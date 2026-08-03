@@ -8,7 +8,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
 MAKEFILE = PROJECT_ROOT / "Makefile"
-REQUIRED_DEVELOPMENT_TOOLS = {"mypy", "pytest", "pytest-cov", "ruff"}
+REQUIRED_DEVELOPMENT_TOOLS = {
+    "httpx2",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+}
 REQUIRED_MAKE_TARGETS = {
     "install",
     "format",

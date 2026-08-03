@@ -10,14 +10,31 @@ from pydantic import ValidationError
 from taskforge.settings import Settings
 
 ENVIRONMENT_PREFIX = "TASKFORGE_"
+DEPENDENCY_ENVIRONMENT_VARIABLES = {
+    "POSTGRES_HOST",
+    "POSTGRES_PORT",
+    "POSTGRES_DB",
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "RABBITMQ_HOST",
+    "RABBITMQ_AMQP_PORT",
+    "RABBITMQ_DEFAULT_USER",
+    "RABBITMQ_DEFAULT_PASS",
+    "RABBITMQ_DEFAULT_VHOST",
+}
 
 
 @pytest.fixture(autouse=True)
 def isolate_taskforge_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent host Taskforge variables from influencing any settings test."""
     for variable_name in tuple(os.environ):
-        if variable_name.startswith(ENVIRONMENT_PREFIX):
+        if (
+            variable_name.startswith(ENVIRONMENT_PREFIX)
+            or variable_name in DEPENDENCY_ENVIRONMENT_VARIABLES
+        ):
             monkeypatch.delenv(variable_name)
+    monkeypatch.setenv("POSTGRES_PASSWORD", "test-postgres-password")
+    monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "test-rabbitmq-password")
 
 
 def test_settings_have_safe_local_defaults() -> None:
@@ -26,6 +43,13 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.application_name == "taskforge"
     assert settings.environment == "development"
     assert settings.log_level == "INFO"
+    assert settings.api_host == "127.0.0.1"
+    assert settings.api_port == 8000
+    assert settings.readiness_timeout_seconds == 2.0
+    assert settings.postgres_host == "127.0.0.1"
+    assert settings.postgres_port == 5432
+    assert settings.rabbitmq_host == "127.0.0.1"
+    assert settings.rabbitmq_port == 5672
 
 
 def test_settings_accept_prefixed_environment_overrides(
@@ -72,3 +96,76 @@ def test_settings_ignore_unprefixed_environment_variables(
     assert settings.application_name == "taskforge"
     assert settings.environment == "development"
     assert settings.log_level == "INFO"
+
+
+def test_settings_accept_compose_compatible_dependency_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POSTGRES_HOST", "postgres.internal")
+    monkeypatch.setenv("POSTGRES_PORT", "55432")
+    monkeypatch.setenv("POSTGRES_DB", "taskforge_test")
+    monkeypatch.setenv("POSTGRES_USER", "postgres-test-user")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "postgres-test-secret")
+    monkeypatch.setenv("RABBITMQ_HOST", "rabbitmq.internal")
+    monkeypatch.setenv("RABBITMQ_AMQP_PORT", "55672")
+    monkeypatch.setenv("RABBITMQ_DEFAULT_USER", "rabbitmq-test-user")
+    monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "rabbitmq-test-secret")
+    monkeypatch.setenv("RABBITMQ_DEFAULT_VHOST", "taskforge_test")
+
+    settings = Settings()
+
+    assert settings.postgres_host == "postgres.internal"
+    assert settings.postgres_port == 55432
+    assert settings.postgres_database == "taskforge_test"
+    assert settings.postgres_user == "postgres-test-user"
+    assert settings.postgres_password.get_secret_value() == "postgres-test-secret"
+    assert settings.rabbitmq_host == "rabbitmq.internal"
+    assert settings.rabbitmq_port == 55672
+    assert settings.rabbitmq_user == "rabbitmq-test-user"
+    assert settings.rabbitmq_password.get_secret_value() == "rabbitmq-test-secret"
+    assert settings.rabbitmq_vhost == "taskforge_test"
+
+
+def test_dependency_passwords_are_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("POSTGRES_PASSWORD")
+    monkeypatch.delenv("RABBITMQ_DEFAULT_PASS")
+
+    with pytest.raises(ValidationError) as error:
+        Settings()
+
+    locations = {item["loc"] for item in error.value.errors()}
+    assert ("POSTGRES_PASSWORD",) in locations
+    assert ("RABBITMQ_DEFAULT_PASS",) in locations
+
+
+def test_dependency_passwords_are_redacted() -> None:
+    settings = Settings()
+
+    rendered = repr(settings)
+
+    assert "test-postgres-password" not in rendered
+    assert "test-rabbitmq-password" not in rendered
+    assert rendered.count("**********") == 2
+
+
+@pytest.mark.parametrize(
+    ("variable_name", "invalid_value"),
+    (
+        ("TASKFORGE_API_PORT", "0"),
+        ("POSTGRES_PORT", "65536"),
+        ("RABBITMQ_AMQP_PORT", "0"),
+        ("TASKFORGE_READINESS_TIMEOUT_SECONDS", "0"),
+        ("TASKFORGE_READINESS_TIMEOUT_SECONDS", "10.1"),
+    ),
+)
+def test_settings_reject_invalid_runtime_values(
+    monkeypatch: pytest.MonkeyPatch,
+    variable_name: str,
+    invalid_value: str,
+) -> None:
+    monkeypatch.setenv(variable_name, invalid_value)
+
+    with pytest.raises(ValidationError):
+        Settings()

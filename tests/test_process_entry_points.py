@@ -22,8 +22,8 @@ PACKAGE_NAMES = (
     "taskforge.orchestrator",
     "taskforge.worker",
 )
-PROCESS_MODULES = ("taskforge.api", "taskforge.worker")
-PROCESS_ENTRY_POINTS = (api_main, worker_main)
+PROCESS_MODULES = ("taskforge.worker",)
+PROCESS_ENTRY_POINTS = (worker_main,)
 
 
 @pytest.mark.parametrize("package_name", PACKAGE_NAMES)
@@ -36,6 +36,35 @@ def test_package_boundary_is_importable(package_name: str) -> None:
 @pytest.mark.parametrize("entry_point", PROCESS_ENTRY_POINTS)
 def test_process_entry_point_returns_success(entry_point: Callable[[], int]) -> None:
     assert entry_point() == 0
+
+
+def test_api_entry_point_uses_typed_runtime_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocation: dict[str, object] = {}
+
+    def record_uvicorn_invocation(app: str, **kwargs: object) -> None:
+        invocation["app"] = app
+        invocation.update(kwargs)
+
+    monkeypatch.setenv("POSTGRES_PASSWORD", "test-postgres-password")
+    monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "test-rabbitmq-password")
+    monkeypatch.setenv("TASKFORGE_API_HOST", "127.0.0.2")
+    monkeypatch.setenv("TASKFORGE_API_PORT", "8765")
+    monkeypatch.setenv("TASKFORGE_LOG_LEVEL", "WARNING")
+    monkeypatch.setattr(
+        "taskforge.api.__main__.uvicorn.run",
+        record_uvicorn_invocation,
+    )
+
+    assert api_main() == 0
+    assert invocation == {
+        "app": "taskforge.api.application:create_app",
+        "factory": True,
+        "host": "127.0.0.2",
+        "port": 8765,
+        "log_level": "warning",
+    }
 
 
 @pytest.mark.parametrize("module_name", PROCESS_MODULES)
