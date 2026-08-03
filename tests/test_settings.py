@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import os
 
-from pydantic import ValidationError
 import pytest
+from pydantic import ValidationError
 
 from taskforge.settings import Settings
-
 
 ENVIRONMENT_PREFIX = "TASKFORGE_"
 

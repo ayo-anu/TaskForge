@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import subprocess
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "compose.yaml"
@@ -51,7 +50,7 @@ def compose_configuration() -> dict[str, Any]:
     )
 
     assert result.returncode == 0, result.stderr
-    return json.loads(result.stdout)
+    return cast(dict[str, Any], json.loads(result.stdout))
 
 
 def test_compose_defines_only_required_services(
