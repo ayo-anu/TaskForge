@@ -16,6 +16,7 @@ from taskforge.identity.authentication import (
     AuthenticationUnavailable,
     WorkerAuthenticator,
 )
+from taskforge.identity.authorization import AuthorizationService
 from taskforge.identity.credentials import (
     CredentialFormatError,
     PresentedCredential,
@@ -25,6 +26,7 @@ from taskforge.persistence.authentication import (
     SQLAlchemyAPICredentialRepository,
     SQLAlchemyWorkerCredentialRepository,
 )
+from taskforge.persistence.authorization import SQLAlchemyPrincipalRoleRepository
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.settings import Settings
 
@@ -49,10 +51,12 @@ class AuthenticationRuntime:
         engine: AsyncEngine,
         api_authenticator: APIAuthenticator,
         worker_authenticator: WorkerAuthenticator,
+        authorization_service: AuthorizationService,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
         self.worker_authenticator = worker_authenticator
+        self.authorization_service = authorization_service
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -70,6 +74,10 @@ def build_authentication_runtime(settings: Settings) -> AuthenticationRuntime:
         ),
         worker_authenticator=WorkerAuthenticator(
             SQLAlchemyWorkerCredentialRepository(sessions),
+            timeout_seconds=settings.authentication_timeout_seconds,
+        ),
+        authorization_service=AuthorizationService(
+            SQLAlchemyPrincipalRoleRepository(sessions),
             timeout_seconds=settings.authentication_timeout_seconds,
         ),
     )
