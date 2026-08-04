@@ -34,12 +34,24 @@ def test_migration_configuration_contains_no_embedded_credentials() -> None:
     assert "taskforge_database_url" in combined
 
 
-def test_migration_graph_starts_empty_and_has_a_locked_validation_command() -> None:
-    revision_files = [
-        path for path in VERSIONS_DIRECTORY.iterdir() if path.name != ".gitkeep"
-    ]
+def test_migration_graph_has_one_identity_head_and_locked_validation_commands() -> None:
+    revision_files = sorted(VERSIONS_DIRECTORY.glob("*.py"))
     makefile = MAKEFILE.read_text(encoding="utf-8")
 
-    assert revision_files == []
+    assert [path.name for path in revision_files] == [
+        "0001_create_identity_foundation.py"
+    ]
     assert "migrations-check:\n\tuv run alembic heads --verbose" in makefile
+    assert "migration-test:" in makefile
+    assert "TASKFORGE_RUN_MIGRATION_INTEGRATION" in makefile
+    assert "TASKFORGE_MIGRATION_TEST_DATABASE_URL" in makefile
     assert "check: format-check lint typecheck coverage migrations-check" in makefile
+
+
+def test_alembic_uses_shared_metadata_without_restructuring_the_environment() -> None:
+    environment = (MIGRATIONS_DIRECTORY / "env.py").read_text(encoding="utf-8")
+
+    assert "from taskforge.persistence.metadata import metadata" in environment
+    assert "target_metadata = metadata" in environment
+    assert "async_engine_from_config" in environment
+    assert "TASKFORGE_DATABASE_URL" in environment

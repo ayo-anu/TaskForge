@@ -15,7 +15,6 @@ REQUIRED_DEVELOPMENT_TOOLS = {
     "pytest",
     "pytest-cov",
     "ruff",
-    "sqlalchemy",
 }
 REQUIRED_MAKE_TARGETS = {
     "install",
@@ -26,6 +25,7 @@ REQUIRED_MAKE_TARGETS = {
     "test",
     "coverage",
     "migrations-check",
+    "migration-test",
     "check",
     "clean",
 }
@@ -50,6 +50,16 @@ def test_required_development_tools_are_declared() -> None:
     }
 
     assert declared_tools == REQUIRED_DEVELOPMENT_TOOLS
+
+
+def test_sqlalchemy_is_a_runtime_persistence_dependency() -> None:
+    pyproject = load_pyproject()
+    project = pyproject["project"]
+    assert isinstance(project, dict)
+    dependencies = project["dependencies"]
+    assert isinstance(dependencies, list)
+
+    assert "sqlalchemy>=2,<3" in dependencies
 
 
 def test_quality_policy_is_centrally_configured() -> None:
@@ -84,8 +94,8 @@ def test_makefile_exposes_consistent_developer_commands() -> None:
 
     assert declared_targets == REQUIRED_MAKE_TARGETS
     assert "uv sync --locked --dev" in makefile
-    assert "ruff format --check src tests migrations/env.py" in makefile
-    assert "ruff check src tests migrations/env.py" in makefile
+    assert "ruff format --check src tests migrations" in makefile
+    assert "ruff check src tests migrations" in makefile
     assert "check: format-check lint typecheck coverage migrations-check" in makefile
 
 

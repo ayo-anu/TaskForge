@@ -13,6 +13,7 @@ dependencies = [
     "fastapi>=0.116,<1",
     "pydantic>=2,<3",
     "pydantic-settings>=2,<3",
+    "sqlalchemy>=2,<3",
     "uvicorn>=0.35,<1",
 ]
 
@@ -24,7 +25,6 @@ dev = [
     "pytest>=8,<9",
     "pytest-cov>=6,<8",
     "ruff>=0.12,<1",
-    "sqlalchemy>=2,<3",
 ]
 
 [tool.hatch.build.targets.wheel]

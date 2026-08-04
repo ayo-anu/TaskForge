@@ -1,16 +1,16 @@
-.PHONY: install format format-check lint typecheck test coverage migrations-check check clean
+.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test check clean
 
 install:
 	uv sync --locked --dev
 
 format:
-	uv run ruff format src tests migrations/env.py
+	uv run ruff format src tests migrations
 
 format-check:
-	uv run ruff format --check src tests migrations/env.py
+	uv run ruff format --check src tests migrations
 
 lint:
-	uv run ruff check src tests migrations/env.py
+	uv run ruff check src tests migrations
 
 typecheck:
 	uv run mypy src tests
@@ -23,6 +23,11 @@ coverage:
 
 migrations-check:
 	uv run alembic heads --verbose
+
+migration-test:
+	@test "$${TASKFORGE_RUN_MIGRATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_MIGRATION_INTEGRATION=1 is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_MIGRATION_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_MIGRATION_TEST_DATABASE_URL is required" >&2; exit 2)
+	uv run pytest tests/integration/test_identity_migrations.py
 
 check: format-check lint typecheck coverage migrations-check
 
