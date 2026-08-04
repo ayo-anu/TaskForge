@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import secrets
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 import httpx2
+import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
 
 from taskforge.api.application import create_app
 from taskforge.api.health import ReadinessCoordinator
+from taskforge.api.workflows import MAX_CURSOR_LENGTH, _decode_cursor, _encode_cursor
 from taskforge.identity.authentication import APIAuthenticator, WorkerAuthenticator
 from taskforge.identity.authorization import AuthorizationService, Role
 from taskforge.identity.credentials import (
@@ -24,8 +27,13 @@ from taskforge.identity.credentials import (
 )
 from taskforge.identity.ports import CredentialRecord
 from taskforge.settings import Settings
-from taskforge.workflows.domain import WorkflowDraft
-from taskforge.workflows.persistence_ports import StoredWorkflowDraft
+from taskforge.workflows.domain import WorkflowDefinitionStatus, WorkflowDraft
+from taskforge.workflows.persistence_ports import (
+    StoredWorkflowDraft,
+    WorkflowPage,
+    WorkflowPageCursor,
+    WorkflowSummary,
+)
 from taskforge.workflows.service import (
     WorkflowNotFound,
     WorkflowPersistenceConflict,
@@ -86,6 +94,9 @@ class WorkflowServiceStub:
         self.stored: dict[UUID, StoredWorkflowDraft] = {}
         self.create_error: Exception | None = None
         self.get_error: Exception | None = None
+        self.list_error: Exception | None = None
+        self.page = WorkflowPage((), None)
+        self.list_calls: list[tuple[UUID, int, WorkflowPageCursor | None]] = []
 
     async def create(self, workflow: WorkflowDraft) -> StoredWorkflowDraft:
         if self.create_error:
@@ -106,6 +117,18 @@ class WorkflowServiceStub:
             raise WorkflowNotFound
         return stored
 
+    async def list(
+        self,
+        *,
+        owner_principal_id: UUID,
+        limit: int,
+        cursor: WorkflowPageCursor | None = None,
+    ) -> WorkflowPage:
+        self.list_calls.append((owner_principal_id, limit, cursor))
+        if self.list_error:
+            raise self.list_error
+        return self.page
+
 
 class Runtime:
     def __init__(
@@ -115,6 +138,7 @@ class Runtime:
         service: WorkflowServiceStub,
         registry: TaskTypeRegistry,
     ) -> None:
+        self.caller_id = caller_id
         api_value, api_record = make_credential(CredentialScope.API, caller_id)
         worker_value, worker_record = make_credential(CredentialScope.WORKER, uuid4())
         self.api_credential = api_value
@@ -199,6 +223,19 @@ def valid_body() -> dict[str, object]:
             }
         ],
     }
+
+
+def summary(owner_id: UUID, *, created_at: datetime | None = None) -> WorkflowSummary:
+    now = created_at or datetime.now(UTC)
+    return WorkflowSummary(
+        uuid4(),
+        owner_id,
+        "Summary",
+        None,
+        WorkflowDefinitionStatus.DRAFT,
+        now,
+        now,
+    )
 
 
 def test_operator_creates_and_reads_own_draft() -> None:
@@ -289,5 +326,116 @@ def test_hidden_and_missing_workflows_are_identical() -> None:
 def test_openapi_exposes_only_task_four_workflow_operations() -> None:
     app, _, _, _ = make_app(frozenset())
     schema = request(app, "GET", "/openapi.json", None).json()
-    assert set(schema["paths"]["/api/v1/workflows"]) == {"post"}
+    assert set(schema["paths"]["/api/v1/workflows"]) == {"get", "post"}
     assert set(schema["paths"]["/api/v1/workflows/{workflow_id}"]) == {"get"}
+
+
+def test_viewer_lists_only_service_owner_scope_with_default_page_size() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.VIEWER.value}))
+    item = summary(runtime.caller_id)
+    service.page = WorkflowPage((item,), None)
+
+    response = request(app, "GET", "/api/v1/workflows", runtime.api_credential)
+
+    assert response.status_code == 200
+    assert response.json()["page"] == {"limit": 50, "next_cursor": None}
+    assert response.json()["items"][0]["id"] == str(item.id)
+    assert "steps" not in response.json()["items"][0]
+    assert service.list_calls == [(item.owner_principal_id, 50, None)]
+
+
+def test_returned_cursor_round_trips_utc_microseconds_and_next_page() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.VIEWER.value}))
+    owner_id = runtime.caller_id
+    timestamp = datetime.fromisoformat("2026-08-04T12:34:56.123456-07:00")
+    item = summary(owner_id, created_at=timestamp)
+    service.page = WorkflowPage((item,), WorkflowPageCursor(timestamp, item.id))
+
+    first = request(app, "GET", "/api/v1/workflows?limit=1", runtime.api_credential)
+    encoded = first.json()["page"]["next_cursor"]
+    decoded = _decode_cursor(encoded)
+    assert (
+        decoded.created_at.isoformat(timespec="microseconds")
+        == "2026-08-04T19:34:56.123456+00:00"
+    )
+    service.page = WorkflowPage((), None)
+    second = request(
+        app,
+        "GET",
+        f"/api/v1/workflows?limit=1&cursor={encoded}",
+        runtime.api_credential,
+    )
+    assert second.status_code == 200
+    assert service.list_calls[-1] == (owner_id, 1, decoded)
+
+
+def test_invalid_and_oversized_cursors_fail_before_service_access() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.VIEWER.value}))
+    malformed = request(
+        app, "GET", "/api/v1/workflows?cursor=not-base64!", runtime.api_credential
+    )
+    oversized = request(
+        app,
+        "GET",
+        f"/api/v1/workflows?cursor={'a' * (MAX_CURSOR_LENGTH + 1)}",
+        runtime.api_credential,
+    )
+    assert malformed.status_code == oversized.status_code == 422
+    assert malformed.json()["error"]["details"][0]["code"] == "invalid_cursor"
+    assert service.list_calls == []
+
+
+def test_page_limits_are_bounded_and_list_outages_are_safe() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.VIEWER.value}))
+    assert (
+        request(
+            app, "GET", "/api/v1/workflows?limit=1", runtime.api_credential
+        ).status_code
+        == 200
+    )
+    assert (
+        request(
+            app, "GET", "/api/v1/workflows?limit=100", runtime.api_credential
+        ).status_code
+        == 200
+    )
+    assert (
+        request(
+            app, "GET", "/api/v1/workflows?limit=0", runtime.api_credential
+        ).status_code
+        == 422
+    )
+    assert (
+        request(
+            app, "GET", "/api/v1/workflows?limit=101", runtime.api_credential
+        ).status_code
+        == 422
+    )
+    service.list_error = WorkflowServiceUnavailable("database-secret")
+    unavailable = request(app, "GET", "/api/v1/workflows", runtime.api_credential)
+    assert unavailable.status_code == 503
+    assert "database-secret" not in unavailable.text
+
+
+def test_list_authorization_precedes_service_access() -> None:
+    app, runtime, service, _ = make_app(frozenset())
+    forbidden = request(app, "GET", "/api/v1/workflows", runtime.api_credential)
+    worker = request(app, "GET", "/api/v1/workflows", runtime.worker_credential)
+    assert forbidden.status_code == 403
+    assert worker.status_code == 401
+    assert service.list_calls == []
+
+
+def test_cursor_codec_rejects_unsupported_and_naive_payloads() -> None:
+    cursor = WorkflowPageCursor(datetime.now(UTC), uuid4())
+    encoded = _encode_cursor(cursor)
+    assert len(encoded) <= MAX_CURSOR_LENGTH
+    for payload in (
+        {"v": 2, "created_at": "2026-08-04T00:00:00.000000Z", "id": str(uuid4())},
+        {"v": 1, "created_at": "2026-08-04T00:00:00.000000", "id": str(uuid4())},
+    ):
+        raw = (
+            base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+        )
+        with pytest.raises(ValueError, match="invalid cursor"):
+            _decode_cursor(raw)

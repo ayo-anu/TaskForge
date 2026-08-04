@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import base64
+import binascii
+import json
+from datetime import UTC, datetime
 from typing import Annotated, Any, Protocol, cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from taskforge.api.authorization import require_permission
@@ -25,7 +28,11 @@ from taskforge.workflows.domain import (
     create_draft_step,
     create_workflow_draft,
 )
-from taskforge.workflows.persistence_ports import StoredWorkflowDraft
+from taskforge.workflows.persistence_ports import (
+    StoredWorkflowDraft,
+    WorkflowPageCursor,
+    WorkflowSummary,
+)
 from taskforge.workflows.service import (
     WorkflowNotFound,
     WorkflowOwnerDisabled,
@@ -92,6 +99,26 @@ class WorkflowResponse(BaseModel):
     dependencies: list[WorkflowDependencyResponse]
 
 
+class WorkflowSummaryResponse(BaseModel):
+    id: UUID
+    owner_principal_id: UUID
+    name: str
+    description: str | None
+    status: WorkflowDefinitionStatus
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkflowPageMetadataResponse(BaseModel):
+    limit: int
+    next_cursor: str | None
+
+
+class WorkflowListResponse(BaseModel):
+    items: list[WorkflowSummaryResponse]
+    page: WorkflowPageMetadataResponse
+
+
 class WorkflowRuntimeProtocol(Protocol):
     workflow_service: WorkflowService
     task_type_registry: TaskTypeRegistry
@@ -105,6 +132,66 @@ COMMON_RESPONSES: dict[int | str, dict[str, Any]] = {
     status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
     status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse},
 }
+
+DEFAULT_WORKFLOW_PAGE_SIZE = 50
+MAX_WORKFLOW_PAGE_SIZE = 100
+MAX_CURSOR_LENGTH = 256
+_CURSOR_VERSION = 1
+
+
+@router.get(
+    "",
+    response_model=WorkflowListResponse,
+    responses=COMMON_RESPONSES,
+)
+async def list_workflows(
+    request: Request,
+    context: Annotated[
+        AuthorizationContext,
+        Depends(require_permission(Permission.VIEW)),
+    ],
+    limit: Annotated[
+        int,
+        Query(ge=1, le=MAX_WORKFLOW_PAGE_SIZE),
+    ] = DEFAULT_WORKFLOW_PAGE_SIZE,
+    cursor: Annotated[
+        str | None,
+        Query(max_length=MAX_CURSOR_LENGTH),
+    ] = None,
+) -> WorkflowListResponse | Response:
+    """List the authenticated owner's workflows in stable keyset order."""
+    try:
+        decoded_cursor = _decode_cursor(cursor) if cursor is not None else None
+    except ValueError:
+        return _validation_error(
+            request,
+            (
+                WorkflowValidationIssue(
+                    "invalid_cursor",
+                    ("query", "cursor"),
+                    "Cursor is invalid.",
+                ),
+            ),
+        )
+    try:
+        page = await _runtime(request).workflow_service.list(
+            owner_principal_id=context.principal_id,
+            limit=limit,
+            cursor=decoded_cursor,
+        )
+    except WorkflowServiceUnavailable as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
+    return WorkflowListResponse(
+        items=[_workflow_summary_response(item) for item in page.items],
+        page=WorkflowPageMetadataResponse(
+            limit=limit,
+            next_cursor=(
+                _encode_cursor(page.next_cursor)
+                if page.next_cursor is not None
+                else None
+            ),
+        ),
+    )
 
 
 @router.post(
@@ -285,3 +372,60 @@ def _workflow_response(stored: StoredWorkflowDraft) -> WorkflowResponse:
             for dependency in draft.dependencies
         ],
     )
+
+
+def _workflow_summary_response(summary: WorkflowSummary) -> WorkflowSummaryResponse:
+    return WorkflowSummaryResponse(
+        id=summary.id,
+        owner_principal_id=summary.owner_principal_id,
+        name=summary.name,
+        description=summary.description,
+        status=summary.status,
+        created_at=summary.created_at,
+        updated_at=summary.updated_at,
+    )
+
+
+def _encode_cursor(cursor: WorkflowPageCursor) -> str:
+    payload = json.dumps(
+        {
+            "v": _CURSOR_VERSION,
+            "created_at": cursor.created_at.astimezone(UTC)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "id": str(cursor.workflow_id),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_cursor(value: str) -> WorkflowPageCursor:
+    if not value or len(value) > MAX_CURSOR_LENGTH or not value.isascii():
+        raise ValueError("invalid cursor")
+    padding = "=" * (-len(value) % 4)
+    try:
+        decoded = base64.b64decode(
+            f"{value}{padding}",
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(decoded)
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid cursor") from error
+    if not isinstance(payload, dict) or set(payload) != {"v", "created_at", "id"}:
+        raise ValueError("invalid cursor")
+    if type(payload["v"]) is not int or payload["v"] != _CURSOR_VERSION:
+        raise ValueError("invalid cursor")
+    created_at_value, workflow_id_value = payload["created_at"], payload["id"]
+    if not isinstance(created_at_value, str) or not isinstance(workflow_id_value, str):
+        raise ValueError("invalid cursor")
+    try:
+        created_at = datetime.fromisoformat(created_at_value.replace("Z", "+00:00"))
+        workflow_id = UUID(workflow_id_value)
+    except ValueError as error:
+        raise ValueError("invalid cursor") from error
+    if created_at.tzinfo is None:
+        raise ValueError("invalid cursor")
+    return WorkflowPageCursor(created_at.astimezone(UTC), workflow_id)

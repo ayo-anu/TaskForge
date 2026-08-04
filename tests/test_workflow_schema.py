@@ -132,3 +132,20 @@ def test_dependency_indexes_support_both_graph_directions() -> None:
 
     assert ("workflow_definition_id", "predecessor_step_id") in index_columns
     assert ("workflow_definition_id", "successor_step_id") in index_columns
+
+
+def test_workflow_list_index_matches_owner_scoped_stable_order() -> None:
+    index_names = {index.name for index in workflow_definitions.indexes}
+
+    assert "ix_workflow_definitions_owner_principal_id" not in index_names
+    index = next(
+        index
+        for index in workflow_definitions.indexes
+        if index.name == "ix_workflow_definitions_owner_created_id"
+    )
+    expressions = tuple(str(expression) for expression in index.expressions)
+    assert expressions == (
+        "workflow_definitions.owner_principal_id",
+        "workflow_definitions.created_at DESC",
+        "workflow_definitions.id DESC",
+    )

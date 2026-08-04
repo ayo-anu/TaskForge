@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Protocol
 from uuid import UUID
@@ -69,6 +69,25 @@ class WorkflowSummary:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class WorkflowPageCursor:
+    """Immutable keyset position in the stable workflow list order."""
+
+    created_at: datetime
+    workflow_id: UUID
+
+    def __post_init__(self) -> None:
+        if self.created_at.tzinfo is None:
+            raise ValueError("workflow page cursor timestamp must be timezone-aware")
+        object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class WorkflowPage:
+    items: tuple[WorkflowSummary, ...]
+    next_cursor: WorkflowPageCursor | None
+
+
 class WorkflowTransaction(Protocol):
     async def require_enabled_owner(self, owner_principal_id: UUID) -> None: ...
 
@@ -116,4 +135,5 @@ class WorkflowRepository(Protocol):
         owner_principal_id: UUID,
         *,
         limit: int,
-    ) -> tuple[WorkflowSummary, ...]: ...
+        cursor: WorkflowPageCursor | None,
+    ) -> WorkflowPage: ...

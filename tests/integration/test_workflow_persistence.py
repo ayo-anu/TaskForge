@@ -141,8 +141,8 @@ async def verify_workflow_persistence(database_url: URL) -> None:
             owner_principal_id=other_owner_id,
             limit=10_000,
         )
-        assert [summary.id for summary in owner_list] == [created_input.id]
-        assert other_list == ()
+        assert [summary.id for summary in owner_list.items] == [created_input.id]
+        assert other_list.items == ()
 
         invalid = workflow(owner_id)
         invalid = WorkflowDraft(
@@ -180,7 +180,33 @@ async def verify_workflow_persistence(database_url: URL) -> None:
 
         same_name = workflow(owner_id)
         await service.create(same_name)
-        assert len(await service.list(owner_principal_id=owner_id, limit=10_000)) == 3
+        assert (
+            len((await service.list(owner_principal_id=owner_id, limit=10_000)).items)
+            == 3
+        )
+
+        first_page = await service.list(owner_principal_id=owner_id, limit=2)
+        assert len(first_page.items) == 2
+        assert first_page.next_cursor is not None
+        initial_ids = {
+            created_input.id,
+            concurrent_input.id,
+            same_name.id,
+        }
+        inserted_between_pages = workflow(owner_id)
+        await service.create(inserted_between_pages)
+        second_page = await service.list(
+            owner_principal_id=owner_id,
+            limit=2,
+            cursor=first_page.next_cursor,
+        )
+        traversed_ids = {
+            *(item.id for item in first_page.items),
+            *(item.id for item in second_page.items),
+        }
+        assert traversed_ids == initial_ids
+        assert inserted_between_pages.id not in traversed_ids
+        assert second_page.next_cursor is None
 
     finally:
         await engine.dispose()

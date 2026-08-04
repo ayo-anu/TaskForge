@@ -7,7 +7,7 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import insert, select, text
+from sqlalchemy import and_, insert, or_, select, text
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -24,6 +24,8 @@ from taskforge.workflows.persistence_ports import (
     StoredWorkflowDraft,
     WorkflowOwnerRecordDisabled,
     WorkflowOwnerRecordNotFound,
+    WorkflowPage,
+    WorkflowPageCursor,
     WorkflowPersistenceUnavailable,
     WorkflowRecordConflict,
     WorkflowSummary,
@@ -99,38 +101,72 @@ class SQLAlchemyWorkflowRepository:
         owner_principal_id: UUID,
         *,
         limit: int,
-    ) -> tuple[WorkflowSummary, ...]:
-        statement = (
-            select(
-                workflow_definitions.c.id,
-                workflow_definitions.c.owner_principal_id,
-                workflow_definitions.c.name,
-                workflow_definitions.c.description,
-                workflow_definitions.c.status,
-                workflow_definitions.c.created_at,
-                workflow_definitions.c.updated_at,
-            )
-            .where(workflow_definitions.c.owner_principal_id == owner_principal_id)
-            .order_by(workflow_definitions.c.id)
-            .limit(limit)
-        )
+        cursor: WorkflowPageCursor | None,
+    ) -> WorkflowPage:
+        statement = _workflow_list_statement(owner_principal_id, limit, cursor)
         try:
             async with self._sessions() as session:
                 rows = (await session.execute(statement)).all()
         except DBAPIError as error:
             raise WorkflowPersistenceUnavailable from error
-        return tuple(
-            WorkflowSummary(
-                id=row.id,
-                owner_principal_id=row.owner_principal_id,
-                name=row.name,
-                description=row.description,
-                status=WorkflowDefinitionStatus(row.status),
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-            )
-            for row in rows
+        return _workflow_page(rows, limit)
+
+
+def _workflow_list_statement(
+    owner_principal_id: UUID,
+    limit: int,
+    cursor: WorkflowPageCursor | None,
+) -> Any:
+    statement = (
+        select(
+            workflow_definitions.c.id,
+            workflow_definitions.c.owner_principal_id,
+            workflow_definitions.c.name,
+            workflow_definitions.c.description,
+            workflow_definitions.c.status,
+            workflow_definitions.c.created_at,
+            workflow_definitions.c.updated_at,
         )
+        .where(workflow_definitions.c.owner_principal_id == owner_principal_id)
+        .order_by(
+            workflow_definitions.c.created_at.desc(),
+            workflow_definitions.c.id.desc(),
+        )
+        .limit(limit + 1)
+    )
+    if cursor is not None:
+        statement = statement.where(
+            or_(
+                workflow_definitions.c.created_at < cursor.created_at,
+                and_(
+                    workflow_definitions.c.created_at == cursor.created_at,
+                    workflow_definitions.c.id < cursor.workflow_id,
+                ),
+            )
+        )
+    return statement
+
+
+def _workflow_page(rows: Sequence[Row[Any]], limit: int) -> WorkflowPage:
+    summaries = tuple(
+        WorkflowSummary(
+            id=row.id,
+            owner_principal_id=row.owner_principal_id,
+            name=row.name,
+            description=row.description,
+            status=WorkflowDefinitionStatus(row.status),
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+        for row in rows
+    )
+    has_more = len(summaries) > limit
+    items = summaries[:limit]
+    next_cursor = None
+    if has_more:
+        last = items[-1]
+        next_cursor = WorkflowPageCursor(last.created_at, last.id)
+    return WorkflowPage(items=items, next_cursor=next_cursor)
 
 
 class SQLAlchemyWorkflowUnitOfWork:

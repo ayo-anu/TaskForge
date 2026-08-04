@@ -133,6 +133,34 @@ async def verify_workflow_routes(database_url: URL) -> None:
             found = await client.get(
                 location, headers={"Authorization": f"Bearer {owner_token}"}
             )
+            second_created = await client.post(
+                "/api/v1/workflows",
+                json={**body, "name": "Second integrated draft"},
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            third_created = await client.post(
+                "/api/v1/workflows",
+                json={**body, "name": "Third integrated draft"},
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            first_page = await client.get(
+                "/api/v1/workflows?limit=2",
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            cursor = first_page.json()["page"]["next_cursor"]
+            inserted_between_pages = await client.post(
+                "/api/v1/workflows",
+                json={**body, "name": "Inserted between pages"},
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            second_page = await client.get(
+                f"/api/v1/workflows?limit=2&cursor={cursor}",
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            other_owner_page = await client.get(
+                "/api/v1/workflows",
+                headers={"Authorization": f"Bearer {other_token}"},
+            )
             hidden = await client.get(
                 location, headers={"Authorization": f"Bearer {other_token}"}
             )
@@ -144,6 +172,24 @@ async def verify_workflow_routes(database_url: URL) -> None:
     assert created.status_code == 201
     assert created.json()["owner_principal_id"] == str(owner_id)
     assert found.status_code == 200
+    assert second_created.status_code == third_created.status_code == 201
+    assert first_page.status_code == second_page.status_code == 200
+    assert len(first_page.json()["items"]) == 2
+    assert len(second_page.json()["items"]) == 1
+    assert second_page.json()["page"]["next_cursor"] is None
+    initial_ids = {
+        created.json()["id"],
+        second_created.json()["id"],
+        third_created.json()["id"],
+    }
+    traversed_ids = {
+        item["id"]
+        for page in (first_page, second_page)
+        for item in page.json()["items"]
+    }
+    assert traversed_ids == initial_ids
+    assert inserted_between_pages.json()["id"] not in traversed_ids
+    assert other_owner_page.json()["items"] == []
     assert hidden.status_code == missing.status_code == 404
     hidden_body, missing_body = hidden.json(), missing.json()
     hidden_body["error"].pop("request_id")

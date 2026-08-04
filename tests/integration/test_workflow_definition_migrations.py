@@ -98,6 +98,16 @@ async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
         assert await connection.fetchval(
             "SELECT enum_range(NULL::workflow_definition_status)::text[]"
         ) == ["draft", "enabled", "disabled", "archived"]
+        index_definition = await connection.fetchval(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' "
+            "AND indexname = 'ix_workflow_definitions_owner_created_id'"
+        )
+        assert index_definition is not None
+        assert "(owner_principal_id, created_at DESC, id DESC)" in index_definition
+        assert not await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM pg_indexes WHERE schemaname = 'public' "
+            "AND indexname = 'ix_workflow_definitions_owner_principal_id')"
+        )
 
         principal_id = await insert_principal(connection)
         workflow_id = await insert_workflow(connection, principal_id)
@@ -199,6 +209,21 @@ async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
         await connection.close()
 
 
+async def inspect_pagination_index_downgrade(database_url: URL) -> None:
+    connection = await asyncpg.connect(asyncpg_dsn(database_url))
+    try:
+        assert await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM pg_indexes WHERE schemaname = 'public' "
+            "AND indexname = 'ix_workflow_definitions_owner_principal_id')"
+        )
+        assert not await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM pg_indexes WHERE schemaname = 'public' "
+            "AND indexname = 'ix_workflow_definitions_owner_created_id')"
+        )
+    finally:
+        await connection.close()
+
+
 async def inspect_workflow_downgrade(database_url: URL) -> None:
     connection = await asyncpg.connect(asyncpg_dsn(database_url))
     try:
@@ -238,5 +263,7 @@ def test_workflow_migration_constraints_and_reversible_boundary() -> None:
         with migration_database_url(alembic_url):
             command.upgrade(configuration, "head")
             asyncio.run(inspect_upgraded_workflow_schema(database_url))
+            command.downgrade(configuration, "0002_workflows")
+            asyncio.run(inspect_pagination_index_downgrade(database_url))
             command.downgrade(configuration, "0001_identity")
             asyncio.run(inspect_workflow_downgrade(database_url))

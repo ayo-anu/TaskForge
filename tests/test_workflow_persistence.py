@@ -14,8 +14,11 @@ from taskforge.persistence.workflows import (
     SQLAlchemyWorkflowRepository,
     SQLAlchemyWorkflowUnitOfWork,
     _stored_draft,
+    _workflow_list_statement,
+    _workflow_page,
 )
 from taskforge.workflows.domain import WorkflowDefinitionStatus
+from taskforge.workflows.persistence_ports import WorkflowPageCursor
 
 
 class FakeSession:
@@ -133,3 +136,63 @@ def test_stored_draft_reconstructs_identifiers_and_ordinary_json_parameters() ->
     assert stored.draft.dependencies[0].successor_identifier == "second"
     assert stored.created_at == stored.updated_at == now
     assert "value" not in repr(stored)
+
+
+def test_list_statement_is_owner_scoped_stably_ordered_and_keyset_bounded() -> None:
+    owner_id = uuid4()
+    cursor = WorkflowPageCursor(datetime.now(UTC), uuid4())
+
+    statement = _workflow_list_statement(owner_id, 2, cursor)
+    sql = " ".join(str(statement).split())
+
+    assert "workflow_definitions.owner_principal_id =" in sql
+    assert "workflow_definitions.created_at <" in sql
+    assert "workflow_definitions.created_at =" in sql
+    assert "workflow_definitions.id <" in sql
+    assert (
+        "ORDER BY workflow_definitions.created_at DESC, workflow_definitions.id DESC"
+        in sql
+    )
+    assert statement._limit_clause is not None
+    assert statement._limit_clause.value == 3
+
+
+def test_page_cursor_uses_last_returned_item_not_extra_fetched_row() -> None:
+    owner_id = uuid4()
+    timestamp = datetime.now(UTC)
+    identifiers = (uuid4(), uuid4(), uuid4())
+    rows = [
+        SimpleNamespace(
+            id=identifier,
+            owner_principal_id=owner_id,
+            name=f"workflow-{index}",
+            description=None,
+            status="draft",
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        for index, identifier in enumerate(identifiers)
+    ]
+
+    page = _workflow_page(cast(Any, rows), 2)
+
+    assert tuple(item.id for item in page.items) == identifiers[:2]
+    assert page.next_cursor == WorkflowPageCursor(timestamp, identifiers[1])
+    assert page.next_cursor.workflow_id != identifiers[2]
+
+
+def test_page_has_no_cursor_without_an_extra_row() -> None:
+    assert _workflow_page([], 10).next_cursor is None
+
+
+def test_page_cursor_requires_timezone_and_normalizes_to_utc() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        WorkflowPageCursor(datetime(2026, 8, 4), uuid4())
+
+    cursor = WorkflowPageCursor(
+        datetime.fromisoformat("2026-08-04T12:00:00.123456-07:00"),
+        uuid4(),
+    )
+    assert cursor.created_at.isoformat(timespec="microseconds") == (
+        "2026-08-04T19:00:00.123456+00:00"
+    )

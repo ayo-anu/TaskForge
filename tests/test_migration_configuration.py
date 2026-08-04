@@ -41,6 +41,7 @@ def test_migration_graph_has_one_workflow_head_and_locked_validation_commands() 
     assert [path.name for path in revision_files] == [
         "0001_create_identity_foundation.py",
         "0002_create_workflow_definition_foundation.py",
+        "0003_add_workflow_list_index.py",
     ]
     assert "migrations-check:\n\tuv run alembic heads --verbose" in makefile
     assert "migration-test:" in makefile

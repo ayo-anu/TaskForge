@@ -10,10 +10,11 @@ from taskforge.workflows.persistence_ports import (
     StoredWorkflowDraft,
     WorkflowOwnerRecordDisabled,
     WorkflowOwnerRecordNotFound,
+    WorkflowPage,
+    WorkflowPageCursor,
     WorkflowPersistenceUnavailable,
     WorkflowRecordConflict,
     WorkflowRepository,
-    WorkflowSummary,
 )
 
 
@@ -90,13 +91,15 @@ class WorkflowService:
         *,
         owner_principal_id: UUID,
         limit: int,
-    ) -> tuple[WorkflowSummary, ...]:
+        cursor: WorkflowPageCursor | None = None,
+    ) -> WorkflowPage:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise InvalidWorkflowListQuery("limit must be a positive integer")
         try:
             return await self._repository.list_summaries(
                 owner_principal_id,
                 limit=limit,
+                cursor=cursor,
             )
         except WorkflowPersistenceUnavailable as error:
             raise WorkflowServiceUnavailable from error

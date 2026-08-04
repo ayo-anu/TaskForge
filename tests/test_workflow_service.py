@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import TracebackType
 from uuid import UUID, uuid4
@@ -21,9 +21,10 @@ from taskforge.workflows.persistence_ports import (
     StoredWorkflowDraft,
     WorkflowOwnerRecordDisabled,
     WorkflowOwnerRecordNotFound,
+    WorkflowPage,
+    WorkflowPageCursor,
     WorkflowPersistenceUnavailable,
     WorkflowRecordConflict,
-    WorkflowSummary,
     WorkflowTimestamps,
     WorkflowTransactionContext,
 )
@@ -107,12 +108,12 @@ class FakeTransaction:
 class FakeRepository:
     transaction_value: FakeTransaction
     stored: StoredWorkflowDraft | None = None
-    summaries: tuple[WorkflowSummary, ...] = ()
+    page: WorkflowPage = field(default_factory=lambda: WorkflowPage((), None))
     query_failure: Exception | None = None
 
     def __post_init__(self) -> None:
         self.find_calls: list[tuple[UUID, UUID]] = []
-        self.list_calls: list[tuple[UUID, int]] = []
+        self.list_calls: list[tuple[UUID, int, WorkflowPageCursor | None]] = []
 
     def transaction(self) -> WorkflowTransactionContext:
         return self.transaction_value
@@ -132,11 +133,12 @@ class FakeRepository:
         owner_principal_id: UUID,
         *,
         limit: int,
-    ) -> tuple[WorkflowSummary, ...]:
-        self.list_calls.append((owner_principal_id, limit))
+        cursor: WorkflowPageCursor | None,
+    ) -> WorkflowPage:
+        self.list_calls.append((owner_principal_id, limit, cursor))
         if self.query_failure is not None:
             raise self.query_failure
-        return self.summaries
+        return self.page
 
 
 def test_create_persists_complete_aggregate_in_one_transaction() -> None:
@@ -245,13 +247,18 @@ def test_list_requires_an_explicit_positive_integer_limit(limit: object) -> None
 def test_list_passes_owner_and_unbounded_policy_free_limit() -> None:
     owner_id = uuid4()
     repository = FakeRepository(FakeTransaction())
+    cursor = WorkflowPageCursor(datetime.now(UTC), uuid4())
 
     result = asyncio.run(
-        WorkflowService(repository).list(owner_principal_id=owner_id, limit=10_000)
+        WorkflowService(repository).list(
+            owner_principal_id=owner_id,
+            limit=10_000,
+            cursor=cursor,
+        )
     )
 
-    assert result == ()
-    assert repository.list_calls == [(owner_id, 10_000)]
+    assert result == WorkflowPage((), None)
+    assert repository.list_calls == [(owner_id, 10_000, cursor)]
 
 
 @pytest.mark.parametrize("operation", ("get", "list"))

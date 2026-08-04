@@ -35,7 +35,6 @@ workflow_definitions = Table(
         UUID(as_uuid=True),
         ForeignKey("api_principals.id"),
         nullable=False,
-        index=True,
     ),
     Column("name", String(128), nullable=False),
     Column("description", Text),
@@ -58,6 +57,13 @@ workflow_definitions = Table(
         server_default=func.current_timestamp(),
     ),
     CheckConstraint("length(name) > 0", name="name_not_empty"),
+)
+
+Index(
+    "ix_workflow_definitions_owner_created_id",
+    workflow_definitions.c.owner_principal_id,
+    workflow_definitions.c.created_at.desc(),
+    workflow_definitions.c.id.desc(),
 )
 
 workflow_draft_steps = Table(
