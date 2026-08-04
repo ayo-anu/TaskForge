@@ -10,6 +10,16 @@ from taskforge.workflows.domain import (
     create_draft_step,
     create_workflow_draft,
 )
+from taskforge.workflows.persistence_ports import StoredWorkflowDraft, WorkflowSummary
+from taskforge.workflows.service import (
+    InvalidWorkflowListQuery,
+    WorkflowNotFound,
+    WorkflowOwnerDisabled,
+    WorkflowOwnerNotFound,
+    WorkflowPersistenceConflict,
+    WorkflowService,
+    WorkflowServiceUnavailable,
+)
 from taskforge.workflows.task_types import (
     TaskParameterValidator,
     TaskTypeDefinition,
@@ -21,12 +31,21 @@ from taskforge.workflows.task_types import (
 __all__ = [
     "DraftDependency",
     "DraftWorkflowStep",
+    "InvalidWorkflowListQuery",
+    "StoredWorkflowDraft",
     "TaskParameterValidator",
     "TaskTypeDefinition",
     "TaskTypeRegistry",
     "WorkflowAvailabilityIntent",
     "WorkflowDefinitionStatus",
     "WorkflowDraft",
+    "WorkflowNotFound",
+    "WorkflowOwnerDisabled",
+    "WorkflowOwnerNotFound",
+    "WorkflowPersistenceConflict",
+    "WorkflowService",
+    "WorkflowServiceUnavailable",
+    "WorkflowSummary",
     "WorkflowValidationError",
     "WorkflowValidationIssue",
     "create_draft_dependency",

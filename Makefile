@@ -1,4 +1,4 @@
-.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test authentication-test authorization-test protected-route-test credential-bootstrap-test check clean
+.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test check clean
 
 install:
 	uv sync --locked --dev
@@ -48,6 +48,11 @@ credential-bootstrap-test:
 	@test "$${TASKFORGE_RUN_CREDENTIAL_BOOTSTRAP_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_CREDENTIAL_BOOTSTRAP_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_CREDENTIAL_BOOTSTRAP_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_CREDENTIAL_BOOTSTRAP_TEST_DATABASE_URL is required" >&2; exit 2)
 	uv run pytest tests/integration/test_credential_bootstrap.py
+
+workflow-persistence-test:
+	@test "$${TASKFORGE_RUN_WORKFLOW_PERSISTENCE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_WORKFLOW_PERSISTENCE_INTEGRATION=1 is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL is required" >&2; exit 2)
+	uv run pytest tests/integration/test_workflow_persistence.py
 
 check: format-check lint typecheck coverage migrations-check
 
