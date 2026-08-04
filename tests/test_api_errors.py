@@ -23,6 +23,10 @@ def make_app() -> FastAPI:
     async def validated(value: int) -> dict[str, int]:
         return {"value": value}
 
+    @app.get("/unexpected")
+    async def unexpected() -> None:
+        raise RuntimeError("postgresql://user:secret@internal-host/taskforge")
+
     return app
 
 
@@ -31,9 +35,13 @@ def request(
     path: str,
     *,
     headers: dict[str, str] | None = None,
+    raise_app_exceptions: bool = True,
 ) -> httpx2.Response:
     async def send() -> httpx2.Response:
-        transport = httpx2.ASGITransport(app=app)
+        transport = httpx2.ASGITransport(
+            app=app,
+            raise_app_exceptions=raise_app_exceptions,
+        )
         async with httpx2.AsyncClient(
             transport=transport,
             base_url="http://testserver",
@@ -93,4 +101,20 @@ def test_validation_failures_use_the_common_envelope() -> None:
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_failed"
     assert response.json()["error"]["message"] == "The request is invalid."
+    assert response.json()["error"]["details"] == [
+        {
+            "code": "invalid_request_value",
+            "path": ["path", "value"],
+            "message": "Field value is invalid.",
+        }
+    ]
     assert "not-an-integer" not in response.text
+
+
+def test_unexpected_failures_use_a_safe_internal_error_contract() -> None:
+    response = request(make_app(), "/unexpected", raise_app_exceptions=False)
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert response.headers[REQUEST_ID_HEADER] == response.json()["error"]["request_id"]
+    assert "secret" not in response.text

@@ -31,6 +31,7 @@ REQUIRED_MAKE_TARGETS = {
     "protected-route-test",
     "credential-bootstrap-test",
     "workflow-persistence-test",
+    "workflow-route-test",
     "check",
     "clean",
 }

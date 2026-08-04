@@ -30,7 +30,10 @@ from taskforge.persistence.authentication import (
 from taskforge.persistence.authorization import SQLAlchemyPrincipalRoleRepository
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.principals import SQLAlchemyPrincipalProfileRepository
+from taskforge.persistence.workflows import SQLAlchemyWorkflowRepository
 from taskforge.settings import Settings
+from taskforge.workflows.service import WorkflowService
+from taskforge.workflows.task_types import TaskTypeRegistry
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -55,18 +58,25 @@ class AuthenticationRuntime:
         worker_authenticator: WorkerAuthenticator,
         authorization_service: AuthorizationService,
         principal_profile_service: PrincipalProfileService,
+        workflow_service: WorkflowService,
+        task_type_registry: TaskTypeRegistry,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
         self.worker_authenticator = worker_authenticator
         self.authorization_service = authorization_service
         self.principal_profile_service = principal_profile_service
+        self.workflow_service = workflow_service
+        self.task_type_registry = task_type_registry
 
     async def close(self) -> None:
         await self._engine.dispose()
 
 
-def build_authentication_runtime(settings: Settings) -> AuthenticationRuntime:
+def build_authentication_runtime(
+    settings: Settings,
+    task_type_registry: TaskTypeRegistry,
+) -> AuthenticationRuntime:
     """Compose separate API and worker authentication services."""
     engine = build_async_engine(settings)
     sessions = build_session_factory(engine)
@@ -88,6 +98,8 @@ def build_authentication_runtime(settings: Settings) -> AuthenticationRuntime:
             SQLAlchemyPrincipalProfileRepository(sessions),
             timeout_seconds=settings.authentication_timeout_seconds,
         ),
+        workflow_service=WorkflowService(SQLAlchemyWorkflowRepository(sessions)),
+        task_type_registry=task_type_registry,
     )
 
 

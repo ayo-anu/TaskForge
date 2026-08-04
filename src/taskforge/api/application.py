@@ -22,13 +22,16 @@ from taskforge.api.health import (
     ReadinessResponse,
 )
 from taskforge.api.principals import router as principals_router
+from taskforge.api.workflows import router as workflows_router
 from taskforge.settings import Settings
+from taskforge.workflows.task_types import TaskTypeRegistry
 
 
 def create_app(
     settings: Settings | None = None,
     readiness: ReadinessCoordinator | None = None,
     authentication: AuthenticationRuntimeProtocol | None = None,
+    task_types: TaskTypeRegistry | None = None,
 ) -> FastAPI:
     """Create the API with injectable readiness behavior for focused tests."""
 
@@ -36,10 +39,12 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resolved_settings = settings or Settings()
         resolved_readiness = readiness or build_readiness_coordinator(resolved_settings)
+        resolved_task_types = task_types or TaskTypeRegistry(())
         await resolved_readiness.start()
         try:
             resolved_authentication = authentication or build_authentication_runtime(
-                resolved_settings
+                resolved_settings,
+                resolved_task_types,
             )
         except BaseException:
             await resolved_readiness.close()
@@ -58,6 +63,7 @@ def create_app(
     app = FastAPI(title="Taskforge API", lifespan=lifespan)
     install_error_handling(app)
     app.include_router(principals_router)
+    app.include_router(workflows_router)
 
     @app.get(
         "/health",
