@@ -11,8 +11,17 @@ from taskforge.identity.authorization import (
     Permission,
     Role,
 )
-from taskforge.identity.credentials import CredentialScope, PresentedCredential
+from taskforge.identity.credentials import (
+    CredentialScope,
+    GeneratedCredential,
+    PresentedCredential,
+)
 from taskforge.identity.principals import PrincipalProfile, PrincipalProfileService
+from taskforge.identity.provisioning import (
+    CredentialIssuanceService,
+    CredentialRevocationService,
+    IdentityProvisioningService,
+)
 from taskforge.identity.schema import (
     API_ROLES,
     api_credentials,
@@ -28,7 +37,11 @@ __all__ = [
     "AuthenticatedWorker",
     "AuthorizationContext",
     "AuthorizationService",
+    "CredentialIssuanceService",
+    "CredentialRevocationService",
     "CredentialScope",
+    "GeneratedCredential",
+    "IdentityProvisioningService",
     "OwnerFilter",
     "Permission",
     "PresentedCredential",

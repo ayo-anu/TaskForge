@@ -5,10 +5,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 SECRET_BYTES = 32
 SECRET_ENCODED_LENGTH = 43
@@ -49,6 +51,40 @@ class PresentedCredential:
 
     def __str__(self) -> str:
         return "<redacted credential>"
+
+
+class CredentialAlreadyConsumed(RuntimeError):
+    """A newly issued credential cannot be displayed twice."""
+
+
+class GeneratedCredential:
+    """New verifier plus a consumable one-time presentation value."""
+
+    def __init__(
+        self,
+        *,
+        credential_id: UUID,
+        credential_verifier: str,
+        presented_value: str,
+    ) -> None:
+        self.credential_id = credential_id
+        self.credential_verifier = credential_verifier
+        self._presented_value: str | None = presented_value
+
+    def take_presented_value(self) -> str:
+        value, self._presented_value = self._presented_value, None
+        if value is None:
+            raise CredentialAlreadyConsumed("credential has already been consumed")
+        return value
+
+    def __repr__(self) -> str:
+        return (
+            "GeneratedCredential(credential_id=<redacted>, "
+            "credential_verifier=<redacted>, presented_value=<redacted>)"
+        )
+
+    def __str__(self) -> str:
+        return "<redacted generated credential>"
 
 
 class VerifierAlgorithm(Protocol):
@@ -94,6 +130,33 @@ class VerifierRegistry:
 
 DEFAULT_VERIFIERS = VerifierRegistry((SHA256Verifier(),))
 DEFAULT_VERIFIER_ALGORITHM = SHA256Verifier.name
+
+
+def generate_credential(
+    scope: CredentialScope,
+    *,
+    random_bytes: Callable[[int], bytes] = secrets.token_bytes,
+    credential_id_factory: Callable[[], UUID] = uuid4,
+    verifiers: VerifierRegistry = DEFAULT_VERIFIERS,
+    algorithm: str = DEFAULT_VERIFIER_ALGORITHM,
+) -> GeneratedCredential:
+    """Generate a scoped machine credential and its durable verifier."""
+    try:
+        secret = random_bytes(SECRET_BYTES)
+        credential_id = credential_id_factory()
+    except Exception as error:
+        raise RuntimeError("secure credential generation failed") from error
+    if not isinstance(secret, bytes) or len(secret) != SECRET_BYTES:
+        raise RuntimeError("secure credential generation failed")
+    if not isinstance(credential_id, UUID):
+        raise RuntimeError("credential identifier generation failed")
+    encoded_secret = _encode_base64url(secret)
+    presented_value = f"{SCOPE_PREFIXES[scope]}.{credential_id}.{encoded_secret}"
+    return GeneratedCredential(
+        credential_id=credential_id,
+        credential_verifier=verifiers.encode(secret, algorithm=algorithm),
+        presented_value=presented_value,
+    )
 
 
 def parse_presented_credential(value: str) -> PresentedCredential:

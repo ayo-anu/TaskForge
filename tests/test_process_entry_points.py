@@ -19,6 +19,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 PACKAGE_NAMES = (
     "taskforge",
     "taskforge.api",
+    "taskforge.bootstrap",
     "taskforge.orchestrator",
     "taskforge.worker",
 )

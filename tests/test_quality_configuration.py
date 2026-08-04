@@ -29,6 +29,7 @@ REQUIRED_MAKE_TARGETS = {
     "authentication-test",
     "authorization-test",
     "protected-route-test",
+    "credential-bootstrap-test",
     "check",
     "clean",
 }
