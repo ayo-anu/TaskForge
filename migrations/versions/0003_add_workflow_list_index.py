@@ -18,6 +18,8 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Replace the owner-only index with the stable keyset-order index."""
+    # owner_principal_id remains the leading B-tree column, so this index
+    # supports both the current owner predicate and its stable list ordering.
     op.drop_index(
         op.f("ix_workflow_definitions_owner_principal_id"),
         table_name="workflow_definitions",

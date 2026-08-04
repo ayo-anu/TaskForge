@@ -111,6 +111,16 @@ async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
 
         principal_id = await insert_principal(connection)
         workflow_id = await insert_workflow(connection, principal_id)
+        await connection.execute("SET enable_seqscan = off")
+        owner_lookup_plan = "\n".join(
+            row["QUERY PLAN"]
+            for row in await connection.fetch(
+                "EXPLAIN SELECT id FROM workflow_definitions "
+                "WHERE owner_principal_id = $1",
+                principal_id,
+            )
+        )
+        assert "ix_workflow_definitions_owner_created_id" in owner_lookup_plan
         predecessor_id = await insert_step(connection, workflow_id, "first")
         successor_id = await insert_step(connection, workflow_id, "second")
         await connection.execute(

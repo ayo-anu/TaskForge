@@ -101,7 +101,6 @@ class WorkflowResponse(BaseModel):
 
 class WorkflowSummaryResponse(BaseModel):
     id: UUID
-    owner_principal_id: UUID
     name: str
     description: str | None
     status: WorkflowDefinitionStatus
@@ -136,6 +135,7 @@ COMMON_RESPONSES: dict[int | str, dict[str, Any]] = {
 DEFAULT_WORKFLOW_PAGE_SIZE = 50
 MAX_WORKFLOW_PAGE_SIZE = 100
 MAX_CURSOR_LENGTH = 256
+MAX_DECODED_CURSOR_BYTES = 128
 _CURSOR_VERSION = 1
 
 
@@ -377,7 +377,6 @@ def _workflow_response(stored: StoredWorkflowDraft) -> WorkflowResponse:
 def _workflow_summary_response(summary: WorkflowSummary) -> WorkflowSummaryResponse:
     return WorkflowSummaryResponse(
         id=summary.id,
-        owner_principal_id=summary.owner_principal_id,
         name=summary.name,
         description=summary.description,
         status=summary.status,
@@ -411,6 +410,8 @@ def _decode_cursor(value: str) -> WorkflowPageCursor:
             altchars=b"-_",
             validate=True,
         )
+        if len(decoded) > MAX_DECODED_CURSOR_BYTES:
+            raise ValueError("invalid cursor")
         payload = json.loads(decoded)
     except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid cursor") from error

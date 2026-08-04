@@ -17,7 +17,12 @@ from pydantic import SecretStr
 
 from taskforge.api.application import create_app
 from taskforge.api.health import ReadinessCoordinator
-from taskforge.api.workflows import MAX_CURSOR_LENGTH, _decode_cursor, _encode_cursor
+from taskforge.api.workflows import (
+    MAX_CURSOR_LENGTH,
+    MAX_DECODED_CURSOR_BYTES,
+    _decode_cursor,
+    _encode_cursor,
+)
 from taskforge.identity.authentication import APIAuthenticator, WorkerAuthenticator
 from taskforge.identity.authorization import AuthorizationService, Role
 from taskforge.identity.credentials import (
@@ -340,6 +345,7 @@ def test_viewer_lists_only_service_owner_scope_with_default_page_size() -> None:
     assert response.status_code == 200
     assert response.json()["page"] == {"limit": 50, "next_cursor": None}
     assert response.json()["items"][0]["id"] == str(item.id)
+    assert "owner_principal_id" not in response.json()["items"][0]
     assert "steps" not in response.json()["items"][0]
     assert service.list_calls == [(item.owner_principal_id, 50, None)]
 
@@ -380,7 +386,23 @@ def test_invalid_and_oversized_cursors_fail_before_service_access() -> None:
         f"/api/v1/workflows?cursor={'a' * (MAX_CURSOR_LENGTH + 1)}",
         runtime.api_credential,
     )
-    assert malformed.status_code == oversized.status_code == 422
+    oversized_decoded_payload = (
+        base64.urlsafe_b64encode(b"x" * (MAX_DECODED_CURSOR_BYTES + 1))
+        .rstrip(b"=")
+        .decode()
+    )
+    decoded_oversized = request(
+        app,
+        "GET",
+        f"/api/v1/workflows?cursor={oversized_decoded_payload}",
+        runtime.api_credential,
+    )
+    assert (
+        malformed.status_code
+        == oversized.status_code
+        == decoded_oversized.status_code
+        == 422
+    )
     assert malformed.json()["error"]["details"][0]["code"] == "invalid_cursor"
     assert service.list_calls == []
 
