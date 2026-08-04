@@ -46,6 +46,9 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 8000
     assert settings.readiness_timeout_seconds == 2.0
+    assert settings.authentication_timeout_seconds == 2.0
+    assert settings.database_pool_size == 5
+    assert settings.database_pool_timeout_seconds == 2.0
     assert settings.postgres_host == "127.0.0.1"
     assert settings.postgres_port == 5432
     assert settings.rabbitmq_host == "127.0.0.1"
@@ -158,6 +161,9 @@ def test_dependency_passwords_are_redacted() -> None:
         ("RABBITMQ_AMQP_PORT", "0"),
         ("TASKFORGE_READINESS_TIMEOUT_SECONDS", "0"),
         ("TASKFORGE_READINESS_TIMEOUT_SECONDS", "10.1"),
+        ("TASKFORGE_AUTHENTICATION_TIMEOUT_SECONDS", "0"),
+        ("TASKFORGE_DATABASE_POOL_SIZE", "0"),
+        ("TASKFORGE_DATABASE_POOL_TIMEOUT_SECONDS", "10.1"),
     ),
 )
 def test_settings_reject_invalid_runtime_values(

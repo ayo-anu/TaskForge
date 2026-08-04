@@ -1,5 +1,10 @@
 """Identity and credential persistence boundary."""
 
+from taskforge.identity.authentication import (
+    AuthenticatedAPIPrincipal,
+    AuthenticatedWorker,
+)
+from taskforge.identity.credentials import CredentialScope, PresentedCredential
 from taskforge.identity.schema import (
     API_ROLES,
     api_credentials,
@@ -11,6 +16,10 @@ from taskforge.identity.schema import (
 
 __all__ = [
     "API_ROLES",
+    "AuthenticatedAPIPrincipal",
+    "AuthenticatedWorker",
+    "CredentialScope",
+    "PresentedCredential",
     "api_credentials",
     "api_principal_roles",
     "api_principals",

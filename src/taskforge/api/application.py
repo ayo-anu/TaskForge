@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import cast
@@ -9,6 +10,10 @@ from typing import cast
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
+from taskforge.api.authentication import (
+    AuthenticationRuntimeProtocol,
+    build_authentication_runtime,
+)
 from taskforge.api.dependencies import build_readiness_coordinator
 from taskforge.api.health import (
     LivenessResponse,
@@ -21,6 +26,7 @@ from taskforge.settings import Settings
 def create_app(
     settings: Settings | None = None,
     readiness: ReadinessCoordinator | None = None,
+    authentication: AuthenticationRuntimeProtocol | None = None,
 ) -> FastAPI:
     """Create the API with injectable readiness behavior for focused tests."""
 
@@ -29,11 +35,23 @@ def create_app(
         resolved_settings = settings or Settings()
         resolved_readiness = readiness or build_readiness_coordinator(resolved_settings)
         await resolved_readiness.start()
+        try:
+            resolved_authentication = authentication or build_authentication_runtime(
+                resolved_settings
+            )
+        except BaseException:
+            await resolved_readiness.close()
+            raise
         app.state.readiness = resolved_readiness
+        app.state.authentication = resolved_authentication
         try:
             yield
         finally:
-            await resolved_readiness.close()
+            await asyncio.gather(
+                resolved_authentication.close(),
+                resolved_readiness.close(),
+                return_exceptions=True,
+            )
 
     app = FastAPI(title="Taskforge API", lifespan=lifespan)
 

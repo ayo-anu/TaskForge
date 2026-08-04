@@ -26,6 +26,7 @@ REQUIRED_MAKE_TARGETS = {
     "coverage",
     "migrations-check",
     "migration-test",
+    "authentication-test",
     "check",
     "clean",
 }

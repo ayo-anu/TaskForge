@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    authentication_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    database_pool_size: int = Field(default=5, ge=1, le=20)
+    database_pool_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
 
     postgres_host: str = Field(
         default="127.0.0.1",
