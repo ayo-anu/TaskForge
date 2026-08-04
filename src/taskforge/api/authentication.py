@@ -22,12 +22,14 @@ from taskforge.identity.credentials import (
     PresentedCredential,
     parse_presented_credential,
 )
+from taskforge.identity.principals import PrincipalProfileService
 from taskforge.persistence.authentication import (
     SQLAlchemyAPICredentialRepository,
     SQLAlchemyWorkerCredentialRepository,
 )
 from taskforge.persistence.authorization import SQLAlchemyPrincipalRoleRepository
 from taskforge.persistence.database import build_async_engine, build_session_factory
+from taskforge.persistence.principals import SQLAlchemyPrincipalProfileRepository
 from taskforge.settings import Settings
 
 _bearer = HTTPBearer(auto_error=False)
@@ -52,11 +54,13 @@ class AuthenticationRuntime:
         api_authenticator: APIAuthenticator,
         worker_authenticator: WorkerAuthenticator,
         authorization_service: AuthorizationService,
+        principal_profile_service: PrincipalProfileService,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
         self.worker_authenticator = worker_authenticator
         self.authorization_service = authorization_service
+        self.principal_profile_service = principal_profile_service
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -78,6 +82,10 @@ def build_authentication_runtime(settings: Settings) -> AuthenticationRuntime:
         ),
         authorization_service=AuthorizationService(
             SQLAlchemyPrincipalRoleRepository(sessions),
+            timeout_seconds=settings.authentication_timeout_seconds,
+        ),
+        principal_profile_service=PrincipalProfileService(
+            SQLAlchemyPrincipalProfileRepository(sessions),
             timeout_seconds=settings.authentication_timeout_seconds,
         ),
     )

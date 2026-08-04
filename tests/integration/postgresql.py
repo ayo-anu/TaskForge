@@ -15,7 +15,7 @@ from sqlalchemy.engine import URL, make_url
 
 SAFE_DATABASE_NAME = re.compile(
     r"\A(?:taskforge_migration_test|taskforge_auth_test|"
-    r"taskforge_authorization_test)_[0-9a-f]{32}\Z"
+    r"taskforge_authorization_test|taskforge_protected_route_test)_[0-9a-f]{32}\Z"
 )
 
 

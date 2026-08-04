@@ -12,6 +12,7 @@ from taskforge.identity.authorization import (
     Role,
 )
 from taskforge.identity.credentials import CredentialScope, PresentedCredential
+from taskforge.identity.principals import PrincipalProfile, PrincipalProfileService
 from taskforge.identity.schema import (
     API_ROLES,
     api_credentials,
@@ -31,6 +32,8 @@ __all__ = [
     "OwnerFilter",
     "Permission",
     "PresentedCredential",
+    "PrincipalProfile",
+    "PrincipalProfileService",
     "Role",
     "api_credentials",
     "api_principal_roles",

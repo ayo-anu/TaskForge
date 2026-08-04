@@ -169,7 +169,7 @@ def test_no_role_returns_generic_forbidden_response() -> None:
     response = request(app, credential)
 
     assert response.status_code == 403
-    assert response.json() == {"detail": "access denied"}
+    assert response.json()["error"]["code"] == "forbidden"
     assert credential not in response.text
 
 
@@ -179,7 +179,7 @@ def test_missing_authentication_remains_unauthorized() -> None:
     response = request(app, None)
 
     assert response.status_code == 401
-    assert response.json() == {"detail": "authentication required"}
+    assert response.json()["error"]["code"] == "authentication_required"
 
 
 def test_role_persistence_failure_is_safely_unavailable() -> None:
@@ -192,6 +192,6 @@ def test_role_persistence_failure_is_safely_unavailable() -> None:
     response = request(app, credential)
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "authorization unavailable"}
+    assert response.json()["error"]["code"] == "service_unavailable"
     assert sensitive_detail not in response.text
     assert credential not in response.text

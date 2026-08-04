@@ -1,4 +1,4 @@
-.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test authentication-test authorization-test check clean
+.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test authentication-test authorization-test protected-route-test check clean
 
 install:
 	uv sync --locked --dev
@@ -38,6 +38,11 @@ authorization-test:
 	@test "$${TASKFORGE_RUN_AUTHORIZATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_AUTHORIZATION_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_AUTHORIZATION_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_AUTHORIZATION_TEST_DATABASE_URL is required" >&2; exit 2)
 	uv run pytest tests/integration/test_authorization_persistence.py
+
+protected-route-test:
+	@test "$${TASKFORGE_RUN_PROTECTED_ROUTE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_PROTECTED_ROUTE_INTEGRATION=1 is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_PROTECTED_ROUTE_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_PROTECTED_ROUTE_TEST_DATABASE_URL is required" >&2; exit 2)
+	uv run pytest tests/integration/test_protected_principal_route.py
 
 check: format-check lint typecheck coverage migrations-check
 

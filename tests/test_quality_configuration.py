@@ -28,6 +28,7 @@ REQUIRED_MAKE_TARGETS = {
     "migration-test",
     "authentication-test",
     "authorization-test",
+    "protected-route-test",
     "check",
     "clean",
 }

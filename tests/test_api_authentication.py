@@ -216,9 +216,15 @@ def test_missing_malformed_unknown_invalid_revoked_and_wrong_scope_are_uniform()
 
     responses = [request(app, "/test-api", value) for value in presented_values]
 
-    assert {(response.status_code, response.text) for response in responses} == {
-        (401, '{"detail":"authentication required"}')
-    }
+    assert {response.status_code for response in responses} == {401}
+    assert {
+        (
+            response.json()["error"]["version"],
+            response.json()["error"]["code"],
+            response.json()["error"]["message"],
+        )
+        for response in responses
+    } == {("1", "authentication_required", "Authentication is required.")}
     assert all(
         response.headers["www-authenticate"] == "Bearer" for response in responses
     )
@@ -235,7 +241,7 @@ def test_missing_malformed_unknown_invalid_revoked_and_wrong_scope_are_uniform()
         credential_value(CredentialScope.API, credential_id, secret),
     )
     assert revoked_response.status_code == 401
-    assert revoked_response.text == responses[0].text
+    assert revoked_response.json()["error"]["code"] == "authentication_required"
 
 
 def test_repository_failure_returns_safe_service_unavailable() -> None:
@@ -253,7 +259,7 @@ def test_repository_failure_returns_safe_service_unavailable() -> None:
     response = request(app, "/test-api", raw_credential)
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "authentication unavailable"}
+    assert response.json()["error"]["code"] == "service_unavailable"
     assert sensitive_detail not in response.text
     assert raw_credential not in response.text
 

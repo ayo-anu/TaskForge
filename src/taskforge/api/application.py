@@ -15,11 +15,13 @@ from taskforge.api.authentication import (
     build_authentication_runtime,
 )
 from taskforge.api.dependencies import build_readiness_coordinator
+from taskforge.api.errors import install_error_handling
 from taskforge.api.health import (
     LivenessResponse,
     ReadinessCoordinator,
     ReadinessResponse,
 )
+from taskforge.api.principals import router as principals_router
 from taskforge.settings import Settings
 
 
@@ -54,6 +56,8 @@ def create_app(
             )
 
     app = FastAPI(title="Taskforge API", lifespan=lifespan)
+    install_error_handling(app)
+    app.include_router(principals_router)
 
     @app.get(
         "/health",
