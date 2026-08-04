@@ -11,6 +11,9 @@ from datetime import UTC, datetime, timedelta
 from typing import TextIO
 from uuid import UUID
 
+from pydantic import ValidationError
+from pydantic_settings import SettingsError
+
 from taskforge.identity.authorization import Role
 from taskforge.identity.credentials import GeneratedCredential
 from taskforge.identity.provisioning import (
@@ -101,7 +104,7 @@ def main(
 
     try:
         settings = settings_factory()
-    except Exception:
+    except (SettingsError, ValidationError):
         _write_error(error_stream, "Bootstrap configuration is invalid.")
         return 2
     if settings.environment != "development":
@@ -132,9 +135,6 @@ def main(
     except ProvisioningUnavailable:
         _write_error(error_stream, "Credential operation is unavailable.")
         return 1
-    except Exception:
-        _write_error(error_stream, "Credential operation is unavailable.")
-        return 1
 
     if generated is None:
         _write_error(error_stream, "Credential revoked.")
@@ -146,7 +146,7 @@ def main(
     try:
         output_stream.write(generated.take_presented_value() + "\n")
         output_stream.flush()
-    except Exception:
+    except OSError:
         _write_error(error_stream, "Credential output failed after creation.")
         return 1
     return 0

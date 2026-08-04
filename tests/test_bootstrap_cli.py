@@ -235,7 +235,6 @@ def test_revocation_has_no_secret_output_and_supports_yes(
         (CredentialNotFound(), "not found", 2),
         (IdentityDisabled(), "disabled", 2),
         (ProvisioningUnavailable(), "unavailable", 1),
-        (RuntimeError("database hostname and secret"), "unavailable", 1),
     ),
 )
 def test_failures_are_normalized_without_secret_output(
@@ -263,6 +262,29 @@ def test_failures_are_normalized_without_secret_output(
     assert expected_message in stderr.getvalue().lower()
     assert "hostname" not in stderr.getvalue()
     assert "secret" not in stderr.getvalue()
+
+
+def test_unexpected_failures_propagate_during_development(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail(*values: object) -> None:
+        del values
+        raise RuntimeError("unexpected programming failure")
+
+    monkeypatch.setattr(cli, "_execute", fail)
+
+    with pytest.raises(RuntimeError, match="unexpected programming failure"):
+        cli.main(
+            [
+                "create-worker",
+                "--name",
+                "worker",
+                "--expires-in",
+                "30d",
+                "--yes",
+            ],
+            settings_factory=settings,
+        )
 
 
 class FakeEngine:
