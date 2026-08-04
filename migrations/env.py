@@ -10,7 +10,7 @@ from alembic import context
 from sqlalchemy import Connection, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from taskforge.persistence.metadata import metadata
+from taskforge.persistence.schema import metadata
 
 config = context.config
 

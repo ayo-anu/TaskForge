@@ -153,7 +153,7 @@ def test_identity_migration_upgrades_and_downgrades_cleanly() -> None:
         ).render_as_string(hide_password=False)
         configuration = Config("alembic.ini")
         with migration_database_url(alembic_url):
-            command.upgrade(configuration, "head")
+            command.upgrade(configuration, "0001_identity")
             asyncio.run(inspect_upgraded_schema(database_url))
             command.downgrade(configuration, "base")
             asyncio.run(inspect_downgraded_schema(database_url))

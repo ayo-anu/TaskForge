@@ -15,14 +15,14 @@ from taskforge.identity.schema import (
 from taskforge.persistence.metadata import metadata
 
 
-def test_identity_metadata_contains_only_the_task_one_tables() -> None:
-    assert set(metadata.tables) == {
+def test_identity_metadata_contains_the_identity_tables() -> None:
+    assert {
         "api_credentials",
         "api_principal_roles",
         "api_principals",
         "worker_credentials",
         "worker_identities",
-    }
+    } <= set(metadata.tables)
 
 
 def test_required_api_roles_are_constrained() -> None:
