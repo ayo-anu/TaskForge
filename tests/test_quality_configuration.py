@@ -9,11 +9,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
 MAKEFILE = PROJECT_ROOT / "Makefile"
 REQUIRED_DEVELOPMENT_TOOLS = {
+    "alembic",
     "httpx2",
     "mypy",
     "pytest",
     "pytest-cov",
     "ruff",
+    "sqlalchemy",
 }
 REQUIRED_MAKE_TARGETS = {
     "install",
@@ -23,6 +25,7 @@ REQUIRED_MAKE_TARGETS = {
     "typecheck",
     "test",
     "coverage",
+    "migrations-check",
     "check",
     "clean",
 }
@@ -81,7 +84,9 @@ def test_makefile_exposes_consistent_developer_commands() -> None:
 
     assert declared_targets == REQUIRED_MAKE_TARGETS
     assert "uv sync --locked --dev" in makefile
-    assert "check: format-check lint typecheck coverage" in makefile
+    assert "ruff format --check src tests migrations/env.py" in makefile
+    assert "ruff check src tests migrations/env.py" in makefile
+    assert "check: format-check lint typecheck coverage migrations-check" in makefile
 
 
 def test_clean_command_preserves_environment_and_docker_resources() -> None:
@@ -92,5 +97,6 @@ def test_clean_command_preserves_environment_and_docker_resources() -> None:
     assert "docker" not in clean_commands.lower()
     assert ".pytest_cache" in clean_commands
     assert "__pycache__" in clean_commands
+    assert "find src tests migrations" in clean_commands
     assert ".coverage" in clean_commands
     assert "htmlcov" in clean_commands

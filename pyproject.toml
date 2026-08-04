@@ -18,11 +18,13 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "alembic>=1,<2",
     "httpx2>=2,<3",
     "mypy>=1,<2",
     "pytest>=8,<9",
     "pytest-cov>=6,<8",
     "ruff>=0.12,<1",
+    "sqlalchemy>=2,<3",
 ]
 
 [tool.hatch.build.targets.wheel]
