@@ -14,15 +14,22 @@ from taskforge.persistence.workflows import (
     SQLAlchemyWorkflowRepository,
     SQLAlchemyWorkflowUnitOfWork,
     _stored_draft,
+    _stored_version,
     _workflow_list_statement,
     _workflow_page,
+    _workflow_version_list_statement,
+    _workflow_version_page,
 )
 from taskforge.workflows.domain import (
     DraftWorkflowStep,
     WorkflowDefinitionStatus,
     WorkflowDraft,
 )
-from taskforge.workflows.persistence_ports import WorkflowPageCursor
+from taskforge.workflows.persistence_ports import (
+    WorkflowPageCursor,
+    WorkflowVersionPageCursor,
+    WorkflowVersionSummary,
+)
 
 
 class FakeSession:
@@ -256,3 +263,75 @@ def test_page_cursor_requires_timezone_and_normalizes_to_utc() -> None:
     assert cursor.created_at.isoformat(timespec="microseconds") == (
         "2026-08-04T19:00:00.123456+00:00"
     )
+
+
+def test_version_page_is_descending_boundary_safe_and_uses_last_returned() -> None:
+    now = datetime.now(UTC)
+    rows = [
+        SimpleNamespace(id=uuid4(), version_number=number, published_at=now)
+        for number in (5, 4, 3)
+    ]
+
+    page = _workflow_version_page(cast(Any, rows), 2)
+
+    assert [item.version_number for item in page.items] == [5, 4]
+    assert page.next_cursor == WorkflowVersionPageCursor(4)
+
+
+def test_version_read_models_reject_invalid_numbers_and_timestamps() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        WorkflowVersionPageCursor(0)
+    with pytest.raises(ValueError, match="positive"):
+        WorkflowVersionSummary(uuid4(), 0, datetime.now(UTC))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        WorkflowVersionSummary(uuid4(), 1, datetime(2026, 8, 5))
+
+
+def test_version_list_statement_uses_strict_descending_keyset_boundary() -> None:
+    statement = _workflow_version_list_statement(
+        uuid4(), uuid4(), 2, WorkflowVersionPageCursor(4)
+    )
+    sql = " ".join(str(statement).split())
+
+    assert "workflow_versions.workflow_definition_id =" in sql
+    assert "workflow_versions.version_number <" in sql
+    assert "workflow_definitions.owner_principal_id =" in sql
+    assert "ORDER BY workflow_versions.version_number DESC" in sql
+    assert statement._limit_clause is not None
+    assert statement._limit_clause.value == 3
+
+
+def test_complete_version_reconstruction_uses_only_snapshot_rows() -> None:
+    now = datetime.now(UTC)
+    version_id, workflow_id = uuid4(), uuid4()
+    version = SimpleNamespace(
+        id=version_id,
+        workflow_definition_id=workflow_id,
+        version_number=2,
+        name="Historical",
+        description=None,
+        execution_policy=None,
+        published_at=now,
+    )
+    steps = [
+        SimpleNamespace(
+            step_identifier="first",
+            task_type="test.task",
+            parameters={"value": 1},
+            execution_policy=None,
+        )
+    ]
+    dependencies = [
+        SimpleNamespace(
+            predecessor_step_identifier="first",
+            successor_step_identifier="second",
+        )
+    ]
+
+    stored = _stored_version(
+        cast(Any, version), cast(Any, steps), cast(Any, dependencies)
+    )
+
+    assert stored.workflow_definition_id == workflow_id
+    assert stored.steps[0].identifier == "first"
+    assert stored.dependencies[0].successor_identifier == "second"

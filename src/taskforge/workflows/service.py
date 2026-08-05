@@ -10,6 +10,7 @@ from taskforge.workflows.domain import (
     WorkflowAvailabilityIntent,
     WorkflowAvailabilityResult,
     WorkflowDraft,
+    WorkflowVersionSnapshot,
     availability_requires_published_version,
     change_workflow_availability,
     create_draft_dependency,
@@ -26,6 +27,8 @@ from taskforge.workflows.persistence_ports import (
     WorkflowPersistenceUnavailable,
     WorkflowRecordConflict,
     WorkflowRepository,
+    WorkflowVersionPage,
+    WorkflowVersionPageCursor,
 )
 from taskforge.workflows.task_types import (
     TaskTypeRegistry,
@@ -240,6 +243,54 @@ class WorkflowService:
             )
         except WorkflowPersistenceUnavailable as error:
             raise WorkflowServiceUnavailable from error
+
+    async def list_versions(
+        self,
+        workflow_id: UUID,
+        *,
+        owner_principal_id: UUID,
+        limit: int,
+        cursor: WorkflowVersionPageCursor | None = None,
+    ) -> WorkflowVersionPage:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise InvalidWorkflowListQuery("limit must be a positive integer")
+        try:
+            page = await self._repository.list_versions(
+                workflow_id,
+                owner_principal_id,
+                limit=limit,
+                cursor=cursor,
+            )
+        except WorkflowPersistenceUnavailable as error:
+            raise WorkflowServiceUnavailable from error
+        if page is None:
+            raise WorkflowNotFound
+        return page
+
+    async def get_version(
+        self,
+        workflow_id: UUID,
+        version_number: int,
+        *,
+        owner_principal_id: UUID,
+    ) -> WorkflowVersionSnapshot:
+        if (
+            isinstance(version_number, bool)
+            or not isinstance(version_number, int)
+            or version_number <= 0
+        ):
+            raise ValueError("version number must be positive")
+        try:
+            version = await self._repository.find_version(
+                workflow_id,
+                version_number,
+                owner_principal_id,
+            )
+        except WorkflowPersistenceUnavailable as error:
+            raise WorkflowServiceUnavailable from error
+        if version is None:
+            raise WorkflowNotFound
+        return version
 
 
 def _resolve_dependencies(

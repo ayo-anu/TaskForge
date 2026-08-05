@@ -14,6 +14,7 @@ from taskforge.workflows.dag_validation import (
     validate_dag,
 )
 from taskforge.workflows.task_types import (
+    JSONMapping,
     JSONValue,
     TaskTypeRegistry,
     WorkflowValidationError,
@@ -160,6 +161,57 @@ class PublishedWorkflowVersion:
         if self.published_at.tzinfo is None:
             raise ValueError("publication timestamp must be timezone-aware")
         object.__setattr__(self, "published_at", self.published_at.astimezone(UTC))
+
+
+@dataclass(frozen=True, repr=False)
+class WorkflowVersionStep:
+    identifier: str
+    task_type: str
+    parameters: JSONMapping
+    execution_policy: JSONMapping | None
+
+    def __repr__(self) -> str:
+        return (
+            "WorkflowVersionStep("
+            f"identifier={self.identifier!r}, task_type={self.task_type!r}, "
+            "parameters=<redacted>, execution_policy=<redacted>)"
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowVersionDependency:
+    predecessor_identifier: str
+    successor_identifier: str
+
+
+@dataclass(frozen=True, repr=False)
+class WorkflowVersionSnapshot:
+    id: UUID
+    workflow_definition_id: UUID
+    version_number: int
+    name: str
+    description: str | None
+    execution_policy: JSONMapping | None
+    published_at: datetime
+    steps: tuple[WorkflowVersionStep, ...]
+    dependencies: tuple[WorkflowVersionDependency, ...]
+
+    def __post_init__(self) -> None:
+        if self.version_number <= 0:
+            raise ValueError("workflow version number must be positive")
+        if self.published_at.tzinfo is None:
+            raise ValueError("publication timestamp must be timezone-aware")
+        object.__setattr__(self, "published_at", self.published_at.astimezone(UTC))
+
+    def __repr__(self) -> str:
+        return (
+            "WorkflowVersionSnapshot("
+            f"id={self.id!r}, workflow_definition_id={self.workflow_definition_id!r}, "
+            f"version_number={self.version_number!r}, name={self.name!r}, "
+            f"description={self.description!r}, execution_policy=<redacted>, "
+            f"published_at={self.published_at!r}, steps={len(self.steps)}, "
+            f"dependencies={len(self.dependencies)})"
+        )
 
 
 def create_draft_step(

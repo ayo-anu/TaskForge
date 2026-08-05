@@ -159,6 +159,48 @@ async def verify_workflow_routes(database_url: URL) -> None:
             found = await client.get(
                 location, headers={"Authorization": f"Bearer {owner_token}"}
             )
+            workflow_id = created.json()["id"]
+            publish_path = f"/api/v1/workflows/{workflow_id}/versions"
+            published = await client.post(
+                publish_path,
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            version_detail = await client.get(
+                published.headers["Location"],
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            second_version = await client.post(
+                publish_path,
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            third_version = await client.post(
+                publish_path,
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            version_first_page = await client.get(
+                f"{publish_path}?limit=2",
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            version_cursor = version_first_page.json()["page"]["next_cursor"]
+            fourth_version = await client.post(
+                publish_path,
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            version_second_page = await client.get(
+                f"{publish_path}?limit=2&cursor={version_cursor}",
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            hidden_version = await client.get(
+                published.headers["Location"],
+                headers={"Authorization": f"Bearer {other_token}"},
+            )
+            missing_version = await client.get(
+                f"/api/v1/workflows/{workflow_id}/versions/999",
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            after_publication = await client.get(
+                location, headers={"Authorization": f"Bearer {owner_token}"}
+            )
             second_created = await client.post(
                 "/api/v1/workflows",
                 json={**body, "name": "Second integrated draft"},
@@ -213,6 +255,29 @@ async def verify_workflow_routes(database_url: URL) -> None:
     ]
     assert created.json()["owner_principal_id"] == str(owner_id)
     assert found.status_code == 200
+    assert published.status_code == 201
+    assert published.json()["version_number"] == 1
+    assert version_detail.status_code == 200
+    assert version_detail.json()["name"] == body["name"]
+    assert [step["identifier"] for step in version_detail.json()["steps"]] == [
+        "first",
+        "second",
+    ]
+    assert version_detail.json()["dependencies"] == [
+        {"predecessor": "first", "successor": "second"}
+    ]
+    assert second_version.json()["version_number"] == 2
+    assert third_version.json()["version_number"] == 3
+    assert fourth_version.json()["version_number"] == 4
+    assert [item["version_number"] for item in version_first_page.json()["items"]] == [
+        3,
+        2,
+    ]
+    assert [item["version_number"] for item in version_second_page.json()["items"]] == [
+        1
+    ]
+    assert after_publication.json()["status"] == "draft"
+    assert hidden_version.status_code == missing_version.status_code == 404
     assert second_created.status_code == third_created.status_code == 201
     assert first_page.status_code == second_page.status_code == 200
     assert len(first_page.json()["items"]) == 2

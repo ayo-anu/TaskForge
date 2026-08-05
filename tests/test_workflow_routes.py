@@ -22,7 +22,9 @@ from taskforge.api.workflows import (
     MAX_CURSOR_LENGTH,
     MAX_DECODED_CURSOR_BYTES,
     _decode_cursor,
+    _decode_version_cursor,
     _encode_cursor,
+    _encode_version_cursor,
 )
 from taskforge.identity.authentication import APIAuthenticator, WorkerAuthenticator
 from taskforge.identity.authorization import AuthorizationService, Role
@@ -38,15 +40,26 @@ from taskforge.workflows.dag_validation import (
     DAGValidationResult,
     validate_dag,
 )
-from taskforge.workflows.domain import WorkflowDefinitionStatus, WorkflowDraft
+from taskforge.workflows.domain import (
+    PublishedWorkflowVersion,
+    WorkflowDefinitionStatus,
+    WorkflowDraft,
+    WorkflowVersionDependency,
+    WorkflowVersionSnapshot,
+    WorkflowVersionStep,
+)
 from taskforge.workflows.persistence_ports import (
     StoredWorkflowDraft,
     WorkflowPage,
     WorkflowPageCursor,
     WorkflowSummary,
+    WorkflowVersionPage,
+    WorkflowVersionPageCursor,
+    WorkflowVersionSummary,
 )
 from taskforge.workflows.service import (
     WorkflowNotFound,
+    WorkflowOwnerDisabled,
     WorkflowPersistenceConflict,
     WorkflowServiceUnavailable,
 )
@@ -54,6 +67,7 @@ from taskforge.workflows.task_types import (
     JSONMapping,
     TaskTypeDefinition,
     TaskTypeRegistry,
+    WorkflowValidationError,
     WorkflowValidationIssue,
 )
 
@@ -107,6 +121,16 @@ class WorkflowServiceStub:
         self.get_error: Exception | None = None
         self.list_error: Exception | None = None
         self.page = WorkflowPage((), None)
+        self.version_page = WorkflowVersionPage((), None)
+        self.version_value: WorkflowVersionSnapshot | None = None
+        self.publish_error: Exception | None = None
+        self.version_list_error: Exception | None = None
+        self.version_get_error: Exception | None = None
+        self.publish_calls: list[tuple[UUID, UUID]] = []
+        self.version_list_calls: list[
+            tuple[UUID, UUID, int, WorkflowVersionPageCursor | None]
+        ] = []
+        self.version_get_calls: list[tuple[UUID, int, UUID]] = []
         self.list_calls: list[tuple[UUID, int, WorkflowPageCursor | None]] = []
 
     async def create(self, workflow: WorkflowDraft) -> StoredWorkflowDraft:
@@ -139,6 +163,41 @@ class WorkflowServiceStub:
         if self.list_error:
             raise self.list_error
         return self.page
+
+    async def publish(
+        self, workflow_id: UUID, *, owner_principal_id: UUID
+    ) -> PublishedWorkflowVersion:
+        self.publish_calls.append((workflow_id, owner_principal_id))
+        if self.publish_error:
+            raise self.publish_error
+        return PublishedWorkflowVersion(uuid4(), workflow_id, 1, datetime.now(UTC))
+
+    async def list_versions(
+        self,
+        workflow_id: UUID,
+        *,
+        owner_principal_id: UUID,
+        limit: int,
+        cursor: WorkflowVersionPageCursor | None = None,
+    ) -> WorkflowVersionPage:
+        self.version_list_calls.append((workflow_id, owner_principal_id, limit, cursor))
+        if self.version_list_error:
+            raise self.version_list_error
+        return self.version_page
+
+    async def get_version(
+        self,
+        workflow_id: UUID,
+        version_number: int,
+        *,
+        owner_principal_id: UUID,
+    ) -> WorkflowVersionSnapshot:
+        self.version_get_calls.append((workflow_id, version_number, owner_principal_id))
+        if self.version_get_error:
+            raise self.version_get_error
+        if self.version_value is None:
+            raise WorkflowNotFound
+        return self.version_value
 
 
 class Runtime:
@@ -246,6 +305,22 @@ def summary(owner_id: UUID, *, created_at: datetime | None = None) -> WorkflowSu
         WorkflowDefinitionStatus.DRAFT,
         now,
         now,
+    )
+
+
+def version_snapshot(
+    workflow_id: UUID, version_number: int = 1
+) -> WorkflowVersionSnapshot:
+    return WorkflowVersionSnapshot(
+        uuid4(),
+        workflow_id,
+        version_number,
+        "Published",
+        "Historical",
+        None,
+        datetime.now(UTC),
+        (WorkflowVersionStep("first", "test.task", {"value": 1}, None),),
+        (WorkflowVersionDependency("first", "second"),),
     )
 
 
@@ -542,6 +617,207 @@ def test_openapi_exposes_only_current_workflow_operations() -> None:
     assert set(schema["paths"]["/api/v1/workflows"]) == {"get", "post"}
     assert set(schema["paths"]["/api/v1/workflows/{workflow_id}"]) == {"get"}
     assert set(schema["paths"]["/api/v1/workflows/validate"]) == {"post"}
+    assert set(schema["paths"]["/api/v1/workflows/{workflow_id}/versions"]) == {
+        "get",
+        "post",
+    }
+    assert set(
+        schema["paths"]["/api/v1/workflows/{workflow_id}/versions/{version_number}"]
+    ) == {"get"}
+
+
+def test_operator_publishes_using_existing_application_result() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    workflow_id = uuid4()
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflows/{workflow_id}/versions",
+        runtime.api_credential,
+    )
+
+    assert response.status_code == 201
+    assert response.json()["workflow_definition_id"] == str(workflow_id)
+    assert response.headers["Location"].endswith("/versions/1")
+    assert service.publish_calls == [(workflow_id, runtime.caller_id)]
+
+
+def test_publish_authorization_and_errors_are_safe() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.VIEWER.value}))
+    path = f"/api/v1/workflows/{uuid4()}/versions"
+    forbidden = request(app, "POST", path, runtime.api_credential)
+    assert forbidden.status_code == 403
+    assert service.publish_calls == []
+
+    app, runtime, service, _ = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    service.publish_error = WorkflowNotFound()
+    missing = request(app, "POST", path, runtime.api_credential)
+    assert missing.status_code == 404
+    service.publish_error = WorkflowPersistenceConflict()
+    assert request(app, "POST", path, runtime.api_credential).status_code == 409
+    service.publish_error = WorkflowServiceUnavailable("database-secret")
+    unavailable = request(app, "POST", path, runtime.api_credential)
+    assert unavailable.status_code == 503
+    assert "database-secret" not in unavailable.text
+    service.publish_error = WorkflowOwnerDisabled()
+    assert request(app, "POST", path, runtime.api_credential).status_code == 403
+
+
+def test_invalid_persisted_draft_publication_returns_structured_422() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    service.publish_error = WorkflowValidationError.from_graph(validate_dag((), ()))
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflows/{uuid4()}/versions",
+        runtime.api_credential,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"] == [
+        {
+            "code": "empty_graph",
+            "path": ["steps"],
+            "message": "A workflow must contain at least one step.",
+        }
+    ]
+
+
+def test_viewer_lists_versions_with_stable_cursor_contract() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.VIEWER.value}))
+    workflow_id = uuid4()
+    now = datetime.now(UTC)
+    service.version_page = WorkflowVersionPage(
+        (WorkflowVersionSummary(uuid4(), 3, now),), WorkflowVersionPageCursor(3)
+    )
+
+    first = request(
+        app,
+        "GET",
+        f"/api/v1/workflows/{workflow_id}/versions?limit=1",
+        runtime.api_credential,
+    )
+    encoded = first.json()["page"]["next_cursor"]
+    assert _decode_version_cursor(encoded) == WorkflowVersionPageCursor(3)
+    service.version_page = WorkflowVersionPage((), None)
+    second = request(
+        app,
+        "GET",
+        f"/api/v1/workflows/{workflow_id}/versions?limit=1&cursor={encoded}",
+        runtime.api_credential,
+    )
+    assert second.status_code == 200
+    assert service.version_list_calls[-1] == (
+        workflow_id,
+        runtime.caller_id,
+        1,
+        WorkflowVersionPageCursor(3),
+    )
+
+
+def test_version_cursor_rejects_invalid_payload_before_service() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.VIEWER.value}))
+    workflow_id = uuid4()
+    invalid = request(
+        app,
+        "GET",
+        f"/api/v1/workflows/{workflow_id}/versions?cursor=not-base64!",
+        runtime.api_credential,
+    )
+    assert invalid.status_code == 422
+    assert service.version_list_calls == []
+    assert _decode_version_cursor(
+        _encode_version_cursor(WorkflowVersionPageCursor(7))
+    ) == (WorkflowVersionPageCursor(7))
+    invalid_payloads: tuple[object, ...] = (
+        {"v": 2, "version_number": 7},
+        {"v": 1, "version_number": 0},
+        {"v": 1, "version_number": True},
+        {"v": 1, "version_number": 7, "extra": 1},
+    )
+    for payload in invalid_payloads:
+        encoded = (
+            base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+        )
+        with pytest.raises(ValueError, match="invalid cursor"):
+            _decode_version_cursor(encoded)
+    oversized = (
+        base64.urlsafe_b64encode(b"x" * (MAX_DECODED_CURSOR_BYTES + 1))
+        .rstrip(b"=")
+        .decode()
+    )
+    with pytest.raises(ValueError, match="invalid cursor"):
+        _decode_version_cursor(oversized)
+
+
+def test_viewer_retrieves_complete_version_by_number_only() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.VIEWER.value}))
+    workflow_id = uuid4()
+    service.version_value = version_snapshot(workflow_id, 2)
+
+    response = request(
+        app,
+        "GET",
+        f"/api/v1/workflows/{workflow_id}/versions/2",
+        runtime.api_credential,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["steps"][0]["identifier"] == "first"
+    assert response.json()["dependencies"] == [
+        {"predecessor": "first", "successor": "second"}
+    ]
+    assert service.version_get_calls == [(workflow_id, 2, runtime.caller_id)]
+    assert (
+        request(
+            app,
+            "GET",
+            f"/api/v1/workflows/{workflow_id}/versions/0",
+            runtime.api_credential,
+        ).status_code
+        == 422
+    )
+
+
+def test_version_reads_normalize_missing_and_unavailable() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.VIEWER.value}))
+    workflow_id = uuid4()
+    service.version_list_error = WorkflowNotFound()
+    missing_list = request(
+        app,
+        "GET",
+        f"/api/v1/workflows/{workflow_id}/versions",
+        runtime.api_credential,
+    )
+    service.version_get_error = WorkflowNotFound()
+    missing_detail = request(
+        app,
+        "GET",
+        f"/api/v1/workflows/{workflow_id}/versions/1",
+        runtime.api_credential,
+    )
+    assert missing_list.status_code == missing_detail.status_code == 404
+
+    service.version_list_error = WorkflowServiceUnavailable("database-secret")
+    unavailable = request(
+        app,
+        "GET",
+        f"/api/v1/workflows/{workflow_id}/versions",
+        runtime.api_credential,
+    )
+    assert unavailable.status_code == 503
+    assert "database-secret" not in unavailable.text
+    service.version_get_error = WorkflowServiceUnavailable("database-secret")
+    unavailable_detail = request(
+        app,
+        "GET",
+        f"/api/v1/workflows/{workflow_id}/versions/1",
+        runtime.api_credential,
+    )
+    assert unavailable_detail.status_code == 503
+    assert "database-secret" not in unavailable_detail.text
 
 
 def test_viewer_lists_only_service_owner_scope_with_default_page_size() -> None:

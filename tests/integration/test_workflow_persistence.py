@@ -383,6 +383,53 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         assert sorted(item.version_number for item in concurrent) == [3, 4]
         assert await count_version_rows(sessions, created_input.id) == (4, 8, 1)
 
+        version_page = await service.list_versions(
+            created_input.id,
+            owner_principal_id=owner_id,
+            limit=2,
+        )
+        assert [item.version_number for item in version_page.items] == [4, 3]
+        assert version_page.next_cursor is not None
+        later_publication = await service.publish(
+            created_input.id, owner_principal_id=owner_id
+        )
+        assert later_publication.version_number == 5
+        older_page = await service.list_versions(
+            created_input.id,
+            owner_principal_id=owner_id,
+            limit=2,
+            cursor=version_page.next_cursor,
+        )
+        assert [item.version_number for item in older_page.items] == [2, 1]
+        assert {item.version_number for item in version_page.items}.isdisjoint(
+            item.version_number for item in older_page.items
+        )
+        historical = await service.get_version(
+            created_input.id,
+            1,
+            owner_principal_id=owner_id,
+        )
+        assert historical.name == created_input.name
+        assert [step.identifier for step in historical.steps] == ["first", "second"]
+        assert historical.steps[0].parameters == {"value": 1}
+        assert [
+            (
+                dependency.predecessor_identifier,
+                dependency.successor_identifier,
+            )
+            for dependency in historical.dependencies
+        ] == [("first", "second")]
+        with pytest.raises(WorkflowNotFound):
+            await service.get_version(
+                created_input.id, 1, owner_principal_id=other_owner_id
+            )
+        with pytest.raises(WorkflowNotFound):
+            await service.list_versions(
+                created_input.id,
+                owner_principal_id=other_owner_id,
+                limit=10,
+            )
+
         with pytest.raises(WorkflowNotFound):
             await service.get(
                 created_input.id,

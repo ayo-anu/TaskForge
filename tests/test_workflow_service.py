@@ -18,6 +18,7 @@ from taskforge.workflows.domain import (
     WorkflowAvailabilityTransitionRejected,
     WorkflowDefinitionStatus,
     WorkflowDraft,
+    WorkflowVersionSnapshot,
 )
 from taskforge.workflows.persistence_ports import (
     LockedWorkflowDefinition,
@@ -31,6 +32,8 @@ from taskforge.workflows.persistence_ports import (
     WorkflowRecordConflict,
     WorkflowTimestamps,
     WorkflowTransactionContext,
+    WorkflowVersionPage,
+    WorkflowVersionPageCursor,
 )
 from taskforge.workflows.service import (
     InvalidWorkflowListQuery,
@@ -197,10 +200,18 @@ class FakeRepository:
     stored: StoredWorkflowDraft | None = None
     page: WorkflowPage = field(default_factory=lambda: WorkflowPage((), None))
     query_failure: Exception | None = None
+    version_page: WorkflowVersionPage | None = field(
+        default_factory=lambda: WorkflowVersionPage((), None)
+    )
+    version_value: WorkflowVersionSnapshot | None = None
 
     def __post_init__(self) -> None:
         self.find_calls: list[tuple[UUID, UUID]] = []
         self.list_calls: list[tuple[UUID, int, WorkflowPageCursor | None]] = []
+        self.version_list_calls: list[
+            tuple[UUID, UUID, int, WorkflowVersionPageCursor | None]
+        ] = []
+        self.version_get_calls: list[tuple[UUID, int, UUID]] = []
 
     def transaction(self) -> WorkflowTransactionContext:
         return self.transaction_value
@@ -226,6 +237,30 @@ class FakeRepository:
         if self.query_failure is not None:
             raise self.query_failure
         return self.page
+
+    async def list_versions(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+        *,
+        limit: int,
+        cursor: WorkflowVersionPageCursor | None,
+    ) -> WorkflowVersionPage | None:
+        self.version_list_calls.append((workflow_id, owner_principal_id, limit, cursor))
+        if self.query_failure is not None:
+            raise self.query_failure
+        return self.version_page
+
+    async def find_version(
+        self,
+        workflow_id: UUID,
+        version_number: int,
+        owner_principal_id: UUID,
+    ) -> WorkflowVersionSnapshot | None:
+        self.version_get_calls.append((workflow_id, version_number, owner_principal_id))
+        if self.query_failure is not None:
+            raise self.query_failure
+        return self.version_value
 
 
 def test_create_persists_complete_aggregate_in_one_transaction() -> None:
@@ -774,3 +809,91 @@ def test_expected_query_failure_is_normalized(operation: str) -> None:
             asyncio.run(service.get(uuid4(), owner_principal_id=uuid4()))
         else:
             asyncio.run(service.list(owner_principal_id=uuid4(), limit=1))
+
+
+def test_version_list_is_owner_scoped_and_passes_cursor() -> None:
+    repository = FakeRepository(FakeTransaction())
+    workflow_id, owner_id = uuid4(), uuid4()
+    cursor = WorkflowVersionPageCursor(8)
+
+    page = asyncio.run(
+        workflow_service(repository).list_versions(
+            workflow_id,
+            owner_principal_id=owner_id,
+            limit=3,
+            cursor=cursor,
+        )
+    )
+
+    assert page == WorkflowVersionPage((), None)
+    assert repository.version_list_calls == [(workflow_id, owner_id, 3, cursor)]
+
+
+def test_missing_version_collection_and_detail_are_non_enumerating() -> None:
+    repository = FakeRepository(
+        FakeTransaction(), version_page=None, version_value=None
+    )
+    service = workflow_service(repository)
+
+    with pytest.raises(WorkflowNotFound):
+        asyncio.run(service.list_versions(uuid4(), owner_principal_id=uuid4(), limit=1))
+    with pytest.raises(WorkflowNotFound):
+        asyncio.run(service.get_version(uuid4(), 1, owner_principal_id=uuid4()))
+
+
+def test_version_detail_uses_only_workflow_scoped_number_and_owner() -> None:
+    repository = FakeRepository(FakeTransaction())
+    workflow_id, owner_id = uuid4(), uuid4()
+    version = WorkflowVersionSnapshot(
+        uuid4(), workflow_id, 4, "Snapshot", None, None, datetime.now(UTC), (), ()
+    )
+    repository.version_value = version
+
+    found = asyncio.run(
+        workflow_service(repository).get_version(
+            workflow_id, 4, owner_principal_id=owner_id
+        )
+    )
+
+    assert found is version
+    assert repository.version_get_calls == [(workflow_id, 4, owner_id)]
+
+
+@pytest.mark.parametrize("operation", ("list", "get"))
+def test_version_query_unavailability_is_normalized(operation: str) -> None:
+    repository = FakeRepository(
+        FakeTransaction(), query_failure=WorkflowPersistenceUnavailable()
+    )
+    service = workflow_service(repository)
+
+    with pytest.raises(WorkflowServiceUnavailable):
+        if operation == "list":
+            asyncio.run(
+                service.list_versions(uuid4(), owner_principal_id=uuid4(), limit=1)
+            )
+        else:
+            asyncio.run(service.get_version(uuid4(), 1, owner_principal_id=uuid4()))
+
+
+@pytest.mark.parametrize("value", (0, -1, True, "1"))
+def test_version_queries_validate_positive_values_before_repository(
+    value: object,
+) -> None:
+    repository = FakeRepository(FakeTransaction())
+    service = workflow_service(repository)
+
+    with pytest.raises((InvalidWorkflowListQuery, ValueError)):
+        if value is True:
+            asyncio.run(
+                service.list_versions(uuid4(), owner_principal_id=uuid4(), limit=value)
+            )
+        else:
+            asyncio.run(
+                service.get_version(
+                    uuid4(),
+                    value,  # type: ignore[arg-type]
+                    owner_principal_id=uuid4(),
+                )
+            )
+    assert repository.version_list_calls == []
+    assert repository.version_get_calls == []

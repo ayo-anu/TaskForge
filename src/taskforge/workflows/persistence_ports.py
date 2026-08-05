@@ -13,6 +13,7 @@ from taskforge.workflows.domain import (
     DraftWorkflowStep,
     WorkflowDefinitionStatus,
     WorkflowDraft,
+    WorkflowVersionSnapshot,
 )
 
 
@@ -93,6 +94,35 @@ class WorkflowPageCursor:
 class WorkflowPage:
     items: tuple[WorkflowSummary, ...]
     next_cursor: WorkflowPageCursor | None
+
+
+@dataclass(frozen=True)
+class WorkflowVersionSummary:
+    id: UUID
+    version_number: int
+    published_at: datetime
+
+    def __post_init__(self) -> None:
+        if isinstance(self.version_number, bool) or self.version_number <= 0:
+            raise ValueError("workflow version number must be positive")
+        if self.published_at.tzinfo is None:
+            raise ValueError("publication timestamp must be timezone-aware")
+        object.__setattr__(self, "published_at", self.published_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class WorkflowVersionPageCursor:
+    version_number: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.version_number, bool) or self.version_number <= 0:
+            raise ValueError("workflow version cursor must be positive")
+
+
+@dataclass(frozen=True)
+class WorkflowVersionPage:
+    items: tuple[WorkflowVersionSummary, ...]
+    next_cursor: WorkflowVersionPageCursor | None
 
 
 class WorkflowTransaction(Protocol):
@@ -187,3 +217,19 @@ class WorkflowRepository(Protocol):
         limit: int,
         cursor: WorkflowPageCursor | None,
     ) -> WorkflowPage: ...
+
+    async def list_versions(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+        *,
+        limit: int,
+        cursor: WorkflowVersionPageCursor | None,
+    ) -> WorkflowVersionPage | None: ...
+
+    async def find_version(
+        self,
+        workflow_id: UUID,
+        version_number: int,
+        owner_principal_id: UUID,
+    ) -> WorkflowVersionSnapshot | None: ...

@@ -19,6 +19,9 @@ from taskforge.workflows.domain import (
     DraftWorkflowStep,
     WorkflowDefinitionStatus,
     WorkflowDraft,
+    WorkflowVersionDependency,
+    WorkflowVersionSnapshot,
+    WorkflowVersionStep,
 )
 from taskforge.workflows.persistence_ports import (
     LockedWorkflowDefinition,
@@ -32,6 +35,9 @@ from taskforge.workflows.persistence_ports import (
     WorkflowRecordConflict,
     WorkflowSummary,
     WorkflowTimestamps,
+    WorkflowVersionPage,
+    WorkflowVersionPageCursor,
+    WorkflowVersionSummary,
 )
 from taskforge.workflows.schema import (
     workflow_definitions,
@@ -116,6 +122,86 @@ class SQLAlchemyWorkflowRepository:
             raise WorkflowPersistenceUnavailable from error
         return _workflow_page(rows, limit)
 
+    async def list_versions(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+        *,
+        limit: int,
+        cursor: WorkflowVersionPageCursor | None,
+    ) -> WorkflowVersionPage | None:
+        try:
+            async with self._sessions() as session, session.begin():
+                rows = (
+                    await session.execute(
+                        _workflow_version_list_statement(
+                            workflow_id,
+                            owner_principal_id,
+                            limit,
+                            cursor,
+                        )
+                    )
+                ).all()
+                if not rows:
+                    return None
+                if rows[0].id is None:
+                    return WorkflowVersionPage((), None)
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+        return _workflow_version_page(rows, limit)
+
+    async def find_version(
+        self,
+        workflow_id: UUID,
+        version_number: int,
+        owner_principal_id: UUID,
+    ) -> WorkflowVersionSnapshot | None:
+        try:
+            async with self._sessions() as session, session.begin():
+                version = (
+                    await session.execute(
+                        select(workflow_versions)
+                        .join(
+                            workflow_definitions,
+                            workflow_definitions.c.id
+                            == workflow_versions.c.workflow_definition_id,
+                        )
+                        .where(
+                            workflow_versions.c.workflow_definition_id == workflow_id,
+                            workflow_versions.c.version_number == version_number,
+                            workflow_definitions.c.owner_principal_id
+                            == owner_principal_id,
+                        )
+                    )
+                ).one_or_none()
+                if version is None:
+                    return None
+                steps = (
+                    await session.execute(
+                        select(workflow_version_steps)
+                        .where(
+                            workflow_version_steps.c.workflow_version_id == version.id
+                        )
+                        .order_by(workflow_version_steps.c.step_identifier)
+                    )
+                ).all()
+                dependencies = (
+                    await session.execute(
+                        select(workflow_version_dependencies)
+                        .where(
+                            workflow_version_dependencies.c.workflow_version_id
+                            == version.id
+                        )
+                        .order_by(
+                            workflow_version_dependencies.c.predecessor_step_identifier,
+                            workflow_version_dependencies.c.successor_step_identifier,
+                        )
+                    )
+                ).all()
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+        return _stored_version(version, steps, dependencies)
+
 
 def _workflow_list_statement(
     owner_principal_id: UUID,
@@ -152,6 +238,35 @@ def _workflow_list_statement(
     return statement
 
 
+def _workflow_version_list_statement(
+    workflow_id: UUID,
+    owner_principal_id: UUID,
+    limit: int,
+    cursor: WorkflowVersionPageCursor | None,
+) -> Any:
+    join_condition = workflow_versions.c.workflow_definition_id == workflow_id
+    if cursor is not None:
+        join_condition = and_(
+            join_condition,
+            workflow_versions.c.version_number < cursor.version_number,
+        )
+    statement = (
+        select(
+            workflow_versions.c.id,
+            workflow_versions.c.version_number,
+            workflow_versions.c.published_at,
+        )
+        .select_from(workflow_definitions.outerjoin(workflow_versions, join_condition))
+        .where(
+            workflow_definitions.c.id == workflow_id,
+            workflow_definitions.c.owner_principal_id == owner_principal_id,
+        )
+        .order_by(workflow_versions.c.version_number.desc())
+        .limit(limit + 1)
+    )
+    return statement
+
+
 def _workflow_page(rows: Sequence[Row[Any]], limit: int) -> WorkflowPage:
     summaries = tuple(
         WorkflowSummary(
@@ -172,6 +287,53 @@ def _workflow_page(rows: Sequence[Row[Any]], limit: int) -> WorkflowPage:
         last = items[-1]
         next_cursor = WorkflowPageCursor(last.created_at, last.id)
     return WorkflowPage(items=items, next_cursor=next_cursor)
+
+
+def _workflow_version_page(rows: Sequence[Row[Any]], limit: int) -> WorkflowVersionPage:
+    summaries = tuple(
+        WorkflowVersionSummary(row.id, row.version_number, row.published_at)
+        for row in rows
+    )
+    has_more = len(summaries) > limit
+    items = summaries[:limit]
+    next_cursor = (
+        WorkflowVersionPageCursor(items[-1].version_number)
+        if has_more and items
+        else None
+    )
+    return WorkflowVersionPage(items, next_cursor)
+
+
+def _stored_version(
+    version: Row[Any],
+    step_rows: Sequence[Row[Any]],
+    dependency_rows: Sequence[Row[Any]],
+) -> WorkflowVersionSnapshot:
+    return WorkflowVersionSnapshot(
+        id=version.id,
+        workflow_definition_id=version.workflow_definition_id,
+        version_number=version.version_number,
+        name=version.name,
+        description=version.description,
+        execution_policy=version.execution_policy,
+        published_at=version.published_at,
+        steps=tuple(
+            WorkflowVersionStep(
+                identifier=row.step_identifier,
+                task_type=row.task_type,
+                parameters=row.parameters,
+                execution_policy=row.execution_policy,
+            )
+            for row in step_rows
+        ),
+        dependencies=tuple(
+            WorkflowVersionDependency(
+                predecessor_identifier=row.predecessor_step_identifier,
+                successor_identifier=row.successor_step_identifier,
+            )
+            for row in dependency_rows
+        ),
+    )
 
 
 class SQLAlchemyWorkflowUnitOfWork:

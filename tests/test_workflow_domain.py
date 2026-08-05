@@ -17,6 +17,9 @@ from taskforge.workflows.domain import (
     WorkflowAvailabilityTransitionRejected,
     WorkflowDefinitionStatus,
     WorkflowDraft,
+    WorkflowVersionDependency,
+    WorkflowVersionSnapshot,
+    WorkflowVersionStep,
     availability_requires_published_version,
     change_workflow_availability,
     create_draft_dependency,
@@ -225,6 +228,34 @@ def test_published_version_metadata_is_frozen_positive_and_utc_normalized() -> N
         PublishedWorkflowVersion(uuid4(), uuid4(), 0, datetime.now(UTC))
     with pytest.raises(ValueError, match="timezone-aware"):
         PublishedWorkflowVersion(uuid4(), uuid4(), 1, datetime(2026, 8, 5))
+
+
+def test_complete_version_snapshot_is_frozen_ordered_and_redacted() -> None:
+    marker = "sensitive-marker"
+    version = WorkflowVersionSnapshot(
+        id=uuid4(),
+        workflow_definition_id=uuid4(),
+        version_number=2,
+        name="Historical",
+        description=None,
+        execution_policy={"marker": marker},
+        published_at=datetime.fromisoformat("2026-08-05T12:00:00-07:00"),
+        steps=(
+            WorkflowVersionStep("first", "test.accepted", {"marker": marker}, None),
+        ),
+        dependencies=(WorkflowVersionDependency("first", "second"),),
+    )
+
+    assert version.published_at == datetime(2026, 8, 5, 19, tzinfo=UTC)
+    assert version.steps[0].parameters == {"marker": marker}
+    assert marker not in repr(version)
+    assert marker not in repr(version.steps[0])
+    with pytest.raises(FrozenInstanceError):
+        version.version_number = 3  # type: ignore[misc]
+    with pytest.raises(ValueError, match="positive"):
+        WorkflowVersionSnapshot(
+            uuid4(), uuid4(), 0, "Invalid", None, None, datetime.now(UTC), (), ()
+        )
 
 
 @pytest.mark.parametrize(

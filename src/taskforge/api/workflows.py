@@ -9,7 +9,16 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Protocol, cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field
 
 from taskforge.api.authorization import require_permission
@@ -29,7 +38,9 @@ from taskforge.workflows.dag_validation import (
 from taskforge.workflows.domain import (
     DraftDependency,
     DraftWorkflowStep,
+    PublishedWorkflowVersion,
     WorkflowDefinitionStatus,
+    WorkflowVersionSnapshot,
     _create_workflow_draft_with_validation,
     create_draft_dependency,
     create_draft_step,
@@ -39,6 +50,8 @@ from taskforge.workflows.persistence_ports import (
     StoredWorkflowDraft,
     WorkflowPageCursor,
     WorkflowSummary,
+    WorkflowVersionPageCursor,
+    WorkflowVersionSummary,
 )
 from taskforge.workflows.service import (
     WorkflowNotFound,
@@ -128,6 +141,48 @@ class WorkflowListResponse(BaseModel):
 class WorkflowValidationResponse(BaseModel):
     valid: bool
     topological_order: list[str]
+
+
+class PublishedWorkflowVersionResponse(BaseModel):
+    id: UUID
+    workflow_definition_id: UUID
+    version_number: int
+    published_at: datetime
+
+
+class WorkflowVersionSummaryResponse(BaseModel):
+    id: UUID
+    version_number: int
+    published_at: datetime
+
+
+class WorkflowVersionListResponse(BaseModel):
+    items: list[WorkflowVersionSummaryResponse]
+    page: WorkflowPageMetadataResponse
+
+
+class WorkflowVersionStepResponse(BaseModel):
+    identifier: str
+    task_type: str
+    parameters: JSONMapping
+    execution_policy: JSONMapping | None
+
+
+class WorkflowVersionDependencyResponse(BaseModel):
+    predecessor: str
+    successor: str
+
+
+class WorkflowVersionResponse(BaseModel):
+    id: UUID
+    workflow_definition_id: UUID
+    version_number: int
+    name: str
+    description: str | None
+    execution_policy: JSONMapping | None
+    published_at: datetime
+    steps: list[WorkflowVersionStepResponse]
+    dependencies: list[WorkflowVersionDependencyResponse]
 
 
 class WorkflowRuntimeProtocol(Protocol):
@@ -298,6 +353,133 @@ async def validate_workflow(
         valid=True,
         topological_order=list(graph_result.topological_order),
     )
+
+
+@router.post(
+    "/{workflow_id}/versions",
+    response_model=PublishedWorkflowVersionResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        **COMMON_RESPONSES,
+        status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+        status.HTTP_409_CONFLICT: {"model": ErrorResponse},
+    },
+)
+async def publish_workflow(
+    workflow_id: UUID,
+    request: Request,
+    response: Response,
+    context: Annotated[
+        AuthorizationContext,
+        Depends(require_permission(Permission.OPERATE_WORKFLOW)),
+    ],
+) -> PublishedWorkflowVersionResponse | Response:
+    try:
+        published = await _runtime(request).workflow_service.publish(
+            workflow_id,
+            owner_principal_id=context.principal_id,
+        )
+    except WorkflowValidationError as error:
+        if error.graph_result is not None:
+            return _graph_validation_error(request, error.graph_result.issues)
+        return _validation_error(request, error.issues)
+    except WorkflowNotFound as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except (WorkflowOwnerNotFound, WorkflowOwnerDisabled) as error:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from error
+    except WorkflowPersistenceConflict as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT) from error
+    except WorkflowServiceUnavailable as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
+    response.headers["Location"] = (
+        f"/api/v1/workflows/{workflow_id}/versions/{published.version_number}"
+    )
+    return _published_version_response(published)
+
+
+@router.get(
+    "/{workflow_id}/versions",
+    response_model=WorkflowVersionListResponse,
+    responses={
+        **COMMON_RESPONSES,
+        status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+    },
+)
+async def list_workflow_versions(
+    workflow_id: UUID,
+    request: Request,
+    context: Annotated[
+        AuthorizationContext,
+        Depends(require_permission(Permission.VIEW)),
+    ],
+    limit: Annotated[int, Query(ge=1, le=MAX_WORKFLOW_PAGE_SIZE)] = (
+        DEFAULT_WORKFLOW_PAGE_SIZE
+    ),
+    cursor: Annotated[str | None, Query(max_length=MAX_CURSOR_LENGTH)] = None,
+) -> WorkflowVersionListResponse | Response:
+    try:
+        decoded = _decode_version_cursor(cursor) if cursor is not None else None
+    except ValueError:
+        return _validation_error(
+            request,
+            (
+                WorkflowValidationIssue(
+                    "invalid_cursor", ("query", "cursor"), "Cursor is invalid."
+                ),
+            ),
+        )
+    try:
+        page = await _runtime(request).workflow_service.list_versions(
+            workflow_id,
+            owner_principal_id=context.principal_id,
+            limit=limit,
+            cursor=decoded,
+        )
+    except WorkflowNotFound as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except WorkflowServiceUnavailable as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
+    return WorkflowVersionListResponse(
+        items=[_version_summary_response(item) for item in page.items],
+        page=WorkflowPageMetadataResponse(
+            limit=limit,
+            next_cursor=(
+                _encode_version_cursor(page.next_cursor)
+                if page.next_cursor is not None
+                else None
+            ),
+        ),
+    )
+
+
+@router.get(
+    "/{workflow_id}/versions/{version_number}",
+    response_model=WorkflowVersionResponse,
+    responses={
+        **COMMON_RESPONSES,
+        status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+    },
+)
+async def get_workflow_version(
+    workflow_id: UUID,
+    version_number: Annotated[int, Path(gt=0)],
+    request: Request,
+    context: Annotated[
+        AuthorizationContext,
+        Depends(require_permission(Permission.VIEW)),
+    ],
+) -> WorkflowVersionResponse:
+    try:
+        version = await _runtime(request).workflow_service.get_version(
+            workflow_id,
+            version_number,
+            owner_principal_id=context.principal_id,
+        )
+    except WorkflowNotFound as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except WorkflowServiceUnavailable as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
+    return _workflow_version_response(version)
 
 
 @router.get(
@@ -479,6 +661,57 @@ def _workflow_summary_response(summary: WorkflowSummary) -> WorkflowSummaryRespo
     )
 
 
+def _published_version_response(
+    published: PublishedWorkflowVersion,
+) -> PublishedWorkflowVersionResponse:
+    return PublishedWorkflowVersionResponse(
+        id=published.id,
+        workflow_definition_id=published.workflow_definition_id,
+        version_number=published.version_number,
+        published_at=published.published_at,
+    )
+
+
+def _version_summary_response(
+    summary: WorkflowVersionSummary,
+) -> WorkflowVersionSummaryResponse:
+    return WorkflowVersionSummaryResponse(
+        id=summary.id,
+        version_number=summary.version_number,
+        published_at=summary.published_at,
+    )
+
+
+def _workflow_version_response(
+    version: WorkflowVersionSnapshot,
+) -> WorkflowVersionResponse:
+    return WorkflowVersionResponse(
+        id=version.id,
+        workflow_definition_id=version.workflow_definition_id,
+        version_number=version.version_number,
+        name=version.name,
+        description=version.description,
+        execution_policy=version.execution_policy,
+        published_at=version.published_at,
+        steps=[
+            WorkflowVersionStepResponse(
+                identifier=step.identifier,
+                task_type=step.task_type,
+                parameters=step.parameters,
+                execution_policy=step.execution_policy,
+            )
+            for step in version.steps
+        ],
+        dependencies=[
+            WorkflowVersionDependencyResponse(
+                predecessor=item.predecessor_identifier,
+                successor=item.successor_identifier,
+            )
+            for item in version.dependencies
+        ],
+    )
+
+
 def _encode_cursor(cursor: WorkflowPageCursor) -> str:
     payload = json.dumps(
         {
@@ -524,3 +757,33 @@ def _decode_cursor(value: str) -> WorkflowPageCursor:
     if created_at.tzinfo is None:
         raise ValueError("invalid cursor")
     return WorkflowPageCursor(created_at.astimezone(UTC), workflow_id)
+
+
+def _encode_version_cursor(cursor: WorkflowVersionPageCursor) -> str:
+    payload = json.dumps(
+        {"v": _CURSOR_VERSION, "version_number": cursor.version_number},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_version_cursor(value: str) -> WorkflowVersionPageCursor:
+    if not value or len(value) > MAX_CURSOR_LENGTH or not value.isascii():
+        raise ValueError("invalid cursor")
+    padding = "=" * (-len(value) % 4)
+    try:
+        decoded = base64.b64decode(f"{value}{padding}", altchars=b"-_", validate=True)
+        if len(decoded) > MAX_DECODED_CURSOR_BYTES:
+            raise ValueError("invalid cursor")
+        payload = json.loads(decoded)
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid cursor") from error
+    if not isinstance(payload, dict) or set(payload) != {"v", "version_number"}:
+        raise ValueError("invalid cursor")
+    if type(payload["v"]) is not int or payload["v"] != _CURSOR_VERSION:
+        raise ValueError("invalid cursor")
+    number = payload["version_number"]
+    if type(number) is not int or number <= 0:
+        raise ValueError("invalid cursor")
+    return WorkflowVersionPageCursor(number)
