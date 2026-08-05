@@ -1,6 +1,7 @@
-"""Relational schema for mutable workflow definitions and their draft graph."""
+"""Relational schema for mutable drafts and immutable version snapshots."""
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Column,
     DateTime,
@@ -136,4 +137,103 @@ workflow_draft_dependencies = Table(
     ),
     Index(None, "workflow_definition_id", "predecessor_step_id"),
     Index(None, "workflow_definition_id", "successor_step_id"),
+)
+
+workflow_versions = Table(
+    "workflow_versions",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column(
+        "workflow_definition_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "workflow_definitions.id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column("version_number", BigInteger, nullable=False),
+    Column("name", String(128), nullable=False),
+    Column("description", Text),
+    Column("execution_policy", JSONB),
+    Column(
+        "published_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    ),
+    UniqueConstraint("workflow_definition_id", "version_number"),
+    CheckConstraint("version_number > 0", name="version_number_positive"),
+    CheckConstraint("length(name) > 0", name="name_not_empty"),
+    CheckConstraint(
+        "execution_policy IS NULL OR jsonb_typeof(execution_policy) = 'object'",
+        name="execution_policy_object",
+    ),
+)
+
+workflow_version_steps = Table(
+    "workflow_version_steps",
+    metadata,
+    Column(
+        "workflow_version_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "workflow_versions.id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        primary_key=True,
+    ),
+    Column("step_identifier", String(128), primary_key=True),
+    Column("task_type", String(128), nullable=False),
+    Column("parameters", JSONB, nullable=False),
+    Column("execution_policy", JSONB),
+    CheckConstraint("length(step_identifier) > 0", name="identifier_not_empty"),
+    CheckConstraint("length(task_type) > 0", name="task_type_not_empty"),
+    CheckConstraint("jsonb_typeof(parameters) = 'object'", name="parameters_object"),
+    CheckConstraint(
+        "execution_policy IS NULL OR jsonb_typeof(execution_policy) = 'object'",
+        name="execution_policy_object",
+    ),
+)
+
+workflow_version_dependencies = Table(
+    "workflow_version_dependencies",
+    metadata,
+    Column(
+        "workflow_version_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "workflow_versions.id",
+            ondelete="RESTRICT",
+            onupdate="RESTRICT",
+        ),
+        primary_key=True,
+    ),
+    Column("predecessor_step_identifier", String(128), primary_key=True),
+    Column("successor_step_identifier", String(128), primary_key=True),
+    ForeignKeyConstraint(
+        ("workflow_version_id", "predecessor_step_identifier"),
+        (
+            "workflow_version_steps.workflow_version_id",
+            "workflow_version_steps.step_identifier",
+        ),
+        ondelete="RESTRICT",
+        onupdate="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ("workflow_version_id", "successor_step_identifier"),
+        (
+            "workflow_version_steps.workflow_version_id",
+            "workflow_version_steps.step_identifier",
+        ),
+        ondelete="RESTRICT",
+        onupdate="RESTRICT",
+    ),
+    CheckConstraint(
+        "predecessor_step_identifier <> successor_step_identifier",
+        name="steps_distinct",
+    ),
+    Index(None, "workflow_version_id", "successor_step_identifier"),
 )

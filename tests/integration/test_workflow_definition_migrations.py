@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from uuid import UUID, uuid4
 
@@ -30,6 +31,14 @@ WORKFLOW_TABLES = {
     "workflow_definitions",
     "workflow_draft_dependencies",
     "workflow_draft_steps",
+    "workflow_version_dependencies",
+    "workflow_version_steps",
+    "workflow_versions",
+}
+VERSION_TABLES = {
+    "workflow_version_dependencies",
+    "workflow_version_steps",
+    "workflow_versions",
 }
 IDENTITY_TABLES = {
     "api_credentials",
@@ -81,6 +90,49 @@ async def insert_step(
         '{"value": 1}',
     )
     return step_id
+
+
+async def insert_version(
+    connection: asyncpg.Connection[asyncpg.Record],
+    workflow_id: UUID,
+    version_number: int,
+    *,
+    name: str = "Version snapshot",
+    description: str | None = None,
+    execution_policy: str | None = None,
+) -> UUID:
+    version_id = uuid4()
+    await connection.execute(
+        "INSERT INTO workflow_versions "
+        "(id, workflow_definition_id, version_number, name, description, "
+        "execution_policy) VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+        version_id,
+        workflow_id,
+        version_number,
+        name,
+        description,
+        execution_policy,
+    )
+    return version_id
+
+
+async def insert_version_step(
+    connection: asyncpg.Connection[asyncpg.Record],
+    version_id: UUID,
+    identifier: str,
+    *,
+    task_type: str = "test.task",
+    parameters: str = '{"value": 1}',
+) -> None:
+    await connection.execute(
+        "INSERT INTO workflow_version_steps "
+        "(workflow_version_id, step_identifier, task_type, parameters) "
+        "VALUES ($1, $2, $3, $4::jsonb)",
+        version_id,
+        identifier,
+        task_type,
+        parameters,
+    )
 
 
 async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
@@ -215,6 +267,235 @@ async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
                 predecessor_id,
                 other_step_id,
             )
+
+        version_id = await insert_version(
+            connection,
+            workflow_id,
+            1,
+            name="Original snapshot",
+            description="Original description",
+        )
+        await insert_version_step(connection, version_id, "first")
+        await insert_version_step(connection, version_id, "second")
+        await connection.execute(
+            "INSERT INTO workflow_version_dependencies "
+            "(workflow_version_id, predecessor_step_identifier, "
+            "successor_step_identifier) VALUES ($1, $2, $3)",
+            version_id,
+            "first",
+            "second",
+        )
+        version_row = await connection.fetchrow(
+            "SELECT version_number, name, description, execution_policy, published_at "
+            "FROM workflow_versions WHERE id = $1",
+            version_id,
+        )
+        assert version_row is not None
+        assert version_row["version_number"] == 1
+        assert version_row["name"] == "Original snapshot"
+        assert version_row["description"] == "Original description"
+        assert version_row["execution_policy"] is None
+        assert version_row["published_at"] is not None
+
+        await connection.execute(
+            "UPDATE workflow_definitions SET name = $1, description = $2 WHERE id = $3",
+            "Changed draft",
+            "Changed description",
+            workflow_id,
+        )
+        await connection.execute(
+            "UPDATE workflow_draft_steps SET task_type = $1, parameters = $2::jsonb "
+            "WHERE workflow_definition_id = $3 AND step_identifier = $4",
+            "changed.task",
+            '{"changed": true}',
+            workflow_id,
+            "first",
+        )
+        snapshot = await connection.fetchrow(
+            "SELECT v.name, v.description, s.task_type, s.parameters "
+            "FROM workflow_versions v JOIN workflow_version_steps s "
+            "ON s.workflow_version_id = v.id "
+            "WHERE v.id = $1 AND s.step_identifier = $2",
+            version_id,
+            "first",
+        )
+        assert snapshot is not None
+        assert snapshot["name"] == "Original snapshot"
+        assert snapshot["description"] == "Original description"
+        assert snapshot["task_type"] == "test.task"
+        assert json.loads(snapshot["parameters"]) == {"value": 1}
+
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await insert_version(connection, workflow_id, 1)
+        other_version_id = await insert_version(
+            connection,
+            other_workflow_id,
+            1,
+            execution_policy='{"placeholder": true}',
+        )
+        assert json.loads(
+            await connection.fetchval(
+                "SELECT execution_policy FROM workflow_versions WHERE id = $1",
+                other_version_id,
+            )
+        ) == {"placeholder": True}
+        with pytest.raises(asyncpg.CheckViolationError):
+            await insert_version(connection, workflow_id, 0)
+        with pytest.raises(asyncpg.CheckViolationError):
+            await insert_version(connection, workflow_id, -1)
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await insert_version(connection, uuid4(), 1)
+        with pytest.raises(asyncpg.CheckViolationError):
+            await connection.execute(
+                "INSERT INTO workflow_versions "
+                "(id, workflow_definition_id, version_number, name, execution_policy) "
+                "VALUES ($1, $2, $3, $4, $5::jsonb)",
+                uuid4(),
+                workflow_id,
+                2,
+                "Invalid policy",
+                "[]",
+            )
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await insert_version_step(connection, version_id, "first")
+        await insert_version_step(connection, other_version_id, "first")
+        await insert_version_step(connection, other_version_id, "other-only")
+        await connection.execute(
+            "UPDATE workflow_version_steps SET execution_policy = $1::jsonb "
+            "WHERE workflow_version_id = $2 AND step_identifier = $3",
+            '{"placeholder": true}',
+            other_version_id,
+            "first",
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await connection.execute(
+                "INSERT INTO workflow_version_steps "
+                "(workflow_version_id, step_identifier, task_type, parameters, "
+                "execution_policy) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)",
+                version_id,
+                "invalid-policy",
+                "test.task",
+                "{}",
+                "[]",
+            )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await insert_version_step(
+                connection,
+                version_id,
+                "invalid-parameters",
+                parameters="[]",
+            )
+        with pytest.raises(asyncpg.NotNullViolationError):
+            await connection.execute(
+                "INSERT INTO workflow_version_steps "
+                "(workflow_version_id, step_identifier, task_type) "
+                "VALUES ($1, $2, $3)",
+                version_id,
+                "missing-parameters",
+                "test.task",
+            )
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await connection.execute(
+                "INSERT INTO workflow_version_dependencies "
+                "(workflow_version_id, predecessor_step_identifier, "
+                "successor_step_identifier) VALUES ($1, $2, $3)",
+                version_id,
+                "first",
+                "missing",
+            )
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await connection.execute(
+                "INSERT INTO workflow_version_dependencies "
+                "(workflow_version_id, predecessor_step_identifier, "
+                "successor_step_identifier) VALUES ($1, $2, $3)",
+                version_id,
+                "first",
+                "other-only",
+            )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await connection.execute(
+                "INSERT INTO workflow_version_dependencies "
+                "(workflow_version_id, predecessor_step_identifier, "
+                "successor_step_identifier) VALUES ($1, $2, $2)",
+                version_id,
+                "first",
+            )
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await connection.execute(
+                "INSERT INTO workflow_version_dependencies "
+                "(workflow_version_id, predecessor_step_identifier, "
+                "successor_step_identifier) VALUES ($1, $2, $3)",
+                version_id,
+                "first",
+                "second",
+            )
+
+        with pytest.raises(asyncpg.RestrictViolationError):
+            await connection.execute(
+                "DELETE FROM workflow_versions WHERE id = $1",
+                version_id,
+            )
+        with pytest.raises(asyncpg.RestrictViolationError):
+            await connection.execute(
+                "DELETE FROM workflow_version_steps "
+                "WHERE workflow_version_id = $1 AND step_identifier = $2",
+                version_id,
+                "first",
+            )
+        with pytest.raises(asyncpg.RestrictViolationError):
+            await connection.execute(
+                "UPDATE workflow_versions SET id = $1 WHERE id = $2",
+                uuid4(),
+                version_id,
+            )
+        with pytest.raises(asyncpg.RestrictViolationError):
+            await connection.execute(
+                "UPDATE workflow_version_steps SET step_identifier = $1 "
+                "WHERE workflow_version_id = $2 AND step_identifier = $3",
+                "renamed",
+                version_id,
+                "first",
+            )
+        restricted_workflow_id = await insert_workflow(connection, principal_id)
+        await insert_version(connection, restricted_workflow_id, 1)
+        with pytest.raises(asyncpg.RestrictViolationError):
+            await connection.execute(
+                "DELETE FROM workflow_definitions WHERE id = $1",
+                restricted_workflow_id,
+            )
+
+        await connection.execute(
+            "DELETE FROM workflow_version_dependencies WHERE workflow_version_id = $1",
+            version_id,
+        )
+        await connection.execute(
+            "DELETE FROM workflow_version_steps WHERE workflow_version_id = $1",
+            version_id,
+        )
+        assert (
+            await connection.execute(
+                "DELETE FROM workflow_versions WHERE id = $1",
+                version_id,
+            )
+            == "DELETE 1"
+        )
+    finally:
+        await connection.close()
+
+
+async def inspect_version_downgrade(database_url: URL) -> None:
+    connection = await asyncpg.connect(asyncpg_dsn(database_url))
+    try:
+        remaining = await connection.fetchval(
+            "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' "
+            "AND tablename = ANY($1::text[])",
+            list(VERSION_TABLES),
+        )
+        assert remaining == 0
+        assert await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM pg_indexes WHERE schemaname = 'public' "
+            "AND indexname = 'ix_workflow_definitions_owner_created_id')"
+        )
     finally:
         await connection.close()
 
@@ -273,6 +554,8 @@ def test_workflow_migration_constraints_and_reversible_boundary() -> None:
         with migration_database_url(alembic_url):
             command.upgrade(configuration, "head")
             asyncio.run(inspect_upgraded_workflow_schema(database_url))
+            command.downgrade(configuration, "0003_workflow_list")
+            asyncio.run(inspect_version_downgrade(database_url))
             command.downgrade(configuration, "0002_workflows")
             asyncio.run(inspect_pagination_index_downgrade(database_url))
             command.downgrade(configuration, "0001_identity")

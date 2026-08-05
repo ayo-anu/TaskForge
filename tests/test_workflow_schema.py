@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import CheckConstraint, Enum, Index, UniqueConstraint
+from sqlalchemy import BigInteger, CheckConstraint, Enum, Index, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.schema import DefaultClause
 
@@ -12,20 +12,25 @@ from taskforge.workflows.schema import (
     workflow_definitions,
     workflow_draft_dependencies,
     workflow_draft_steps,
+    workflow_version_dependencies,
+    workflow_version_steps,
+    workflow_versions,
 )
 
 WORKFLOW_TABLES = {
     "workflow_definitions",
     "workflow_draft_dependencies",
     "workflow_draft_steps",
+    "workflow_version_dependencies",
+    "workflow_version_steps",
+    "workflow_versions",
 }
 
 
-def test_workflow_tables_are_registered_without_later_milestone_tables() -> None:
+def test_workflow_tables_include_complete_version_snapshot_without_run_tables() -> None:
     assert WORKFLOW_TABLES <= set(metadata.tables)
     assert not any(
-        name.startswith(("workflow_versions", "workflow_runs", "task_runs"))
-        for name in metadata.tables
+        name.startswith(("workflow_runs", "task_runs")) for name in metadata.tables
     )
 
 
@@ -149,3 +154,94 @@ def test_workflow_list_index_matches_owner_scoped_stable_order() -> None:
         "workflow_definitions.created_at DESC",
         "workflow_definitions.id DESC",
     )
+
+
+def test_version_metadata_snapshots_definition_content_without_owner_or_status() -> (
+    None
+):
+    assert isinstance(workflow_versions.c.id.type, UUID)
+    assert isinstance(workflow_versions.c.version_number.type, BigInteger)
+    assert list(workflow_versions.primary_key.columns) == [workflow_versions.c.id]
+    assert set(workflow_versions.c.keys()) == {
+        "id",
+        "workflow_definition_id",
+        "version_number",
+        "name",
+        "description",
+        "execution_policy",
+        "published_at",
+    }
+    assert workflow_versions.c.published_at.server_default is not None
+    assert workflow_versions.c.execution_policy.nullable is True
+    assert workflow_versions.c.execution_policy.server_default is None
+    unique_columns = {
+        tuple(constraint.columns.keys())
+        for constraint in workflow_versions.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    checks = {
+        str(constraint.sqltext)
+        for constraint in workflow_versions.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert ("workflow_definition_id", "version_number") in unique_columns
+    assert "version_number > 0" in checks
+    assert any("jsonb_typeof(execution_policy) = 'object'" in check for check in checks)
+
+
+def test_version_steps_use_natural_identity_and_optional_policy_snapshots() -> None:
+    assert tuple(workflow_version_steps.primary_key.columns.keys()) == (
+        "workflow_version_id",
+        "step_identifier",
+    )
+    assert "id" not in workflow_version_steps.c
+    assert isinstance(workflow_version_steps.c.parameters.type, JSONB)
+    assert workflow_version_steps.c.parameters.nullable is False
+    assert workflow_version_steps.c.parameters.server_default is None
+    assert isinstance(workflow_version_steps.c.execution_policy.type, JSONB)
+    assert workflow_version_steps.c.execution_policy.nullable is True
+    assert workflow_version_steps.c.execution_policy.server_default is None
+    checks = {
+        str(constraint.sqltext)
+        for constraint in workflow_version_steps.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert any("jsonb_typeof(parameters) = 'object'" in check for check in checks)
+    assert any("jsonb_typeof(execution_policy) = 'object'" in check for check in checks)
+
+
+def test_version_dependencies_use_same_version_natural_keys_and_reverse_index() -> None:
+    assert tuple(workflow_version_dependencies.primary_key.columns.keys()) == (
+        "workflow_version_id",
+        "predecessor_step_identifier",
+        "successor_step_identifier",
+    )
+    targets = [
+        tuple(element.target_fullname for element in constraint.elements)
+        for constraint in workflow_version_dependencies.foreign_key_constraints
+    ]
+    step_target = (
+        "workflow_version_steps.workflow_version_id",
+        "workflow_version_steps.step_identifier",
+    )
+    assert targets.count(step_target) == 2
+    assert ("workflow_versions.id",) in targets
+    indexes = {
+        tuple(column.name for column in index.columns)
+        for index in workflow_version_dependencies.indexes
+    }
+    assert ("workflow_version_id", "successor_step_identifier") in indexes
+
+
+def test_version_foreign_keys_restrict_parent_deletion_and_key_updates() -> None:
+    tables = (
+        workflow_versions,
+        workflow_version_steps,
+        workflow_version_dependencies,
+    )
+    constraints = (
+        constraint for table in tables for constraint in table.foreign_key_constraints
+    )
+    for constraint in constraints:
+        assert constraint.ondelete == "RESTRICT"
+        assert constraint.onupdate == "RESTRICT"
