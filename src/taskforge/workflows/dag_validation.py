@@ -28,14 +28,29 @@ class DAGViolationCode(StrEnum):
     CYCLE = "cycle"
 
 
+type DAGValidationPath = tuple[str | int, ...]
+
+
+@dataclass(frozen=True)
+class DAGValidationIssue:
+    code: DAGViolationCode
+    path: DAGValidationPath
+
+
 @dataclass(frozen=True)
 class DAGValidationResult:
     is_acyclic: bool
-    violations: tuple[DAGViolationCode, ...] = ()
+    issues: tuple[DAGValidationIssue, ...] = ()
+    topological_order: tuple[str, ...] | None = None
+    cycle: tuple[str, ...] | None = None
+
+    @property
+    def violations(self) -> tuple[DAGViolationCode, ...]:
+        return tuple(dict.fromkeys(issue.code for issue in self.issues))
 
     @property
     def is_valid(self) -> bool:
-        return self.is_acyclic and not self.violations
+        return self.is_acyclic and not self.issues
 
 
 def validate_dag(
@@ -49,67 +64,112 @@ def validate_dag(
     """
     step_count = len(step_identifiers)
     dependency_count = len(dependencies)
-    violations: list[DAGViolationCode] = []
+    issues: list[DAGValidationIssue] = []
     if step_count == 0:
-        violations.append(DAGViolationCode.EMPTY_GRAPH)
+        issues.append(DAGValidationIssue(DAGViolationCode.EMPTY_GRAPH, ("steps",)))
     if step_count > MAX_DAG_STEPS:
-        violations.append(DAGViolationCode.TOO_MANY_STEPS)
+        issues.append(DAGValidationIssue(DAGViolationCode.TOO_MANY_STEPS, ("steps",)))
     if dependency_count > MAX_DAG_DEPENDENCIES:
-        violations.append(DAGViolationCode.TOO_MANY_DEPENDENCIES)
+        issues.append(
+            DAGValidationIssue(
+                DAGViolationCode.TOO_MANY_DEPENDENCIES,
+                ("dependencies",),
+            )
+        )
     if any(
-        violation
+        issue.code
         in {
             DAGViolationCode.TOO_MANY_STEPS,
             DAGViolationCode.TOO_MANY_DEPENDENCIES,
         }
-        for violation in violations
+        for issue in issues
     ):
-        return DAGValidationResult(is_acyclic=False, violations=tuple(violations))
+        return DAGValidationResult(is_acyclic=False, issues=tuple(issues))
 
     identifiers = tuple(step_identifiers)
     unique_identifiers = set(identifiers)
-    if len(unique_identifiers) != len(identifiers):
-        violations.append(DAGViolationCode.DUPLICATE_STEP_IDENTIFIER)
+    seen_identifiers: set[str] = set()
+    duplicate_step_issues: list[DAGValidationIssue] = []
+    for index, identifier in enumerate(identifiers):
+        if identifier in seen_identifiers:
+            duplicate_step_issues.append(
+                DAGValidationIssue(
+                    DAGViolationCode.DUPLICATE_STEP_IDENTIFIER,
+                    ("steps", index, "identifier"),
+                )
+            )
+        else:
+            seen_identifiers.add(identifier)
 
-    missing_reference = False
-    self_dependency = False
-    duplicate_dependency = False
+    missing_reference_issues: list[DAGValidationIssue] = []
+    self_dependency_issues: list[DAGValidationIssue] = []
+    duplicate_dependency_issues: list[DAGValidationIssue] = []
     seen_edges: set[tuple[str, str]] = set()
     admissible_edges: list[DAGEdge] = []
-    for dependency in dependencies:
-        if (
-            dependency.predecessor not in unique_identifiers
-            or dependency.successor not in unique_identifiers
-        ):
-            missing_reference = True
+    for index, dependency in enumerate(dependencies):
+        predecessor_missing = dependency.predecessor not in unique_identifiers
+        successor_missing = dependency.successor not in unique_identifiers
+        if predecessor_missing:
+            missing_reference_issues.append(
+                DAGValidationIssue(
+                    DAGViolationCode.MISSING_DEPENDENCY_REFERENCE,
+                    ("dependencies", index, "predecessor"),
+                )
+            )
+        if successor_missing:
+            missing_reference_issues.append(
+                DAGValidationIssue(
+                    DAGViolationCode.MISSING_DEPENDENCY_REFERENCE,
+                    ("dependencies", index, "successor"),
+                )
+            )
+        if predecessor_missing or successor_missing:
             continue
         if dependency.predecessor == dependency.successor:
-            self_dependency = True
+            self_dependency_issues.append(
+                DAGValidationIssue(
+                    DAGViolationCode.SELF_DEPENDENCY,
+                    ("dependencies", index, "successor"),
+                )
+            )
             continue
         edge = (dependency.predecessor, dependency.successor)
         if edge in seen_edges:
-            duplicate_dependency = True
+            duplicate_dependency_issues.append(
+                DAGValidationIssue(
+                    DAGViolationCode.DUPLICATE_DEPENDENCY,
+                    ("dependencies", index),
+                )
+            )
             continue
         seen_edges.add(edge)
         admissible_edges.append(dependency)
 
-    if missing_reference:
-        violations.append(DAGViolationCode.MISSING_DEPENDENCY_REFERENCE)
-    if self_dependency:
-        violations.append(DAGViolationCode.SELF_DEPENDENCY)
-    if duplicate_dependency:
-        violations.append(DAGViolationCode.DUPLICATE_DEPENDENCY)
+    issues.extend(duplicate_step_issues)
+    issues.extend(missing_reference_issues)
+    issues.extend(self_dependency_issues)
+    issues.extend(duplicate_dependency_issues)
 
-    is_acyclic = _is_acyclic(tuple(unique_identifiers), tuple(admissible_edges))
+    normalized_identifiers = tuple(sorted(unique_identifiers))
+    normalized_edges = tuple(admissible_edges)
+    order = _topological_order(normalized_identifiers, normalized_edges)
+    is_acyclic = order is not None
+    cycle = None
     if not is_acyclic:
-        violations.append(DAGViolationCode.CYCLE)
-    return DAGValidationResult(is_acyclic=is_acyclic, violations=tuple(violations))
+        issues.append(DAGValidationIssue(DAGViolationCode.CYCLE, ("dependencies",)))
+        cycle = _find_cycle(normalized_identifiers, normalized_edges)
+    return DAGValidationResult(
+        is_acyclic=is_acyclic,
+        issues=tuple(issues),
+        topological_order=order if not issues else None,
+        cycle=cycle,
+    )
 
 
-def _is_acyclic(
+def _topological_order(
     step_identifiers: tuple[str, ...],
     dependencies: tuple[DAGEdge, ...],
-) -> bool:
+) -> tuple[str, ...] | None:
     """Run deterministic iterative Kahn traversal on admissible input."""
     indegree = dict.fromkeys(step_identifiers, 0)
     outgoing: dict[str, list[str]] = {identifier: [] for identifier in step_identifiers}
@@ -122,13 +182,62 @@ def _is_acyclic(
     available = [identifier for identifier, degree in indegree.items() if degree == 0]
     heapq.heapify(available)
 
-    processed = 0
+    processed: list[str] = []
     while available:
         identifier = heapq.heappop(available)
-        processed += 1
+        processed.append(identifier)
         for successor in outgoing[identifier]:
             indegree[successor] -= 1
             if indegree[successor] == 0:
                 heapq.heappush(available, successor)
 
-    return processed == len(indegree)
+    if len(processed) != len(indegree):
+        return None
+    return tuple(processed)
+
+
+def _find_cycle(
+    step_identifiers: tuple[str, ...],
+    dependencies: tuple[DAGEdge, ...],
+) -> tuple[str, ...]:
+    """Return one deterministic closed cycle using iterative depth-first search."""
+    outgoing: dict[str, list[str]] = {identifier: [] for identifier in step_identifiers}
+    for dependency in dependencies:
+        outgoing[dependency.predecessor].append(dependency.successor)
+    for successors in outgoing.values():
+        successors.sort()
+
+    state = dict.fromkeys(step_identifiers, 0)
+    for root in step_identifiers:
+        if state[root] != 0:
+            continue
+        path = [root]
+        active_positions = {root: 0}
+        state[root] = 1
+        stack: list[tuple[str, int]] = [(root, 0)]
+        while stack:
+            node, successor_index = stack[-1]
+            if successor_index == len(outgoing[node]):
+                stack.pop()
+                state[node] = 2
+                active_positions.pop(node)
+                path.pop()
+                continue
+            successor = outgoing[node][successor_index]
+            stack[-1] = (node, successor_index + 1)
+            if state[successor] == 0:
+                active_positions[successor] = len(path)
+                path.append(successor)
+                state[successor] = 1
+                stack.append((successor, 0))
+            elif state[successor] == 1:
+                cycle = (*path[active_positions[successor] :], successor)
+                return _canonical_cycle(cycle)
+    raise RuntimeError("cyclic graph did not contain a discoverable cycle")
+
+
+def _canonical_cycle(cycle: tuple[str, ...]) -> tuple[str, ...]:
+    members = cycle[:-1]
+    start = min(range(len(members)), key=members.__getitem__)
+    canonical = (*members[start:], *members[:start])
+    return (*canonical, canonical[0])

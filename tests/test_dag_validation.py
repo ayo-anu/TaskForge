@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Sequence
+from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 from typing import cast
 
@@ -13,6 +14,7 @@ from taskforge.workflows.dag_validation import (
     MAX_DAG_DEPENDENCIES,
     MAX_DAG_STEPS,
     DAGEdge,
+    DAGValidationIssue,
     DAGViolationCode,
     validate_dag,
 )
@@ -42,7 +44,9 @@ def test_structurally_admissible_acyclic_graphs_are_accepted(
     steps: tuple[str, ...],
     edges: tuple[DAGEdge, ...],
 ) -> None:
-    assert validate_dag(steps, edges).is_acyclic is True
+    result = validate_dag(steps, edges)
+
+    assert result.is_acyclic is True
 
 
 def test_multi_node_cycle_is_detected() -> None:
@@ -103,7 +107,10 @@ def test_long_graph_uses_iterative_traversal() -> None:
         DAGEdge(steps[index], steps[index + 1]) for index in range(len(steps) - 1)
     )
 
-    assert validate_dag(steps, edges).is_acyclic is True
+    result = validate_dag(steps, edges)
+
+    assert result.is_acyclic is True
+    assert result.topological_order == steps
 
 
 def test_module_has_no_transport_or_persistence_imports() -> None:
@@ -299,7 +306,11 @@ def test_violation_order_and_result_are_independent_of_input_order() -> None:
     expected = validate_dag(steps, edges)
     reordered = validate_dag(tuple(reversed(steps)), tuple(reversed(edges)))
 
-    assert reordered == expected
+    assert reordered.is_valid == expected.is_valid
+    assert reordered.is_acyclic == expected.is_acyclic
+    assert reordered.violations == expected.violations
+    assert reordered.topological_order == expected.topological_order
+    assert reordered.cycle == expected.cycle
     assert expected.violations == (
         DAGViolationCode.DUPLICATE_STEP_IDENTIFIER,
         DAGViolationCode.MISSING_DEPENDENCY_REFERENCE,
@@ -317,3 +328,166 @@ def test_violation_result_does_not_expose_identifiers() -> None:
     )
 
     assert sensitive_identifier not in repr(result)
+
+
+@pytest.mark.parametrize(
+    ("steps", "edges", "expected_order"),
+    (
+        (("only",), (), ("only",)),
+        (
+            ("third", "first", "second"),
+            (DAGEdge("first", "second"), DAGEdge("second", "third")),
+            ("first", "second", "third"),
+        ),
+        (
+            ("right", "root", "left"),
+            (DAGEdge("root", "right"), DAGEdge("root", "left")),
+            ("root", "left", "right"),
+        ),
+        (
+            ("join", "right", "left"),
+            (DAGEdge("right", "join"), DAGEdge("left", "join")),
+            ("left", "right", "join"),
+        ),
+        (
+            ("delta", "charlie", "bravo", "alpha"),
+            (DAGEdge("alpha", "bravo"), DAGEdge("charlie", "delta")),
+            ("alpha", "bravo", "charlie", "delta"),
+        ),
+    ),
+)
+def test_valid_graphs_return_deterministic_complete_topological_order(
+    steps: tuple[str, ...],
+    edges: tuple[DAGEdge, ...],
+    expected_order: tuple[str, ...],
+) -> None:
+    result = validate_dag(steps, edges)
+
+    assert result.is_valid is True
+    assert result.issues == ()
+    assert result.topological_order == expected_order
+    assert result.cycle is None
+    positions = {identifier: index for index, identifier in enumerate(expected_order)}
+    assert all(
+        positions[edge.predecessor] < positions[edge.successor] for edge in edges
+    )
+
+
+def test_field_issues_have_exact_semantic_paths_and_no_message_field() -> None:
+    result = validate_dag(
+        ("duplicate", "duplicate", "present"),
+        (
+            DAGEdge("missing", "also_missing"),
+            DAGEdge("present", "present"),
+            DAGEdge("duplicate", "present"),
+            DAGEdge("duplicate", "present"),
+        ),
+    )
+
+    assert tuple((issue.code, issue.path) for issue in result.issues) == (
+        (
+            DAGViolationCode.DUPLICATE_STEP_IDENTIFIER,
+            ("steps", 1, "identifier"),
+        ),
+        (
+            DAGViolationCode.MISSING_DEPENDENCY_REFERENCE,
+            ("dependencies", 0, "predecessor"),
+        ),
+        (
+            DAGViolationCode.MISSING_DEPENDENCY_REFERENCE,
+            ("dependencies", 0, "successor"),
+        ),
+        (DAGViolationCode.SELF_DEPENDENCY, ("dependencies", 1, "successor")),
+        (DAGViolationCode.DUPLICATE_DEPENDENCY, ("dependencies", 3)),
+    )
+    assert {field.name for field in fields(DAGValidationIssue)} == {"code", "path"}
+    assert result.topological_order is None
+
+
+def test_multiple_occurrences_have_deduplicated_violation_codes() -> None:
+    result = validate_dag(
+        ("present",),
+        (
+            DAGEdge("missing_one", "present"),
+            DAGEdge("missing_two", "present"),
+        ),
+    )
+
+    assert len(result.issues) == 2
+    assert result.violations == (DAGViolationCode.MISSING_DEPENDENCY_REFERENCE,)
+
+
+def test_cycle_is_closed_and_canonicalized_to_smallest_identifier() -> None:
+    steps = ("gamma", "alpha", "beta")
+    edges = (
+        DAGEdge("gamma", "alpha"),
+        DAGEdge("beta", "gamma"),
+        DAGEdge("alpha", "beta"),
+    )
+
+    result = validate_dag(steps, edges)
+    reordered = validate_dag(tuple(reversed(steps)), tuple(reversed(edges)))
+
+    assert result.is_acyclic is False
+    assert result.topological_order is None
+    assert result.cycle == ("alpha", "beta", "gamma", "alpha")
+    assert reordered.cycle == result.cycle
+    assert result.issues[-1] == DAGValidationIssue(
+        DAGViolationCode.CYCLE,
+        ("dependencies",),
+    )
+
+
+def test_cycle_excludes_downstream_nodes() -> None:
+    result = validate_dag(
+        ("cycle_a", "cycle_b", "downstream"),
+        (
+            DAGEdge("cycle_a", "cycle_b"),
+            DAGEdge("cycle_b", "cycle_a"),
+            DAGEdge("cycle_b", "downstream"),
+        ),
+    )
+
+    assert result.cycle == ("cycle_a", "cycle_b", "cycle_a")
+    assert "downstream" not in result.cycle
+
+
+def test_multiple_cycles_choose_deterministic_lexicographic_traversal_result() -> None:
+    result = validate_dag(
+        ("delta", "charlie", "bravo", "alpha"),
+        (
+            DAGEdge("charlie", "delta"),
+            DAGEdge("delta", "charlie"),
+            DAGEdge("alpha", "bravo"),
+            DAGEdge("bravo", "alpha"),
+        ),
+    )
+
+    assert result.cycle == ("alpha", "bravo", "alpha")
+
+
+def test_size_issue_paths_suppress_order_and_cycle_details() -> None:
+    result = validate_dag(
+        tuple(f"step_{index}" for index in range(MAX_DAG_STEPS + 1)),
+        _unique_edges(MAX_DAG_DEPENDENCIES + 1),
+    )
+
+    assert result.issues == (
+        DAGValidationIssue(DAGViolationCode.TOO_MANY_STEPS, ("steps",)),
+        DAGValidationIssue(
+            DAGViolationCode.TOO_MANY_DEPENDENCIES,
+            ("dependencies",),
+        ),
+    )
+    assert result.is_acyclic is False
+    assert result.topological_order is None
+    assert result.cycle is None
+
+
+def test_result_and_issue_types_are_immutable() -> None:
+    result = validate_dag((), ())
+
+    with pytest.raises(FrozenInstanceError):
+        result.is_acyclic = False  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        result.issues[0].path = ()  # type: ignore[misc]
