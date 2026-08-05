@@ -44,6 +44,65 @@ class WorkflowAvailabilityIntent(StrEnum):
     DISABLE = "disable"
 
 
+class WorkflowAvailabilityTransitionRejected(Exception):
+    """The requested availability change is not valid for the current state."""
+
+
+@dataclass(frozen=True)
+class WorkflowAvailabilityResult:
+    workflow_id: UUID
+    status: WorkflowDefinitionStatus
+    changed: bool
+
+
+def availability_requires_published_version(
+    current_status: WorkflowDefinitionStatus,
+    intent: WorkflowAvailabilityIntent,
+) -> bool:
+    """Return whether this availability request needs publication evidence."""
+    if not isinstance(intent, WorkflowAvailabilityIntent):
+        raise WorkflowAvailabilityTransitionRejected
+    return (
+        current_status is WorkflowDefinitionStatus.DRAFT
+        and intent is WorkflowAvailabilityIntent.ENABLE
+    )
+
+
+def change_workflow_availability(
+    *,
+    workflow_id: UUID,
+    current_status: WorkflowDefinitionStatus,
+    intent: WorkflowAvailabilityIntent,
+    has_published_version: bool,
+) -> WorkflowAvailabilityResult:
+    """Apply the enable/disable lifecycle rules owned by the workflow domain."""
+    if not isinstance(intent, WorkflowAvailabilityIntent):
+        raise WorkflowAvailabilityTransitionRejected
+    if current_status is WorkflowDefinitionStatus.DRAFT:
+        if intent is not WorkflowAvailabilityIntent.ENABLE or not has_published_version:
+            raise WorkflowAvailabilityTransitionRejected
+        resulting_status = WorkflowDefinitionStatus.ENABLED
+    elif current_status is WorkflowDefinitionStatus.ENABLED:
+        resulting_status = (
+            WorkflowDefinitionStatus.DISABLED
+            if intent is WorkflowAvailabilityIntent.DISABLE
+            else WorkflowDefinitionStatus.ENABLED
+        )
+    elif current_status is WorkflowDefinitionStatus.DISABLED:
+        resulting_status = (
+            WorkflowDefinitionStatus.ENABLED
+            if intent is WorkflowAvailabilityIntent.ENABLE
+            else WorkflowDefinitionStatus.DISABLED
+        )
+    else:
+        raise WorkflowAvailabilityTransitionRejected
+    return WorkflowAvailabilityResult(
+        workflow_id=workflow_id,
+        status=resulting_status,
+        changed=resulting_status is not current_status,
+    )
+
+
 @dataclass(frozen=True, repr=False)
 class DraftWorkflowStep:
     id: UUID

@@ -8,7 +8,7 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, func, insert, null, or_, select, text
+from sqlalchemy import and_, func, insert, null, or_, select, text, update
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -21,6 +21,7 @@ from taskforge.workflows.domain import (
     WorkflowDraft,
 )
 from taskforge.workflows.persistence_ports import (
+    LockedWorkflowDefinition,
     ResolvedDependency,
     StoredWorkflowDraft,
     WorkflowOwnerRecordDisabled,
@@ -179,9 +180,11 @@ class SQLAlchemyWorkflowUnitOfWork:
         self._session: AsyncSession | None = None
         self._committed = False
         self._publication_locks: set[UUID] = set()
+        self._availability_locks: set[UUID] = set()
 
     async def __aenter__(self) -> SQLAlchemyWorkflowUnitOfWork:
         self._publication_locks.clear()
+        self._availability_locks.clear()
         self._session = self._sessions()
         await self._session.begin()
         return self
@@ -199,6 +202,7 @@ class SQLAlchemyWorkflowUnitOfWork:
                 await session.rollback()
         finally:
             self._publication_locks.clear()
+            self._availability_locks.clear()
             await session.close()
 
     async def require_enabled_owner(self, owner_principal_id: UUID) -> None:
@@ -341,6 +345,72 @@ class SQLAlchemyWorkflowUnitOfWork:
             raise WorkflowPersistenceUnavailable from error
         return _stored_draft(definition, step_rows, dependency_rows)
 
+    async def lock_definition_for_availability(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+    ) -> LockedWorkflowDefinition | None:
+        try:
+            row = (
+                await self._required_session().execute(
+                    select(
+                        workflow_definitions.c.id,
+                        workflow_definitions.c.status,
+                    )
+                    .where(
+                        workflow_definitions.c.id == workflow_id,
+                        workflow_definitions.c.owner_principal_id == owner_principal_id,
+                    )
+                    .with_for_update()
+                )
+            ).one_or_none()
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+        if row is None:
+            return None
+        self._availability_locks.add(workflow_id)
+        return LockedWorkflowDefinition(
+            id=row.id,
+            status=WorkflowDefinitionStatus(row.status),
+        )
+
+    async def has_published_version(self, workflow_id: UUID) -> bool:
+        self._require_availability_lock(workflow_id)
+        try:
+            return bool(
+                await self._required_session().scalar(
+                    select(
+                        select(workflow_versions.c.id)
+                        .where(
+                            workflow_versions.c.workflow_definition_id == workflow_id
+                        )
+                        .exists()
+                    )
+                )
+            )
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+
+    async def update_availability(
+        self,
+        workflow_id: UUID,
+        status: WorkflowDefinitionStatus,
+    ) -> None:
+        self._require_availability_lock(workflow_id)
+        try:
+            updated_id = await self._required_session().scalar(
+                update(workflow_definitions)
+                .where(workflow_definitions.c.id == workflow_id)
+                .values(status=status.value, updated_at=func.current_timestamp())
+                .returning(workflow_definitions.c.id)
+            )
+        except IntegrityError as error:
+            raise WorkflowRecordConflict from error
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+        if updated_id != workflow_id:
+            raise WorkflowRecordConflict
+
     async def next_version_number(self, workflow_id: UUID) -> int:
         """Read MAX only after this transaction holds the definition lock."""
         self._require_publication_lock(workflow_id)
@@ -460,6 +530,12 @@ class SQLAlchemyWorkflowUnitOfWork:
         if self._committed or workflow_id not in self._publication_locks:
             raise RuntimeError(
                 "workflow definition lock is required before version allocation"
+            )
+
+    def _require_availability_lock(self, workflow_id: UUID) -> None:
+        if self._committed or workflow_id not in self._availability_locks:
+            raise RuntimeError(
+                "workflow definition lock is required before availability changes"
             )
 
 

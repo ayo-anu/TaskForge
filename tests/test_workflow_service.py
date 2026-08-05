@@ -14,10 +14,13 @@ import pytest
 from taskforge.workflows.domain import (
     DraftDependency,
     DraftWorkflowStep,
+    WorkflowAvailabilityIntent,
+    WorkflowAvailabilityTransitionRejected,
     WorkflowDefinitionStatus,
     WorkflowDraft,
 )
 from taskforge.workflows.persistence_ports import (
+    LockedWorkflowDefinition,
     ResolvedDependency,
     StoredWorkflowDraft,
     WorkflowOwnerRecordDisabled,
@@ -86,6 +89,8 @@ class FakeTransaction:
         self.draft_value: StoredWorkflowDraft | None = None
         self.version_number = 1
         self.published_at = now
+        self.locked_definition: LockedWorkflowDefinition | None = None
+        self.published_version_exists = False
 
     async def __aenter__(self) -> FakeTransaction:
         self.calls.append(("enter",))
@@ -128,6 +133,27 @@ class FakeTransaction:
     ) -> StoredWorkflowDraft | None:
         self._record("lock_draft_for_publication", workflow_id, owner_principal_id)
         return self.draft_value
+
+    async def lock_definition_for_availability(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+    ) -> LockedWorkflowDefinition | None:
+        self._record(
+            "lock_definition_for_availability", workflow_id, owner_principal_id
+        )
+        return self.locked_definition
+
+    async def has_published_version(self, workflow_id: UUID) -> bool:
+        self._record("has_published_version", workflow_id)
+        return self.published_version_exists
+
+    async def update_availability(
+        self,
+        workflow_id: UUID,
+        status: WorkflowDefinitionStatus,
+    ) -> None:
+        self._record("update_availability", workflow_id, status)
 
     async def next_version_number(self, workflow_id: UUID) -> int:
         self._record("next_version_number", workflow_id)
@@ -443,6 +469,31 @@ def test_missing_owner_scoped_publication_stops_after_definition_lock() -> None:
 
 
 @pytest.mark.parametrize(
+    ("failure", "expected"),
+    (
+        (WorkflowOwnerRecordNotFound(), WorkflowOwnerNotFound),
+        (WorkflowOwnerRecordDisabled(), WorkflowOwnerDisabled),
+    ),
+)
+def test_publication_normalizes_owner_failures(
+    failure: Exception,
+    expected: type[Exception],
+) -> None:
+    transaction = FakeTransaction()
+    transaction.failure_for = "require_enabled_owner"
+    transaction.failure = failure
+
+    with pytest.raises(expected):
+        asyncio.run(
+            workflow_service(FakeRepository(transaction)).publish(
+                uuid4(), owner_principal_id=uuid4()
+            )
+        )
+
+    assert transaction.calls[-1] == ("exit",)
+
+
+@pytest.mark.parametrize(
     ("failure_for", "failure", "expected"),
     (
         ("insert_version", WorkflowRecordConflict(), WorkflowPersistenceConflict),
@@ -499,6 +550,184 @@ def test_get_is_owner_scoped_and_non_enumerating() -> None:
 
     assert found.draft is workflow
     assert repository.find_calls[0] == (workflow.id, owner_id)
+
+
+def test_availability_locks_before_publication_check_and_updates_once() -> None:
+    workflow_id, owner_id = uuid4(), uuid4()
+    transaction = FakeTransaction()
+    transaction.locked_definition = LockedWorkflowDefinition(
+        workflow_id, WorkflowDefinitionStatus.DRAFT
+    )
+    transaction.published_version_exists = True
+
+    result = asyncio.run(
+        workflow_service(FakeRepository(transaction)).set_availability(
+            workflow_id,
+            owner_principal_id=owner_id,
+            intent=WorkflowAvailabilityIntent.ENABLE,
+        )
+    )
+
+    assert result.status is WorkflowDefinitionStatus.ENABLED
+    assert result.changed is True
+    assert [call[0] for call in transaction.calls] == [
+        "enter",
+        "require_enabled_owner",
+        "lock_definition_for_availability",
+        "has_published_version",
+        "update_availability",
+        "commit",
+        "exit",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "intent", "expected_status", "changed"),
+    (
+        (
+            WorkflowDefinitionStatus.ENABLED,
+            WorkflowAvailabilityIntent.ENABLE,
+            WorkflowDefinitionStatus.ENABLED,
+            False,
+        ),
+        (
+            WorkflowDefinitionStatus.DISABLED,
+            WorkflowAvailabilityIntent.DISABLE,
+            WorkflowDefinitionStatus.DISABLED,
+            False,
+        ),
+        (
+            WorkflowDefinitionStatus.ENABLED,
+            WorkflowAvailabilityIntent.DISABLE,
+            WorkflowDefinitionStatus.DISABLED,
+            True,
+        ),
+        (
+            WorkflowDefinitionStatus.DISABLED,
+            WorkflowAvailabilityIntent.ENABLE,
+            WorkflowDefinitionStatus.ENABLED,
+            True,
+        ),
+    ),
+)
+def test_existing_availability_changes_never_query_versions(
+    status: WorkflowDefinitionStatus,
+    intent: WorkflowAvailabilityIntent,
+    expected_status: WorkflowDefinitionStatus,
+    changed: bool,
+) -> None:
+    workflow_id, owner_id = uuid4(), uuid4()
+    transaction = FakeTransaction()
+    transaction.locked_definition = LockedWorkflowDefinition(workflow_id, status)
+    transaction.published_version_exists = True
+
+    result = asyncio.run(
+        workflow_service(FakeRepository(transaction)).set_availability(
+            workflow_id,
+            owner_principal_id=owner_id,
+            intent=intent,
+        )
+    )
+
+    names = [call[0] for call in transaction.calls]
+    assert result.status is expected_status
+    assert result.changed is changed
+    assert "has_published_version" not in names
+    assert ("update_availability" in names) is changed
+    assert transaction.calls[-2:] == [("commit",), ("exit",)]
+
+
+def test_invalid_availability_rolls_back_without_update_or_commit() -> None:
+    workflow_id, owner_id = uuid4(), uuid4()
+    transaction = FakeTransaction()
+    transaction.locked_definition = LockedWorkflowDefinition(
+        workflow_id, WorkflowDefinitionStatus.DRAFT
+    )
+
+    with pytest.raises(WorkflowAvailabilityTransitionRejected):
+        asyncio.run(
+            workflow_service(FakeRepository(transaction)).set_availability(
+                workflow_id,
+                owner_principal_id=owner_id,
+                intent=WorkflowAvailabilityIntent.ENABLE,
+            )
+        )
+
+    names = [call[0] for call in transaction.calls]
+    assert names[-1] == "exit"
+    assert "update_availability" not in names
+    assert "commit" not in names
+
+
+def test_draft_disable_does_not_query_versions() -> None:
+    workflow_id, owner_id = uuid4(), uuid4()
+    transaction = FakeTransaction()
+    transaction.locked_definition = LockedWorkflowDefinition(
+        workflow_id, WorkflowDefinitionStatus.DRAFT
+    )
+
+    with pytest.raises(WorkflowAvailabilityTransitionRejected):
+        asyncio.run(
+            workflow_service(FakeRepository(transaction)).set_availability(
+                workflow_id,
+                owner_principal_id=owner_id,
+                intent=WorkflowAvailabilityIntent.DISABLE,
+            )
+        )
+
+    assert "has_published_version" not in [call[0] for call in transaction.calls]
+
+
+def test_missing_owner_scoped_availability_stops_after_lock() -> None:
+    transaction = FakeTransaction()
+
+    with pytest.raises(WorkflowNotFound):
+        asyncio.run(
+            workflow_service(FakeRepository(transaction)).set_availability(
+                uuid4(),
+                owner_principal_id=uuid4(),
+                intent=WorkflowAvailabilityIntent.ENABLE,
+            )
+        )
+
+    assert [call[0] for call in transaction.calls] == [
+        "enter",
+        "require_enabled_owner",
+        "lock_definition_for_availability",
+        "exit",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    (
+        (WorkflowOwnerRecordNotFound(), WorkflowOwnerNotFound),
+        (WorkflowOwnerRecordDisabled(), WorkflowOwnerDisabled),
+        (WorkflowRecordConflict(), WorkflowPersistenceConflict),
+        (WorkflowPersistenceUnavailable(), WorkflowServiceUnavailable),
+    ),
+)
+def test_expected_availability_failures_are_normalized(
+    failure: Exception,
+    expected: type[Exception],
+) -> None:
+    transaction = FakeTransaction()
+    transaction.locked_definition = LockedWorkflowDefinition(
+        uuid4(), WorkflowDefinitionStatus.ENABLED
+    )
+    transaction.failure_for = "require_enabled_owner"
+    transaction.failure = failure
+
+    with pytest.raises(expected):
+        asyncio.run(
+            workflow_service(FakeRepository(transaction)).set_availability(
+                uuid4(),
+                owner_principal_id=uuid4(),
+                intent=WorkflowAvailabilityIntent.DISABLE,
+            )
+        )
+
+    assert transaction.calls[-1] == ("exit",)
 
 
 @pytest.mark.parametrize("limit", (0, -1, True, 1.5, "10"))

@@ -7,7 +7,11 @@ from uuid import UUID, uuid4
 from taskforge.workflows.dag_validation import DAGEdge, validate_dag
 from taskforge.workflows.domain import (
     PublishedWorkflowVersion,
+    WorkflowAvailabilityIntent,
+    WorkflowAvailabilityResult,
     WorkflowDraft,
+    availability_requires_published_version,
+    change_workflow_availability,
     create_draft_dependency,
     create_draft_step,
     create_workflow_draft,
@@ -173,6 +177,51 @@ class WorkflowService:
             version_number=version_number,
             published_at=published_at,
         )
+
+    async def set_availability(
+        self,
+        workflow_id: UUID,
+        *,
+        owner_principal_id: UUID,
+        intent: WorkflowAvailabilityIntent,
+    ) -> WorkflowAvailabilityResult:
+        """Apply one owner-scoped availability change transactionally."""
+        try:
+            async with self._repository.transaction() as transaction:
+                await transaction.require_enabled_owner(owner_principal_id)
+                definition = await transaction.lock_definition_for_availability(
+                    workflow_id,
+                    owner_principal_id,
+                )
+                if definition is None:
+                    raise WorkflowNotFound
+                requires_published_version = availability_requires_published_version(
+                    definition.status,
+                    intent,
+                )
+                has_published_version = (
+                    await transaction.has_published_version(workflow_id)
+                    if requires_published_version
+                    else False
+                )
+                result = change_workflow_availability(
+                    workflow_id=workflow_id,
+                    current_status=definition.status,
+                    intent=intent,
+                    has_published_version=has_published_version,
+                )
+                if result.changed:
+                    await transaction.update_availability(workflow_id, result.status)
+                await transaction.commit()
+        except WorkflowOwnerRecordNotFound as error:
+            raise WorkflowOwnerNotFound from error
+        except WorkflowOwnerRecordDisabled as error:
+            raise WorkflowOwnerDisabled from error
+        except WorkflowRecordConflict as error:
+            raise WorkflowPersistenceConflict from error
+        except WorkflowPersistenceUnavailable as error:
+            raise WorkflowServiceUnavailable from error
+        return result
 
     async def list(
         self,

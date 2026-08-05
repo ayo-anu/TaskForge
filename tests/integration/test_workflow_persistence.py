@@ -19,6 +19,8 @@ from taskforge.persistence.workflows import SQLAlchemyWorkflowRepository
 from taskforge.workflows.domain import (
     DraftDependency,
     DraftWorkflowStep,
+    WorkflowAvailabilityIntent,
+    WorkflowAvailabilityTransitionRejected,
     WorkflowDefinitionStatus,
     WorkflowDraft,
 )
@@ -226,6 +228,104 @@ async def verify_workflow_persistence(database_url: URL) -> None:
             for row in version_dependencies
         ] == [("first", "second")]
 
+        enabled = await service.set_availability(
+            created_input.id,
+            owner_principal_id=owner_id,
+            intent=WorkflowAvailabilityIntent.ENABLE,
+        )
+        assert enabled.status is WorkflowDefinitionStatus.ENABLED
+        assert enabled.changed is True
+        async with sessions() as session:
+            enabled_updated_at = await session.scalar(
+                select(workflow_definitions.c.updated_at).where(
+                    workflow_definitions.c.id == created_input.id
+                )
+            )
+            snapshot_before_availability = (
+                await session.execute(
+                    select(workflow_versions).where(
+                        workflow_versions.c.id == first_publication.id
+                    )
+                )
+            ).one()
+        unchanged = await service.set_availability(
+            created_input.id,
+            owner_principal_id=owner_id,
+            intent=WorkflowAvailabilityIntent.ENABLE,
+        )
+        assert unchanged.changed is False
+        async with sessions() as session:
+            assert (
+                await session.scalar(
+                    select(workflow_definitions.c.updated_at).where(
+                        workflow_definitions.c.id == created_input.id
+                    )
+                )
+                == enabled_updated_at
+            )
+        disabled = await service.set_availability(
+            created_input.id,
+            owner_principal_id=owner_id,
+            intent=WorkflowAvailabilityIntent.DISABLE,
+        )
+        assert disabled.status is WorkflowDefinitionStatus.DISABLED
+        assert disabled.changed is True
+        await service.set_availability(
+            created_input.id,
+            owner_principal_id=owner_id,
+            intent=WorkflowAvailabilityIntent.ENABLE,
+        )
+        async with sessions() as session:
+            snapshot_after_availability = (
+                await session.execute(
+                    select(workflow_versions).where(
+                        workflow_versions.c.id == first_publication.id
+                    )
+                )
+            ).one()
+        assert snapshot_after_availability == snapshot_before_availability
+
+        unpublished = workflow(owner_id)
+        await service.create(unpublished)
+        with pytest.raises(WorkflowAvailabilityTransitionRejected):
+            await service.set_availability(
+                unpublished.id,
+                owner_principal_id=owner_id,
+                intent=WorkflowAvailabilityIntent.ENABLE,
+            )
+        with pytest.raises(WorkflowAvailabilityTransitionRejected):
+            await service.set_availability(
+                unpublished.id,
+                owner_principal_id=owner_id,
+                intent=WorkflowAvailabilityIntent.DISABLE,
+            )
+        assert (
+            await service.get(unpublished.id, owner_principal_id=owner_id)
+        ).draft.status is WorkflowDefinitionStatus.DRAFT
+        with pytest.raises(WorkflowNotFound):
+            await service.set_availability(
+                created_input.id,
+                owner_principal_id=other_owner_id,
+                intent=WorkflowAvailabilityIntent.DISABLE,
+            )
+
+        concurrent_availability = await asyncio.gather(
+            service.set_availability(
+                created_input.id,
+                owner_principal_id=owner_id,
+                intent=WorkflowAvailabilityIntent.DISABLE,
+            ),
+            service.set_availability(
+                created_input.id,
+                owner_principal_id=owner_id,
+                intent=WorkflowAvailabilityIntent.ENABLE,
+            ),
+        )
+        assert {item.status for item in concurrent_availability} == {
+            WorkflowDefinitionStatus.ENABLED,
+            WorkflowDefinitionStatus.DISABLED,
+        }
+
         async with sessions.begin() as session:
             await session.execute(
                 update(workflow_definitions)
@@ -298,7 +398,10 @@ async def verify_workflow_persistence(database_url: URL) -> None:
             owner_principal_id=other_owner_id,
             limit=10_000,
         )
-        assert [summary.id for summary in owner_list.items] == [created_input.id]
+        assert {summary.id for summary in owner_list.items} == {
+            created_input.id,
+            unpublished.id,
+        }
         assert other_list.items == ()
 
         invalid = workflow(owner_id)
@@ -393,6 +496,12 @@ async def verify_workflow_persistence(database_url: URL) -> None:
                 disabled_workflow.id,
                 owner_principal_id=disabled_owner_id,
             )
+        with pytest.raises(WorkflowOwnerDisabled):
+            await service.set_availability(
+                disabled_workflow.id,
+                owner_principal_id=disabled_owner_id,
+                intent=WorkflowAvailabilityIntent.ENABLE,
+            )
         assert await count_version_rows(sessions, disabled_workflow.id) == (0, 0, 0)
 
         concurrent_input = workflow(owner_id)
@@ -414,7 +523,7 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         await service.create(same_name)
         assert (
             len((await service.list(owner_principal_id=owner_id, limit=10_000)).items)
-            == 3
+            == 4
         )
 
         first_page = await service.list(owner_principal_id=owner_id, limit=2)
@@ -424,6 +533,7 @@ async def verify_workflow_persistence(database_url: URL) -> None:
             created_input.id,
             concurrent_input.id,
             same_name.id,
+            unpublished.id,
         }
         inserted_between_pages = workflow(owner_id)
         await service.create(inserted_between_pages)

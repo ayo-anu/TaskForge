@@ -39,6 +39,12 @@ class WorkflowTimestamps:
 
 
 @dataclass(frozen=True)
+class LockedWorkflowDefinition:
+    id: UUID
+    status: WorkflowDefinitionStatus
+
+
+@dataclass(frozen=True)
 class ResolvedDependency:
     id: UUID
     predecessor_step_id: UUID
@@ -106,6 +112,20 @@ class WorkflowTransaction(Protocol):
         self,
         workflow_id: UUID,
         dependencies: tuple[ResolvedDependency, ...],
+    ) -> None: ...
+
+    async def lock_definition_for_availability(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+    ) -> LockedWorkflowDefinition | None: ...
+
+    async def has_published_version(self, workflow_id: UUID) -> bool: ...
+
+    async def update_availability(
+        self,
+        workflow_id: UUID,
+        status: WorkflowDefinitionStatus,
     ) -> None: ...
 
     async def lock_draft_for_publication(

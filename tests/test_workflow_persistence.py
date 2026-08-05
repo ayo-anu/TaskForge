@@ -125,6 +125,26 @@ def test_version_insert_cannot_bypass_definition_lock() -> None:
     assert session.calls == ["begin", "rollback", "close"]
 
 
+@pytest.mark.parametrize("operation", ("has_published_version", "update_availability"))
+def test_availability_operations_cannot_bypass_definition_lock(operation: str) -> None:
+    session = FakeSession()
+    workflow_id = uuid4()
+
+    async def exercise() -> None:
+        async with unit_of_work(session) as transaction:
+            with pytest.raises(RuntimeError, match="definition lock"):
+                if operation == "has_published_version":
+                    await transaction.has_published_version(workflow_id)
+                else:
+                    await transaction.update_availability(
+                        workflow_id, WorkflowDefinitionStatus.ENABLED
+                    )
+
+    asyncio.run(exercise())
+
+    assert session.calls == ["begin", "rollback", "close"]
+
+
 def test_stored_draft_reconstructs_identifiers_and_ordinary_json_parameters() -> None:
     workflow_id, owner_id = uuid4(), uuid4()
     first_id, second_id = uuid4(), uuid4()

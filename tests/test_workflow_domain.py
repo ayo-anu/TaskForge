@@ -14,8 +14,11 @@ from taskforge.workflows.domain import (
     DraftWorkflowStep,
     PublishedWorkflowVersion,
     WorkflowAvailabilityIntent,
+    WorkflowAvailabilityTransitionRejected,
     WorkflowDefinitionStatus,
     WorkflowDraft,
+    availability_requires_published_version,
+    change_workflow_availability,
     create_draft_dependency,
     create_draft_step,
     create_workflow_draft,
@@ -64,6 +67,93 @@ def test_domain_status_and_intent_types_match_persistence_without_transition_pol
         "enable",
         "disable",
     )
+
+
+@pytest.mark.parametrize(
+    ("current", "intent", "published", "expected", "changed"),
+    (
+        ("draft", "enable", True, "enabled", True),
+        ("enabled", "enable", True, "enabled", False),
+        ("enabled", "disable", True, "disabled", True),
+        ("disabled", "disable", True, "disabled", False),
+        ("disabled", "enable", True, "enabled", True),
+    ),
+)
+def test_domain_owns_availability_transitions(
+    current: str,
+    intent: str,
+    published: bool,
+    expected: str,
+    changed: bool,
+) -> None:
+    workflow_id = uuid4()
+    result = change_workflow_availability(
+        workflow_id=workflow_id,
+        current_status=WorkflowDefinitionStatus(current),
+        intent=WorkflowAvailabilityIntent(intent),
+        has_published_version=published,
+    )
+
+    assert result.workflow_id == workflow_id
+    assert result.status is WorkflowDefinitionStatus(expected)
+    assert result.changed is changed
+
+
+@pytest.mark.parametrize(
+    ("intent", "published"),
+    (
+        (WorkflowAvailabilityIntent.ENABLE, False),
+        (WorkflowAvailabilityIntent.DISABLE, True),
+    ),
+)
+def test_draft_availability_rejects_unpublished_enable_and_disable(
+    intent: WorkflowAvailabilityIntent,
+    published: bool,
+) -> None:
+    with pytest.raises(WorkflowAvailabilityTransitionRejected):
+        change_workflow_availability(
+            workflow_id=uuid4(),
+            current_status=WorkflowDefinitionStatus.DRAFT,
+            intent=intent,
+            has_published_version=published,
+        )
+
+
+def test_availability_domain_rejects_an_untyped_intent() -> None:
+    with pytest.raises(WorkflowAvailabilityTransitionRejected):
+        change_workflow_availability(
+            workflow_id=uuid4(),
+            current_status=WorkflowDefinitionStatus.ENABLED,
+            intent="enable",  # type: ignore[arg-type]
+            has_published_version=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "intent", "expected"),
+    (
+        (WorkflowDefinitionStatus.DRAFT, WorkflowAvailabilityIntent.ENABLE, True),
+        (WorkflowDefinitionStatus.DRAFT, WorkflowAvailabilityIntent.DISABLE, False),
+        (WorkflowDefinitionStatus.ENABLED, WorkflowAvailabilityIntent.ENABLE, False),
+        (WorkflowDefinitionStatus.ENABLED, WorkflowAvailabilityIntent.DISABLE, False),
+        (WorkflowDefinitionStatus.DISABLED, WorkflowAvailabilityIntent.ENABLE, False),
+        (WorkflowDefinitionStatus.DISABLED, WorkflowAvailabilityIntent.DISABLE, False),
+    ),
+)
+def test_domain_identifies_only_initial_enablement_as_requiring_a_version(
+    status: WorkflowDefinitionStatus,
+    intent: WorkflowAvailabilityIntent,
+    expected: bool,
+) -> None:
+    assert availability_requires_published_version(status, intent) is expected
+
+
+def test_publication_requirement_rejects_an_untyped_intent() -> None:
+    with pytest.raises(WorkflowAvailabilityTransitionRejected):
+        availability_requires_published_version(
+            WorkflowDefinitionStatus.DRAFT,
+            "enable",  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(
