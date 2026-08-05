@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from uuid import UUID
 
-from taskforge.workflows.dag_validation import DAGEdge, validate_dag
+from taskforge.workflows.dag_validation import (
+    DAGEdge,
+    DAGValidationResult,
+    validate_dag,
+)
 from taskforge.workflows.task_types import (
     JSONValue,
     TaskTypeRegistry,
@@ -186,6 +190,29 @@ def create_workflow_draft(
     dependencies: tuple[DraftDependency, ...] = (),
 ) -> WorkflowDraft:
     """Validate aggregate and graph invariants without persistence."""
+    workflow, _ = _create_workflow_draft_with_validation(
+        workflow_id=workflow_id,
+        owner_principal_id=owner_principal_id,
+        name=name,
+        description=description,
+        status=status,
+        steps=steps,
+        dependencies=dependencies,
+    )
+    return workflow
+
+
+def _create_workflow_draft_with_validation(
+    *,
+    workflow_id: object,
+    owner_principal_id: object,
+    name: object,
+    description: object,
+    status: object,
+    steps: tuple[DraftWorkflowStep, ...],
+    dependencies: tuple[DraftDependency, ...] = (),
+) -> tuple[WorkflowDraft, DAGValidationResult]:
+    """Construct a draft and return its authoritative graph validation result."""
     issues: list[WorkflowValidationIssue] = []
     if not isinstance(workflow_id, UUID):
         issues.append(
@@ -251,14 +278,17 @@ def create_workflow_draft(
     assert isinstance(name, str)
     assert description is None or isinstance(description, str)
     assert isinstance(status, WorkflowDefinitionStatus)
-    return WorkflowDraft(
-        id=workflow_id,
-        owner_principal_id=owner_principal_id,
-        name=name,
-        description=description,
-        status=status,
-        steps=tuple(steps),
-        dependencies=tuple(dependencies),
+    return (
+        WorkflowDraft(
+            id=workflow_id,
+            owner_principal_id=owner_principal_id,
+            name=name,
+            description=description,
+            status=status,
+            steps=tuple(steps),
+            dependencies=tuple(dependencies),
+        ),
+        graph_result,
     )
 
 

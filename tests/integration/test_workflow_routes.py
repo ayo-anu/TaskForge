@@ -124,6 +124,20 @@ async def verify_workflow_routes(database_url: URL) -> None:
         async with httpx2.AsyncClient(
             transport=transport, base_url="http://testserver"
         ) as client:
+            validated = await client.post(
+                "/api/v1/workflows/validate",
+                json=body,
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            rejected_validation = await client.post(
+                "/api/v1/workflows/validate",
+                json={**body, "steps": []},
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
+            empty_after_validation = await client.get(
+                "/api/v1/workflows",
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
             created = await client.post(
                 "/api/v1/workflows",
                 json=body,
@@ -181,6 +195,13 @@ async def verify_workflow_routes(database_url: URL) -> None:
                 headers={"Authorization": f"Bearer {other_token}"},
             )
 
+    assert validated.status_code == 200
+    assert validated.json() == {
+        "valid": True,
+        "topological_order": ["first", "second"],
+    }
+    assert rejected_validation.status_code == 422
+    assert empty_after_validation.json()["items"] == []
     assert created.status_code == 201
     assert invalid.status_code == 422
     assert invalid.json()["error"]["details"] == [

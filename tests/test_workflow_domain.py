@@ -13,6 +13,7 @@ from taskforge.workflows.domain import (
     DraftWorkflowStep,
     WorkflowAvailabilityIntent,
     WorkflowDefinitionStatus,
+    WorkflowDraft,
     create_draft_dependency,
     create_draft_step,
     create_workflow_draft,
@@ -102,6 +103,19 @@ def test_description_is_optional_but_bounded() -> None:
 
     assert valid.description is None
     assert [issue.code for issue in error.value.issues] == ["description_too_large"]
+
+
+def test_public_workflow_factory_still_returns_only_a_workflow_draft() -> None:
+    created = create_workflow_draft(
+        workflow_id=uuid4(),
+        owner_principal_id=uuid4(),
+        name="Public contract",
+        description=None,
+        status=WorkflowDefinitionStatus.DRAFT,
+        steps=(step(),),
+    )
+
+    assert type(created) is WorkflowDraft
 
 
 @pytest.mark.parametrize(

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import secrets
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -32,6 +33,11 @@ from taskforge.identity.credentials import (
 )
 from taskforge.identity.ports import CredentialRecord
 from taskforge.settings import Settings
+from taskforge.workflows.dag_validation import (
+    DAGEdge,
+    DAGValidationResult,
+    validate_dag,
+)
 from taskforge.workflows.domain import WorkflowDefinitionStatus, WorkflowDraft
 from taskforge.workflows.persistence_ports import (
     StoredWorkflowDraft,
@@ -334,6 +340,174 @@ def test_invalid_graph_returns_deterministic_422_before_domain_or_service_work()
     assert service.created == []
 
 
+def test_validation_endpoint_runs_dag_once_and_never_invokes_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, runtime, _, _ = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    runtime.workflow_service = object()
+    calls = 0
+
+    def counted_validate(
+        step_identifiers: Sequence[str],
+        dependencies: Sequence[DAGEdge],
+    ) -> DAGValidationResult:
+        nonlocal calls
+        calls += 1
+        return validate_dag(step_identifiers, dependencies)
+
+    monkeypatch.setattr(
+        "taskforge.workflows.domain.validate_dag",
+        counted_validate,
+    )
+
+    response = request(
+        app,
+        "POST",
+        "/api/v1/workflows/validate",
+        runtime.api_credential,
+        json=valid_body(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"valid": True, "topological_order": ["first"]}
+    assert calls == 1
+
+
+def test_validation_endpoint_uses_common_graph_error_envelope() -> None:
+    app, runtime, service, validator = make_app(
+        frozenset({Role.WORKFLOW_OPERATOR.value})
+    )
+    body = valid_body()
+    body["steps"] = []
+
+    response = request(
+        app,
+        "POST",
+        "/api/v1/workflows/validate",
+        runtime.api_credential,
+        json=body,
+    )
+
+    payload = response.json()
+    assert response.status_code == 422
+    assert payload["error"]["version"] == "1"
+    assert payload["error"]["code"] == "validation_failed"
+    assert payload["error"]["request_id"] == response.headers["X-Request-ID"]
+    assert payload["error"]["details"] == [
+        {
+            "code": "empty_graph",
+            "path": ["steps"],
+            "message": "A workflow must contain at least one step.",
+        }
+    ]
+    assert service.created == []
+    assert service.list_calls == []
+    assert validator.calls == 0
+
+
+def test_validation_endpoint_returns_deterministic_branching_order() -> None:
+    app, runtime, service, validator = make_app(
+        frozenset({Role.WORKFLOW_OPERATOR.value})
+    )
+    body = {
+        "name": "Branching",
+        "steps": [
+            {"identifier": "finish", "task_type": "test.task", "parameters": {}},
+            {"identifier": "right", "task_type": "test.task", "parameters": {}},
+            {"identifier": "start", "task_type": "test.task", "parameters": {}},
+            {"identifier": "left", "task_type": "test.task", "parameters": {}},
+        ],
+        "dependencies": [
+            {"predecessor": "right", "successor": "finish"},
+            {"predecessor": "start", "successor": "right"},
+            {"predecessor": "left", "successor": "finish"},
+            {"predecessor": "start", "successor": "left"},
+        ],
+    }
+
+    first = request(
+        app,
+        "POST",
+        "/api/v1/workflows/validate",
+        runtime.api_credential,
+        json=body,
+    )
+    body["steps"] = list(reversed(body["steps"]))
+    body["dependencies"] = list(reversed(body["dependencies"]))
+    second = request(
+        app,
+        "POST",
+        "/api/v1/workflows/validate",
+        runtime.api_credential,
+        json=body,
+    )
+
+    expected = {
+        "valid": True,
+        "topological_order": ["start", "left", "right", "finish"],
+    }
+    assert first.json() == second.json() == expected
+    assert validator.calls == 8
+    assert service.created == []
+
+
+def test_validation_endpoint_runs_task_type_validation_for_admissible_graph() -> None:
+    app, runtime, service, validator = make_app(
+        frozenset({Role.WORKFLOW_OPERATOR.value})
+    )
+    body = valid_body()
+    body["steps"][0]["task_type"] = "unknown.task"  # type: ignore[index]
+
+    response = request(
+        app,
+        "POST",
+        "/api/v1/workflows/validate",
+        runtime.api_credential,
+        json=body,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"][0]["code"] == "unsupported_task_type"
+    assert validator.calls == 0
+    assert service.created == []
+
+
+def test_validation_endpoint_requires_author_permission_before_domain_validation() -> (
+    None
+):
+    app, runtime, service, validator = make_app(frozenset({Role.VIEWER.value}))
+
+    response = request(
+        app,
+        "POST",
+        "/api/v1/workflows/validate",
+        runtime.api_credential,
+        json=valid_body(),
+    )
+
+    assert response.status_code == 403
+    assert validator.calls == 0
+    assert service.created == []
+
+
+def test_validation_endpoint_rejects_worker_credentials() -> None:
+    app, runtime, service, validator = make_app(
+        frozenset({Role.WORKFLOW_OPERATOR.value})
+    )
+
+    response = request(
+        app,
+        "POST",
+        "/api/v1/workflows/validate",
+        runtime.worker_credential,
+        json=valid_body(),
+    )
+
+    assert response.status_code == 401
+    assert validator.calls == 0
+    assert service.created == []
+
+
 def test_persistence_conflict_and_unavailability_are_normalized() -> None:
     app, runtime, service, _ = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
     service.create_error = WorkflowPersistenceConflict()
@@ -362,11 +536,12 @@ def test_hidden_and_missing_workflows_are_identical() -> None:
     assert set(first.headers) == set(second.headers)
 
 
-def test_openapi_exposes_only_task_four_workflow_operations() -> None:
+def test_openapi_exposes_only_current_workflow_operations() -> None:
     app, _, _, _ = make_app(frozenset())
     schema = request(app, "GET", "/openapi.json", None).json()
     assert set(schema["paths"]["/api/v1/workflows"]) == {"get", "post"}
     assert set(schema["paths"]["/api/v1/workflows/{workflow_id}"]) == {"get"}
+    assert set(schema["paths"]["/api/v1/workflows/validate"]) == {"post"}
 
 
 def test_viewer_lists_only_service_owner_scope_with_default_page_size() -> None:

@@ -30,6 +30,7 @@ from taskforge.workflows.domain import (
     DraftDependency,
     DraftWorkflowStep,
     WorkflowDefinitionStatus,
+    _create_workflow_draft_with_validation,
     create_draft_dependency,
     create_draft_step,
     create_workflow_draft,
@@ -122,6 +123,11 @@ class WorkflowPageMetadataResponse(BaseModel):
 class WorkflowListResponse(BaseModel):
     items: list[WorkflowSummaryResponse]
     page: WorkflowPageMetadataResponse
+
+
+class WorkflowValidationResponse(BaseModel):
+    valid: bool
+    topological_order: list[str]
 
 
 class WorkflowRuntimeProtocol(Protocol):
@@ -254,6 +260,44 @@ async def create_workflow(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
     response.headers["Location"] = f"/api/v1/workflows/{stored.draft.id}"
     return _workflow_response(stored)
+
+
+@router.post(
+    "/validate",
+    response_model=WorkflowValidationResponse,
+    responses=COMMON_RESPONSES,
+)
+async def validate_workflow(
+    body: CreateWorkflowRequest,
+    request: Request,
+    context: Annotated[
+        AuthorizationContext,
+        Depends(require_permission(Permission.AUTHOR_WORKFLOW)),
+    ],
+) -> WorkflowValidationResponse | Response:
+    """Validate a prospective workflow without reading or writing workflow state."""
+    runtime = _runtime(request)
+    try:
+        steps = _create_steps(body.steps, runtime.task_type_registry)
+        dependencies = _create_dependencies(body.dependencies)
+        _, graph_result = _create_workflow_draft_with_validation(
+            workflow_id=uuid4(),
+            owner_principal_id=context.principal_id,
+            name=body.name,
+            description=body.description,
+            status=WorkflowDefinitionStatus.DRAFT,
+            steps=steps,
+            dependencies=dependencies,
+        )
+    except WorkflowValidationError as error:
+        if error.graph_result is not None:
+            return _graph_validation_error(request, error.graph_result.issues)
+        return _validation_error(request, error.issues)
+    assert graph_result.topological_order is not None
+    return WorkflowValidationResponse(
+        valid=True,
+        topological_order=list(graph_result.topological_order),
+    )
 
 
 @router.get(
