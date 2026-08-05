@@ -27,11 +27,8 @@ WORKFLOW_TABLES = {
 }
 
 
-def test_workflow_tables_include_complete_version_snapshot_without_run_tables() -> None:
+def test_workflow_tables_include_complete_version_snapshot() -> None:
     assert WORKFLOW_TABLES <= set(metadata.tables)
-    assert not any(
-        name.startswith(("workflow_runs", "task_runs")) for name in metadata.tables
-    )
 
 
 def test_workflow_definition_has_stable_identity_and_api_principal_owner() -> None:
@@ -185,6 +182,7 @@ def test_version_metadata_snapshots_definition_content_without_owner_or_status()
         if isinstance(constraint, CheckConstraint)
     }
     assert ("workflow_definition_id", "version_number") in unique_columns
+    assert ("workflow_definition_id", "id") in unique_columns
     assert "version_number > 0" in checks
     assert any("jsonb_typeof(execution_policy) = 'object'" in check for check in checks)
 

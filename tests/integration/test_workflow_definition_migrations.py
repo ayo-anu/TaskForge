@@ -717,7 +717,7 @@ def test_workflow_migration_constraints_and_reversible_boundary() -> None:
         ).render_as_string(hide_password=False)
         configuration = Config("alembic.ini")
         with migration_database_url(alembic_url):
-            command.upgrade(configuration, "head")
+            command.upgrade(configuration, "0005_version_immutability")
             asyncio.run(inspect_upgraded_workflow_schema(database_url))
             command.downgrade(configuration, "0004_versions")
             asyncio.run(inspect_immutability_downgrade(database_url))

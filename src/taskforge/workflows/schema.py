@@ -164,6 +164,11 @@ workflow_versions = Table(
         server_default=func.current_timestamp(),
     ),
     UniqueConstraint("workflow_definition_id", "version_number"),
+    UniqueConstraint(
+        "workflow_definition_id",
+        "id",
+        name="workflow_definition_id_id",
+    ),
     CheckConstraint("version_number > 0", name="version_number_positive"),
     CheckConstraint("length(name) > 0", name="name_not_empty"),
     CheckConstraint(

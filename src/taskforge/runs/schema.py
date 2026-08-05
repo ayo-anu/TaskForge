@@ -1,0 +1,237 @@
+"""Relational schema for workflow runs and accepted creation snapshots."""
+
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    DateTime,
+    Enum,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    String,
+    Table,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+
+from taskforge.persistence.metadata import metadata
+
+WORKFLOW_RUN_STATUSES = (
+    "pending",
+    "running",
+    "cancelling",
+    "succeeded",
+    "failed",
+    "cancelled",
+)
+TASK_RUN_STATUSES = (
+    "blocked",
+    "runnable",
+    "dispatched",
+    "claimed",
+    "running",
+    "retry_scheduled",
+    "succeeded",
+    "failed",
+    "skipped",
+    "cancelled",
+)
+
+workflow_run_status = Enum(
+    *WORKFLOW_RUN_STATUSES,
+    name="workflow_run_status",
+    native_enum=True,
+)
+task_run_status = Enum(
+    *TASK_RUN_STATUSES,
+    name="task_run_status",
+    native_enum=True,
+)
+
+workflow_runs = Table(
+    "workflow_runs",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("workflow_definition_id", UUID(as_uuid=True), nullable=False),
+    Column("workflow_version_id", UUID(as_uuid=True), nullable=False),
+    Column(
+        "requested_by_principal_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "api_principals.id",
+            name="fk_workflow_runs_requested_by_principal_id_api_principals",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column("status", workflow_run_status, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    ),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    ),
+    ForeignKeyConstraint(
+        ("workflow_definition_id", "workflow_version_id"),
+        ("workflow_versions.workflow_definition_id", "workflow_versions.id"),
+        name="fk_workflow_runs_definition_version",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    UniqueConstraint(
+        "id",
+        "workflow_version_id",
+        name="uq_workflow_runs_id_workflow_version_id",
+    ),
+    UniqueConstraint(
+        "id",
+        "requested_by_principal_id",
+        "workflow_definition_id",
+        name="uq_workflow_runs_id_requester_definition",
+    ),
+)
+
+Index(
+    "ix_workflow_runs_workflow_definition_id_created_at_id",
+    workflow_runs.c.workflow_definition_id,
+    workflow_runs.c.created_at.desc(),
+    workflow_runs.c.id.desc(),
+)
+Index(
+    "ix_workflow_runs_workflow_definition_id_workflow_version_id",
+    workflow_runs.c.workflow_definition_id,
+    workflow_runs.c.workflow_version_id,
+)
+
+workflow_run_inputs = Table(
+    "workflow_run_inputs",
+    metadata,
+    Column(
+        "workflow_run_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "workflow_runs.id",
+            name="fk_workflow_run_inputs_workflow_run_id_workflow_runs",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        primary_key=True,
+    ),
+    Column("payload", JSONB, nullable=False),
+    Column("input_references", JSONB, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    ),
+    CheckConstraint(
+        "jsonb_typeof(payload) = 'object'",
+        name="payload_object",
+    ),
+    CheckConstraint(
+        "jsonb_typeof(input_references) = 'object'",
+        name="input_references_object",
+    ),
+)
+
+task_runs = Table(
+    "task_runs",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("workflow_run_id", UUID(as_uuid=True), nullable=False),
+    Column("workflow_version_id", UUID(as_uuid=True), nullable=False),
+    Column("step_identifier", String(128), nullable=False),
+    Column("status", task_run_status, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    ),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    ),
+    ForeignKeyConstraint(
+        ("workflow_run_id", "workflow_version_id"),
+        ("workflow_runs.id", "workflow_runs.workflow_version_id"),
+        name="fk_task_runs_run_version",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ("workflow_version_id", "step_identifier"),
+        (
+            "workflow_version_steps.workflow_version_id",
+            "workflow_version_steps.step_identifier",
+        ),
+        name="fk_task_runs_version_step",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    UniqueConstraint(
+        "workflow_run_id",
+        "step_identifier",
+        name="uq_task_runs_workflow_run_id_step_identifier",
+    ),
+    CheckConstraint(
+        "length(btrim(step_identifier)) > 0",
+        name="step_identifier_not_blank",
+    ),
+)
+
+Index(
+    "ix_task_runs_workflow_version_id_step_identifier",
+    task_runs.c.workflow_version_id,
+    task_runs.c.step_identifier,
+)
+
+workflow_run_idempotency = Table(
+    "workflow_run_idempotency",
+    metadata,
+    Column("principal_id", UUID(as_uuid=True), primary_key=True),
+    Column("workflow_definition_id", UUID(as_uuid=True), primary_key=True),
+    Column("idempotency_key_digest", String(256), primary_key=True),
+    Column("request_fingerprint", String(256), nullable=False),
+    Column("workflow_run_id", UUID(as_uuid=True), nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    ),
+    ForeignKeyConstraint(
+        ("workflow_run_id", "principal_id", "workflow_definition_id"),
+        (
+            "workflow_runs.id",
+            "workflow_runs.requested_by_principal_id",
+            "workflow_runs.workflow_definition_id",
+        ),
+        name="fk_workflow_run_idempotency_run_scope",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    UniqueConstraint(
+        "workflow_run_id",
+        name="uq_workflow_run_idempotency_workflow_run_id",
+    ),
+    CheckConstraint(
+        "length(btrim(idempotency_key_digest)) > 0",
+        name="digest_not_blank",
+    ),
+    CheckConstraint(
+        "length(btrim(request_fingerprint)) > 0",
+        name="fingerprint_not_blank",
+    ),
+)
