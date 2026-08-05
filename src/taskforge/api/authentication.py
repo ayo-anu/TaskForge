@@ -98,7 +98,10 @@ def build_authentication_runtime(
             SQLAlchemyPrincipalProfileRepository(sessions),
             timeout_seconds=settings.authentication_timeout_seconds,
         ),
-        workflow_service=WorkflowService(SQLAlchemyWorkflowRepository(sessions)),
+        workflow_service=WorkflowService(
+            SQLAlchemyWorkflowRepository(sessions),
+            task_type_registry,
+        ),
         task_type_registry=task_type_registry,
     )
 

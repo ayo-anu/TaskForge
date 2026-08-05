@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
@@ -83,6 +84,23 @@ class WorkflowDraft:
             f"status={self.status!r}, steps={len(self.steps)}, "
             f"dependencies={len(self.dependencies)})"
         )
+
+
+@dataclass(frozen=True)
+class PublishedWorkflowVersion:
+    """Metadata returned after one complete immutable snapshot commits."""
+
+    id: UUID
+    workflow_definition_id: UUID
+    version_number: int
+    published_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.version_number <= 0:
+            raise ValueError("published version number must be positive")
+        if self.published_at.tzinfo is None:
+            raise ValueError("publication timestamp must be timezone-aware")
+        object.__setattr__(self, "published_at", self.published_at.astimezone(UTC))
 
 
 def create_draft_step(

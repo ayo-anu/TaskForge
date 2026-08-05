@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -11,6 +12,7 @@ from taskforge.workflows.domain import (
     MAX_WORKFLOW_DESCRIPTION_LENGTH,
     MAX_WORKFLOW_NAME_LENGTH,
     DraftWorkflowStep,
+    PublishedWorkflowVersion,
     WorkflowAvailabilityIntent,
     WorkflowDefinitionStatus,
     WorkflowDraft,
@@ -116,6 +118,23 @@ def test_public_workflow_factory_still_returns_only_a_workflow_draft() -> None:
     )
 
     assert type(created) is WorkflowDraft
+
+
+def test_published_version_metadata_is_frozen_positive_and_utc_normalized() -> None:
+    published = PublishedWorkflowVersion(
+        id=uuid4(),
+        workflow_definition_id=uuid4(),
+        version_number=1,
+        published_at=datetime.fromisoformat("2026-08-05T12:00:00-07:00"),
+    )
+
+    assert published.published_at == datetime(2026, 8, 5, 19, tzinfo=UTC)
+    with pytest.raises(FrozenInstanceError):
+        published.version_number = 2  # type: ignore[misc]
+    with pytest.raises(ValueError, match="positive"):
+        PublishedWorkflowVersion(uuid4(), uuid4(), 0, datetime.now(UTC))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        PublishedWorkflowVersion(uuid4(), uuid4(), 1, datetime(2026, 8, 5))
 
 
 @pytest.mark.parametrize(

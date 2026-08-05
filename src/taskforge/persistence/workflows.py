@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, insert, or_, select, text
+from sqlalchemy import and_, func, insert, null, or_, select, text
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -35,6 +36,9 @@ from taskforge.workflows.schema import (
     workflow_definitions,
     workflow_draft_dependencies,
     workflow_draft_steps,
+    workflow_version_dependencies,
+    workflow_version_steps,
+    workflow_versions,
 )
 
 
@@ -174,8 +178,10 @@ class SQLAlchemyWorkflowUnitOfWork:
         self._sessions = sessions
         self._session: AsyncSession | None = None
         self._committed = False
+        self._publication_locks: set[UUID] = set()
 
     async def __aenter__(self) -> SQLAlchemyWorkflowUnitOfWork:
+        self._publication_locks.clear()
         self._session = self._sessions()
         await self._session.begin()
         return self
@@ -192,6 +198,7 @@ class SQLAlchemyWorkflowUnitOfWork:
             if not self._committed:
                 await session.rollback()
         finally:
+            self._publication_locks.clear()
             await session.close()
 
     async def require_enabled_owner(self, owner_principal_id: UUID) -> None:
@@ -285,6 +292,156 @@ class SQLAlchemyWorkflowUnitOfWork:
         except DBAPIError as error:
             raise WorkflowPersistenceUnavailable from error
 
+    async def lock_draft_for_publication(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+    ) -> StoredWorkflowDraft | None:
+        """Lock the definition that serializes all version allocation."""
+        session = self._required_session()
+        try:
+            definition = (
+                await session.execute(
+                    select(workflow_definitions)
+                    .where(
+                        workflow_definitions.c.id == workflow_id,
+                        workflow_definitions.c.owner_principal_id == owner_principal_id,
+                    )
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if definition is None:
+                return None
+            self._publication_locks.add(workflow_id)
+            step_rows = (
+                await session.execute(
+                    select(workflow_draft_steps)
+                    .where(workflow_draft_steps.c.workflow_definition_id == workflow_id)
+                    .order_by(
+                        workflow_draft_steps.c.step_identifier,
+                        workflow_draft_steps.c.id,
+                    )
+                )
+            ).all()
+            dependency_rows = (
+                await session.execute(
+                    select(workflow_draft_dependencies)
+                    .where(
+                        workflow_draft_dependencies.c.workflow_definition_id
+                        == workflow_id
+                    )
+                    .order_by(
+                        workflow_draft_dependencies.c.predecessor_step_id,
+                        workflow_draft_dependencies.c.successor_step_id,
+                        workflow_draft_dependencies.c.id,
+                    )
+                )
+            ).all()
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+        return _stored_draft(definition, step_rows, dependency_rows)
+
+    async def next_version_number(self, workflow_id: UUID) -> int:
+        """Read MAX only after this transaction holds the definition lock."""
+        self._require_publication_lock(workflow_id)
+        try:
+            value = await self._required_session().scalar(
+                select(
+                    func.coalesce(func.max(workflow_versions.c.version_number), 0) + 1
+                ).where(workflow_versions.c.workflow_definition_id == workflow_id)
+            )
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+        if not isinstance(value, int) or value <= 0:
+            raise RuntimeError("database returned an invalid workflow version number")
+        return value
+
+    async def insert_version(
+        self,
+        version_id: UUID,
+        version_number: int,
+        workflow: WorkflowDraft,
+    ) -> datetime:
+        self._require_publication_lock(workflow.id)
+        try:
+            published_at = await self._required_session().scalar(
+                insert(workflow_versions)
+                .values(
+                    id=version_id,
+                    workflow_definition_id=workflow.id,
+                    version_number=version_number,
+                    name=workflow.name,
+                    description=workflow.description,
+                    execution_policy=null(),
+                )
+                .returning(workflow_versions.c.published_at)
+            )
+        except IntegrityError as error:
+            raise WorkflowRecordConflict from error
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+        if not isinstance(published_at, datetime):
+            raise RuntimeError("database did not return a publication timestamp")
+        return published_at
+
+    async def insert_version_steps(
+        self,
+        version_id: UUID,
+        steps: tuple[DraftWorkflowStep, ...],
+    ) -> None:
+        if not steps:
+            return
+        try:
+            await self._required_session().execute(
+                insert(workflow_version_steps),
+                [
+                    {
+                        "workflow_version_id": version_id,
+                        "step_identifier": step.identifier,
+                        "task_type": step.task_type,
+                        "parameters": step.parameters,
+                    }
+                    for step in sorted(steps, key=lambda item: item.identifier)
+                ],
+            )
+        except IntegrityError as error:
+            raise WorkflowRecordConflict from error
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+
+    async def insert_version_dependencies(
+        self,
+        version_id: UUID,
+        dependencies: tuple[DraftDependency, ...],
+    ) -> None:
+        if not dependencies:
+            return
+        ordered = sorted(
+            dependencies,
+            key=lambda dependency: (
+                dependency.predecessor_identifier,
+                dependency.successor_identifier,
+            ),
+        )
+        try:
+            await self._required_session().execute(
+                insert(workflow_version_dependencies),
+                [
+                    {
+                        "workflow_version_id": version_id,
+                        "predecessor_step_identifier": (
+                            dependency.predecessor_identifier
+                        ),
+                        "successor_step_identifier": dependency.successor_identifier,
+                    }
+                    for dependency in ordered
+                ],
+            )
+        except IntegrityError as error:
+            raise WorkflowRecordConflict from error
+        except DBAPIError as error:
+            raise WorkflowPersistenceUnavailable from error
+
     async def commit(self) -> None:
         try:
             await self._required_session().commit()
@@ -298,6 +455,12 @@ class SQLAlchemyWorkflowUnitOfWork:
         if self._session is None:
             raise RuntimeError("workflow transaction is not active")
         return self._session
+
+    def _require_publication_lock(self, workflow_id: UUID) -> None:
+        if self._committed or workflow_id not in self._publication_locks:
+            raise RuntimeError(
+                "workflow definition lock is required before version allocation"
+            )
 
 
 def _stored_draft(

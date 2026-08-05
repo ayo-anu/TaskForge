@@ -3,6 +3,7 @@
 from taskforge.workflows.domain import (
     DraftDependency,
     DraftWorkflowStep,
+    PublishedWorkflowVersion,
     WorkflowAvailabilityIntent,
     WorkflowDefinitionStatus,
     WorkflowDraft,
@@ -33,6 +34,7 @@ __all__ = [
     "DraftDependency",
     "DraftWorkflowStep",
     "InvalidWorkflowListQuery",
+    "PublishedWorkflowVersion",
     "StoredWorkflowDraft",
     "TaskParameterValidator",
     "TaskTypeDefinition",

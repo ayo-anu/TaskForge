@@ -9,6 +9,7 @@ from typing import Protocol
 from uuid import UUID
 
 from taskforge.workflows.domain import (
+    DraftDependency,
     DraftWorkflowStep,
     WorkflowDefinitionStatus,
     WorkflowDraft,
@@ -105,6 +106,35 @@ class WorkflowTransaction(Protocol):
         self,
         workflow_id: UUID,
         dependencies: tuple[ResolvedDependency, ...],
+    ) -> None: ...
+
+    async def lock_draft_for_publication(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+    ) -> StoredWorkflowDraft | None:
+        """Lock the definition before any version allocation or insertion."""
+
+    async def next_version_number(self, workflow_id: UUID) -> int:
+        """Allocate under the definition lock held by this transaction."""
+
+    async def insert_version(
+        self,
+        version_id: UUID,
+        version_number: int,
+        workflow: WorkflowDraft,
+    ) -> datetime: ...
+
+    async def insert_version_steps(
+        self,
+        version_id: UUID,
+        steps: tuple[DraftWorkflowStep, ...],
+    ) -> None: ...
+
+    async def insert_version_dependencies(
+        self,
+        version_id: UUID,
+        dependencies: tuple[DraftDependency, ...],
     ) -> None: ...
 
     async def commit(self) -> None: ...

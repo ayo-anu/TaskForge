@@ -17,7 +17,11 @@ from taskforge.persistence.workflows import (
     _workflow_list_statement,
     _workflow_page,
 )
-from taskforge.workflows.domain import WorkflowDefinitionStatus
+from taskforge.workflows.domain import (
+    DraftWorkflowStep,
+    WorkflowDefinitionStatus,
+    WorkflowDraft,
+)
 from taskforge.workflows.persistence_ports import WorkflowPageCursor
 
 
@@ -83,6 +87,42 @@ def test_committed_unit_of_work_does_not_roll_back() -> None:
 def test_unit_of_work_rejects_operations_outside_its_context() -> None:
     with pytest.raises(RuntimeError, match="transaction is not active"):
         asyncio.run(unit_of_work(FakeSession()).commit())
+
+
+def test_version_allocation_cannot_bypass_definition_lock() -> None:
+    session = FakeSession()
+    workflow_id = uuid4()
+
+    async def exercise() -> None:
+        async with unit_of_work(session) as transaction:
+            with pytest.raises(RuntimeError, match="definition lock"):
+                await transaction.next_version_number(workflow_id)
+
+    asyncio.run(exercise())
+
+    assert session.calls == ["begin", "rollback", "close"]
+
+
+def test_version_insert_cannot_bypass_definition_lock() -> None:
+    session = FakeSession()
+    workflow = WorkflowDraft(
+        id=uuid4(),
+        owner_principal_id=uuid4(),
+        name="Locked publication",
+        description=None,
+        status=WorkflowDefinitionStatus.DRAFT,
+        steps=(DraftWorkflowStep(uuid4(), "first", "test.task", {}),),
+        dependencies=(),
+    )
+
+    async def exercise() -> None:
+        async with unit_of_work(session) as transaction:
+            with pytest.raises(RuntimeError, match="definition lock"):
+                await transaction.insert_version(uuid4(), 1, workflow)
+
+    asyncio.run(exercise())
+
+    assert session.calls == ["begin", "rollback", "close"]
 
 
 def test_stored_draft_reconstructs_identifiers_and_ordinary_json_parameters() -> None:

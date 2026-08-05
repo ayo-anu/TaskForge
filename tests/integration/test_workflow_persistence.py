@@ -26,6 +26,9 @@ from taskforge.workflows.schema import (
     workflow_definitions,
     workflow_draft_dependencies,
     workflow_draft_steps,
+    workflow_version_dependencies,
+    workflow_version_steps,
+    workflow_versions,
 )
 from taskforge.workflows.service import (
     WorkflowNotFound,
@@ -34,7 +37,13 @@ from taskforge.workflows.service import (
     WorkflowPersistenceConflict,
     WorkflowService,
 )
-from taskforge.workflows.task_types import WorkflowValidationError
+from taskforge.workflows.task_types import (
+    JSONMapping,
+    TaskTypeDefinition,
+    TaskTypeRegistry,
+    WorkflowValidationError,
+    WorkflowValidationIssue,
+)
 from tests.integration.postgresql import migration_database_url, temporary_database
 from tests.integration.test_authentication_persistence import settings_for
 
@@ -45,6 +54,12 @@ pytestmark = [
         reason="set TASKFORGE_RUN_WORKFLOW_PERSISTENCE_INTEGRATION=1 explicitly",
     ),
 ]
+
+
+class AcceptParameters:
+    def validate(self, parameters: JSONMapping) -> tuple[WorkflowValidationIssue, ...]:
+        del parameters
+        return ()
 
 
 def workflow(owner_id: UUID, *, workflow_id: UUID | None = None) -> WorkflowDraft:
@@ -85,11 +100,43 @@ async def count_workflow_rows(
     return tuple(counts)
 
 
+async def count_version_rows(
+    sessions: async_sessionmaker[AsyncSession], workflow_id: UUID
+) -> tuple[int, int, int]:
+    async with sessions() as session:
+        version_ids = select(workflow_versions.c.id).where(
+            workflow_versions.c.workflow_definition_id == workflow_id
+        )
+        version_count = await session.scalar(
+            select(func.count())
+            .select_from(workflow_versions)
+            .where(workflow_versions.c.workflow_definition_id == workflow_id)
+        )
+        step_count = await session.scalar(
+            select(func.count())
+            .select_from(workflow_version_steps)
+            .where(workflow_version_steps.c.workflow_version_id.in_(version_ids))
+        )
+        dependency_count = await session.scalar(
+            select(func.count())
+            .select_from(workflow_version_dependencies)
+            .where(workflow_version_dependencies.c.workflow_version_id.in_(version_ids))
+        )
+    return (
+        int(version_count or 0),
+        int(step_count or 0),
+        int(dependency_count or 0),
+    )
+
+
 async def verify_workflow_persistence(database_url: URL) -> None:
     engine = build_async_engine(settings_for(database_url))
     sessions = build_session_factory(engine)
     repository = SQLAlchemyWorkflowRepository(sessions)
-    service = WorkflowService(repository)
+    service = WorkflowService(
+        repository,
+        TaskTypeRegistry((TaskTypeDefinition("test.task", AcceptParameters()),)),
+    )
     owner_id, other_owner_id, disabled_owner_id = uuid4(), uuid4(), uuid4()
     try:
         async with sessions.begin() as session:
@@ -132,8 +179,117 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         assert found.created_at.tzinfo is not None
         assert found.updated_at.tzinfo is not None
 
+        first_publication = await service.publish(
+            created_input.id,
+            owner_principal_id=owner_id,
+        )
+        assert first_publication.version_number == 1
+        assert first_publication.published_at.tzinfo is not None
+        async with sessions() as session:
+            version_row = (
+                await session.execute(
+                    select(workflow_versions).where(
+                        workflow_versions.c.id == first_publication.id
+                    )
+                )
+            ).one()
+            version_steps = (
+                await session.execute(
+                    select(workflow_version_steps)
+                    .where(
+                        workflow_version_steps.c.workflow_version_id
+                        == first_publication.id
+                    )
+                    .order_by(workflow_version_steps.c.step_identifier)
+                )
+            ).all()
+            version_dependencies = (
+                await session.execute(
+                    select(workflow_version_dependencies).where(
+                        workflow_version_dependencies.c.workflow_version_id
+                        == first_publication.id
+                    )
+                )
+            ).all()
+        assert version_row.name == created_input.name
+        assert version_row.description == created_input.description
+        assert version_row.execution_policy is None
+        assert [row.step_identifier for row in version_steps] == ["first", "second"]
+        assert version_steps[0].task_type == "test.task"
+        assert version_steps[0].parameters == {"value": 1}
+        assert all(row.execution_policy is None for row in version_steps)
+        assert [
+            (
+                row.predecessor_step_identifier,
+                row.successor_step_identifier,
+            )
+            for row in version_dependencies
+        ] == [("first", "second")]
+
+        async with sessions.begin() as session:
+            await session.execute(
+                update(workflow_definitions)
+                .where(workflow_definitions.c.id == created_input.id)
+                .values(name="Changed draft", description="Changed")
+            )
+            await session.execute(
+                update(workflow_draft_steps)
+                .where(
+                    workflow_draft_steps.c.workflow_definition_id == created_input.id,
+                    workflow_draft_steps.c.step_identifier == "first",
+                )
+                .values(task_type="test.task", parameters={"changed": True})
+            )
+            await session.execute(
+                workflow_draft_dependencies.delete().where(
+                    workflow_draft_dependencies.c.workflow_definition_id
+                    == created_input.id
+                )
+            )
+        async with sessions() as session:
+            unchanged_name = await session.scalar(
+                select(workflow_versions.c.name).where(
+                    workflow_versions.c.id == first_publication.id
+                )
+            )
+            unchanged_parameters = await session.scalar(
+                select(workflow_version_steps.c.parameters).where(
+                    workflow_version_steps.c.workflow_version_id
+                    == first_publication.id,
+                    workflow_version_steps.c.step_identifier == "first",
+                )
+            )
+            unchanged_edges = await session.scalar(
+                select(func.count())
+                .select_from(workflow_version_dependencies)
+                .where(
+                    workflow_version_dependencies.c.workflow_version_id
+                    == first_publication.id
+                )
+            )
+        assert unchanged_name == created_input.name
+        assert unchanged_parameters == {"value": 1}
+        assert unchanged_edges == 1
+
+        second_publication = await service.publish(
+            created_input.id,
+            owner_principal_id=owner_id,
+        )
+        concurrent = await asyncio.gather(
+            service.publish(created_input.id, owner_principal_id=owner_id),
+            service.publish(created_input.id, owner_principal_id=owner_id),
+        )
+        assert second_publication.version_number == 2
+        assert sorted(item.version_number for item in concurrent) == [3, 4]
+        assert await count_version_rows(sessions, created_input.id) == (4, 8, 1)
+
         with pytest.raises(WorkflowNotFound):
             await service.get(
+                created_input.id,
+                owner_principal_id=other_owner_id,
+            )
+        with pytest.raises(WorkflowNotFound):
+            await service.publish(
                 created_input.id,
                 owner_principal_id=other_owner_id,
             )
@@ -160,10 +316,84 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         assert error.value.graph_result is not None
         assert await count_workflow_rows(sessions, invalid.id) == (0, 0, 0)
 
+        cyclic = workflow(owner_id)
+        await service.create(cyclic)
+        identifiers = {step.identifier: step.id for step in cyclic.steps}
+        async with sessions.begin() as session:
+            await session.execute(
+                insert(workflow_draft_dependencies).values(
+                    id=uuid4(),
+                    workflow_definition_id=cyclic.id,
+                    predecessor_step_id=identifiers["second"],
+                    successor_step_id=identifiers["first"],
+                )
+            )
+        with pytest.raises(WorkflowValidationError) as publication_error:
+            await service.publish(cyclic.id, owner_principal_id=owner_id)
+        assert publication_error.value.graph_result is not None
+        assert await count_version_rows(sessions, cyclic.id) == (0, 0, 0)
+        async with sessions.begin() as session:
+            await session.execute(
+                workflow_draft_dependencies.delete().where(
+                    workflow_draft_dependencies.c.workflow_definition_id == cyclic.id
+                )
+            )
+            await session.execute(
+                workflow_draft_steps.delete().where(
+                    workflow_draft_steps.c.workflow_definition_id == cyclic.id
+                )
+            )
+            await session.execute(
+                workflow_definitions.delete().where(
+                    workflow_definitions.c.id == cyclic.id
+                )
+            )
+
         with pytest.raises(WorkflowOwnerNotFound):
             await service.create(workflow(uuid4()))
         with pytest.raises(WorkflowOwnerDisabled):
             await service.create(workflow(disabled_owner_id))
+        disabled_workflow = workflow(disabled_owner_id)
+        disabled_identifiers = {
+            step.identifier: step.id for step in disabled_workflow.steps
+        }
+        async with sessions.begin() as session:
+            await session.execute(
+                insert(workflow_definitions).values(
+                    id=disabled_workflow.id,
+                    owner_principal_id=disabled_owner_id,
+                    name=disabled_workflow.name,
+                    description=disabled_workflow.description,
+                    status=disabled_workflow.status.value,
+                )
+            )
+            await session.execute(
+                insert(workflow_draft_steps),
+                [
+                    {
+                        "id": step.id,
+                        "workflow_definition_id": disabled_workflow.id,
+                        "step_identifier": step.identifier,
+                        "task_type": step.task_type,
+                        "parameters": step.parameters,
+                    }
+                    for step in disabled_workflow.steps
+                ],
+            )
+            await session.execute(
+                insert(workflow_draft_dependencies).values(
+                    id=disabled_workflow.dependencies[0].id,
+                    workflow_definition_id=disabled_workflow.id,
+                    predecessor_step_id=disabled_identifiers["first"],
+                    successor_step_id=disabled_identifiers["second"],
+                )
+            )
+        with pytest.raises(WorkflowOwnerDisabled):
+            await service.publish(
+                disabled_workflow.id,
+                owner_principal_id=disabled_owner_id,
+            )
+        assert await count_version_rows(sessions, disabled_workflow.id) == (0, 0, 0)
 
         concurrent_input = workflow(owner_id)
         outcomes = await asyncio.gather(
@@ -209,6 +439,19 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         assert traversed_ids == initial_ids
         assert inserted_between_pages.id not in traversed_ids
         assert second_page.next_cursor is None
+
+        independent_inputs = (workflow(owner_id), workflow(owner_id))
+        for independent in independent_inputs:
+            await service.create(independent)
+        independent_versions = await asyncio.gather(
+            *(
+                service.publish(item.id, owner_principal_id=owner_id)
+                for item in independent_inputs
+            )
+        )
+        assert [item.version_number for item in independent_versions] == [1, 1]
+        for independent in independent_inputs:
+            assert await count_version_rows(sessions, independent.id) == (1, 2, 1)
 
     finally:
         await engine.dispose()

@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from taskforge.workflows.dag_validation import DAGEdge, validate_dag
-from taskforge.workflows.domain import WorkflowDraft
+from taskforge.workflows.domain import (
+    PublishedWorkflowVersion,
+    WorkflowDraft,
+    create_draft_dependency,
+    create_draft_step,
+    create_workflow_draft,
+)
 from taskforge.workflows.persistence_ports import (
     ResolvedDependency,
     StoredWorkflowDraft,
@@ -17,7 +23,11 @@ from taskforge.workflows.persistence_ports import (
     WorkflowRecordConflict,
     WorkflowRepository,
 )
-from taskforge.workflows.task_types import WorkflowValidationError
+from taskforge.workflows.task_types import (
+    TaskTypeRegistry,
+    WorkflowValidationError,
+    WorkflowValidationIssue,
+)
 
 
 class WorkflowNotFound(Exception):
@@ -45,8 +55,13 @@ class InvalidWorkflowListQuery(ValueError):
 
 
 class WorkflowService:
-    def __init__(self, repository: WorkflowRepository) -> None:
+    def __init__(
+        self,
+        repository: WorkflowRepository,
+        task_types: TaskTypeRegistry,
+    ) -> None:
         self._repository = repository
+        self._task_types = task_types
 
     async def create(self, workflow: WorkflowDraft) -> StoredWorkflowDraft:
         graph_result = validate_dag(
@@ -100,6 +115,65 @@ class WorkflowService:
             raise WorkflowNotFound
         return stored
 
+    async def publish(
+        self,
+        workflow_id: UUID,
+        *,
+        owner_principal_id: UUID,
+    ) -> PublishedWorkflowVersion:
+        """Revalidate and atomically snapshot one owner-scoped draft."""
+        version_id = uuid4()
+        try:
+            async with self._repository.transaction() as transaction:
+                await transaction.require_enabled_owner(owner_principal_id)
+                stored = await transaction.lock_draft_for_publication(
+                    workflow_id,
+                    owner_principal_id,
+                )
+                if stored is None:
+                    raise WorkflowNotFound
+                validated = _revalidate_for_publication(
+                    stored.draft,
+                    self._task_types,
+                )
+                version_number = await transaction.next_version_number(workflow_id)
+                published_at = await transaction.insert_version(
+                    version_id,
+                    version_number,
+                    validated,
+                )
+                await transaction.insert_version_steps(
+                    version_id,
+                    tuple(sorted(validated.steps, key=lambda step: step.identifier)),
+                )
+                await transaction.insert_version_dependencies(
+                    version_id,
+                    tuple(
+                        sorted(
+                            validated.dependencies,
+                            key=lambda dependency: (
+                                dependency.predecessor_identifier,
+                                dependency.successor_identifier,
+                            ),
+                        )
+                    ),
+                )
+                await transaction.commit()
+        except WorkflowOwnerRecordNotFound as error:
+            raise WorkflowOwnerNotFound from error
+        except WorkflowOwnerRecordDisabled as error:
+            raise WorkflowOwnerDisabled from error
+        except WorkflowRecordConflict as error:
+            raise WorkflowPersistenceConflict from error
+        except WorkflowPersistenceUnavailable as error:
+            raise WorkflowServiceUnavailable from error
+        return PublishedWorkflowVersion(
+            id=version_id,
+            workflow_definition_id=workflow_id,
+            version_number=version_number,
+            published_at=published_at,
+        )
+
     async def list(
         self,
         *,
@@ -140,3 +214,57 @@ def _resolve_dependencies(
             )
         )
     return tuple(resolved)
+
+
+def _revalidate_for_publication(
+    workflow: WorkflowDraft,
+    task_types: TaskTypeRegistry,
+) -> WorkflowDraft:
+    steps = []
+    dependencies = []
+    issues: list[WorkflowValidationIssue] = []
+    for index, step in enumerate(workflow.steps):
+        try:
+            steps.append(
+                create_draft_step(
+                    step_id=step.id,
+                    identifier=step.identifier,
+                    task_type=step.task_type,
+                    parameters=step.parameters,
+                    task_types=task_types,
+                )
+            )
+        except WorkflowValidationError as error:
+            issues.extend(_prefix_issues(("steps", index), error.issues))
+    for index, dependency in enumerate(workflow.dependencies):
+        try:
+            dependencies.append(
+                create_draft_dependency(
+                    dependency_id=dependency.id,
+                    predecessor_identifier=dependency.predecessor_identifier,
+                    successor_identifier=dependency.successor_identifier,
+                )
+            )
+        except WorkflowValidationError as error:
+            issues.extend(_prefix_issues(("dependencies", index), error.issues))
+    if issues:
+        raise WorkflowValidationError(tuple(issues))
+    return create_workflow_draft(
+        workflow_id=workflow.id,
+        owner_principal_id=workflow.owner_principal_id,
+        name=workflow.name,
+        description=workflow.description,
+        status=workflow.status,
+        steps=tuple(steps),
+        dependencies=tuple(dependencies),
+    )
+
+
+def _prefix_issues(
+    prefix: tuple[str | int, ...],
+    issues: tuple[WorkflowValidationIssue, ...],
+) -> tuple[WorkflowValidationIssue, ...]:
+    return tuple(
+        WorkflowValidationIssue(issue.code, (*prefix, *issue.path), issue.message)
+        for issue in issues
+    )
