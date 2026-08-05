@@ -37,6 +37,7 @@ from taskforge.workflows.service import (
     WorkflowService,
     WorkflowServiceUnavailable,
 )
+from taskforge.workflows.task_types import WorkflowValidationError
 
 
 def draft(*, dependency_target: str = "second") -> WorkflowDraft:
@@ -169,13 +170,40 @@ def test_create_persists_complete_aggregate_in_one_transaction() -> None:
     assert stored.created_at == transaction.timestamps.created_at
 
 
-def test_unknown_dependency_fails_before_opening_a_transaction() -> None:
+def test_invalid_graph_fails_before_opening_a_transaction() -> None:
     transaction = FakeTransaction()
     service = WorkflowService(FakeRepository(transaction))
 
-    with pytest.raises(WorkflowPersistenceConflict):
+    with pytest.raises(WorkflowValidationError) as error:
         asyncio.run(service.create(draft(dependency_target="missing")))
 
+    assert error.value.graph_result is not None
+    assert transaction.calls == []
+
+
+def test_service_revalidates_graph_even_for_directly_constructed_domain_record() -> (
+    None
+):
+    invalid = draft()
+    invalid = WorkflowDraft(
+        id=invalid.id,
+        owner_principal_id=invalid.owner_principal_id,
+        name=invalid.name,
+        description=invalid.description,
+        status=invalid.status,
+        steps=invalid.steps,
+        dependencies=(
+            DraftDependency(uuid4(), "first", "second"),
+            DraftDependency(uuid4(), "second", "first"),
+        ),
+    )
+    transaction = FakeTransaction()
+
+    with pytest.raises(WorkflowValidationError) as error:
+        asyncio.run(WorkflowService(FakeRepository(transaction)).create(invalid))
+
+    assert error.value.graph_result is not None
+    assert "cycle" in error.value.graph_result.violations
     assert transaction.calls == []
 
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from uuid import UUID
 
+from taskforge.workflows.dag_validation import DAGEdge, validate_dag
 from taskforge.workflows.task_types import (
     JSONValue,
     TaskTypeRegistry,
@@ -184,7 +185,7 @@ def create_workflow_draft(
     steps: tuple[DraftWorkflowStep, ...],
     dependencies: tuple[DraftDependency, ...] = (),
 ) -> WorkflowDraft:
-    """Validate aggregate-level invariants without persistence or graph analysis."""
+    """Validate aggregate and graph invariants without persistence."""
     issues: list[WorkflowValidationIssue] = []
     if not isinstance(workflow_id, UUID):
         issues.append(
@@ -233,6 +234,18 @@ def create_workflow_draft(
 
     if issues:
         raise WorkflowValidationError(tuple(issues))
+    graph_result = validate_dag(
+        tuple(step.identifier for step in steps),
+        tuple(
+            DAGEdge(
+                dependency.predecessor_identifier,
+                dependency.successor_identifier,
+            )
+            for dependency in dependencies
+        ),
+    )
+    if not graph_result.is_valid:
+        raise WorkflowValidationError.from_graph(graph_result)
     assert isinstance(workflow_id, UUID)
     assert isinstance(owner_principal_id, UUID)
     assert isinstance(name, str)
@@ -246,6 +259,26 @@ def create_workflow_draft(
         status=status,
         steps=tuple(steps),
         dependencies=tuple(dependencies),
+    )
+
+
+def replace_workflow_draft(
+    workflow: WorkflowDraft,
+    *,
+    name: object,
+    description: object,
+    steps: tuple[DraftWorkflowStep, ...],
+    dependencies: tuple[DraftDependency, ...] = (),
+) -> WorkflowDraft:
+    """Construct a validated draft replacement without defining persistence policy."""
+    return create_workflow_draft(
+        workflow_id=workflow.id,
+        owner_principal_id=workflow.owner_principal_id,
+        name=name,
+        description=description,
+        status=workflow.status,
+        steps=steps,
+        dependencies=dependencies,
     )
 
 

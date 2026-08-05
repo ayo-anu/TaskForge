@@ -9,6 +9,7 @@ from taskforge.workflows.domain import (
     create_draft_dependency,
     create_draft_step,
     create_workflow_draft,
+    replace_workflow_draft,
 )
 from taskforge.workflows.persistence_ports import StoredWorkflowDraft, WorkflowSummary
 from taskforge.workflows.service import (
@@ -51,4 +52,5 @@ __all__ = [
     "create_draft_dependency",
     "create_draft_step",
     "create_workflow_draft",
+    "replace_workflow_draft",
 ]

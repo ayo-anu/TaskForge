@@ -20,6 +20,12 @@ from taskforge.api.errors import (
     error_response,
 )
 from taskforge.identity.authorization import AuthorizationContext, Permission
+from taskforge.workflows.dag_validation import (
+    DAGEdge,
+    DAGValidationIssue,
+    DAGViolationCode,
+    validate_dag,
+)
 from taskforge.workflows.domain import (
     DraftDependency,
     DraftWorkflowStep,
@@ -215,6 +221,15 @@ async def create_workflow(
     """Create an owner-bound draft after authentication and authorization."""
     runtime = _runtime(request)
     try:
+        graph_result = validate_dag(
+            tuple(step.identifier for step in body.steps),
+            tuple(
+                DAGEdge(dependency.predecessor, dependency.successor)
+                for dependency in body.dependencies
+            ),
+        )
+        if not graph_result.is_valid:
+            return _graph_validation_error(request, graph_result.issues)
         steps = _create_steps(body.steps, runtime.task_type_registry)
         dependencies = _create_dependencies(body.dependencies)
         workflow = create_workflow_draft(
@@ -228,6 +243,8 @@ async def create_workflow(
         )
         stored = await runtime.workflow_service.create(workflow)
     except WorkflowValidationError as error:
+        if error.graph_result is not None:
+            return _graph_validation_error(request, error.graph_result.issues)
         return _validation_error(request, error.issues)
     except (WorkflowOwnerNotFound, WorkflowOwnerDisabled) as error:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN) from error
@@ -339,6 +356,39 @@ def _validation_error(
         message=message,
         details=tuple(
             ErrorDetail(code=issue.code, path=list(issue.path), message=issue.message)
+            for issue in issues
+        ),
+    )
+
+
+_DAG_ERROR_MESSAGES = {
+    DAGViolationCode.EMPTY_GRAPH: "A workflow must contain at least one step.",
+    DAGViolationCode.TOO_MANY_STEPS: "The workflow contains too many steps.",
+    DAGViolationCode.TOO_MANY_DEPENDENCIES: (
+        "The workflow contains too many dependencies."
+    ),
+    DAGViolationCode.DUPLICATE_STEP_IDENTIFIER: "Step identifier is duplicated.",
+    DAGViolationCode.MISSING_DEPENDENCY_REFERENCE: (
+        "Dependency references an unknown step."
+    ),
+    DAGViolationCode.SELF_DEPENDENCY: "A step cannot depend on itself.",
+    DAGViolationCode.DUPLICATE_DEPENDENCY: "Dependency is duplicated.",
+    DAGViolationCode.CYCLE: "Workflow dependencies must not contain a cycle.",
+}
+
+
+def _graph_validation_error(
+    request: Request,
+    issues: tuple[DAGValidationIssue, ...],
+) -> Response:
+    return _validation_error(
+        request,
+        tuple(
+            WorkflowValidationIssue(
+                issue.code.value,
+                issue.path,
+                _DAG_ERROR_MESSAGES[issue.code],
+            )
             for issue in issues
         ),
     )

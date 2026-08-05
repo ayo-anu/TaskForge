@@ -6,7 +6,10 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from taskforge.workflows.dag_validation import DAGValidationResult
 
 MAX_PARAMETER_BYTES = 16 * 1024
 MAX_PARAMETER_DEPTH = 8
@@ -33,11 +36,24 @@ class WorkflowValidationIssue:
 class WorkflowValidationError(ValueError):
     """One or more safe, deterministic workflow validation issues."""
 
-    def __init__(self, issues: tuple[WorkflowValidationIssue, ...]) -> None:
-        if not issues:
-            raise ValueError("at least one validation issue is required")
+    def __init__(
+        self,
+        issues: tuple[WorkflowValidationIssue, ...] = (),
+        *,
+        graph_result: DAGValidationResult | None = None,
+    ) -> None:
+        if bool(issues) == (graph_result is not None):
+            raise ValueError("exactly one validation issue form is required")
         self.issues = issues
+        self.graph_result = graph_result
         super().__init__("workflow validation failed")
+
+    @classmethod
+    def from_graph(cls, result: DAGValidationResult) -> WorkflowValidationError:
+        """Represent an invalid graph through the existing validation family."""
+        if result.is_valid:
+            raise ValueError("graph validation result must be invalid")
+        return cls(graph_result=result)
 
 
 class TaskParameterValidator(Protocol):

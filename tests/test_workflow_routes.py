@@ -300,6 +300,40 @@ def test_transport_and_domain_validation_are_422() -> None:
     assert service.created == []
 
 
+def test_invalid_graph_returns_deterministic_422_before_domain_or_service_work() -> (
+    None
+):
+    app, runtime, service, validator = make_app(
+        frozenset({Role.WORKFLOW_OPERATOR.value})
+    )
+    body = {
+        "name": "Cyclic",
+        "steps": [
+            {"identifier": "first", "task_type": "test.task", "parameters": {}},
+            {"identifier": "second", "task_type": "test.task", "parameters": {}},
+        ],
+        "dependencies": [
+            {"predecessor": "first", "successor": "second"},
+            {"predecessor": "second", "successor": "first"},
+        ],
+    }
+
+    response = request(
+        app, "POST", "/api/v1/workflows", runtime.api_credential, json=body
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"] == [
+        {
+            "code": "cycle",
+            "path": ["dependencies"],
+            "message": "Workflow dependencies must not contain a cycle.",
+        }
+    ]
+    assert validator.calls == 0
+    assert service.created == []
+
+
 def test_persistence_conflict_and_unavailability_are_normalized() -> None:
     app, runtime, service, _ = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
     service.create_error = WorkflowPersistenceConflict()

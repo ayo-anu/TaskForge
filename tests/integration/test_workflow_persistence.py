@@ -34,6 +34,7 @@ from taskforge.workflows.service import (
     WorkflowPersistenceConflict,
     WorkflowService,
 )
+from taskforge.workflows.task_types import WorkflowValidationError
 from tests.integration.postgresql import migration_database_url, temporary_database
 from tests.integration.test_authentication_persistence import settings_for
 
@@ -154,8 +155,9 @@ async def verify_workflow_persistence(database_url: URL) -> None:
             steps=invalid.steps,
             dependencies=(DraftDependency(uuid4(), "first", "first"),),
         )
-        with pytest.raises(WorkflowPersistenceConflict):
+        with pytest.raises(WorkflowValidationError) as error:
             await service.create(invalid)
+        assert error.value.graph_result is not None
         assert await count_workflow_rows(sessions, invalid.id) == (0, 0, 0)
 
         with pytest.raises(WorkflowOwnerNotFound):

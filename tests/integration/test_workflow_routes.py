@@ -129,6 +129,18 @@ async def verify_workflow_routes(database_url: URL) -> None:
                 json=body,
                 headers={"Authorization": f"Bearer {owner_token}"},
             )
+            invalid = await client.post(
+                "/api/v1/workflows",
+                json={
+                    **body,
+                    "name": "Invalid integrated draft",
+                    "dependencies": [
+                        {"predecessor": "first", "successor": "second"},
+                        {"predecessor": "second", "successor": "first"},
+                    ],
+                },
+                headers={"Authorization": f"Bearer {owner_token}"},
+            )
             location = created.headers["Location"]
             found = await client.get(
                 location, headers={"Authorization": f"Bearer {owner_token}"}
@@ -170,6 +182,14 @@ async def verify_workflow_routes(database_url: URL) -> None:
             )
 
     assert created.status_code == 201
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["details"] == [
+        {
+            "code": "cycle",
+            "path": ["dependencies"],
+            "message": "Workflow dependencies must not contain a cycle.",
+        }
+    ]
     assert created.json()["owner_principal_id"] == str(owner_id)
     assert found.status_code == 200
     assert second_created.status_code == third_created.status_code == 201

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from taskforge.workflows.dag_validation import DAGEdge, validate_dag
 from taskforge.workflows.domain import WorkflowDraft
 from taskforge.workflows.persistence_ports import (
     ResolvedDependency,
@@ -16,6 +17,7 @@ from taskforge.workflows.persistence_ports import (
     WorkflowRecordConflict,
     WorkflowRepository,
 )
+from taskforge.workflows.task_types import WorkflowValidationError
 
 
 class WorkflowNotFound(Exception):
@@ -47,6 +49,18 @@ class WorkflowService:
         self._repository = repository
 
     async def create(self, workflow: WorkflowDraft) -> StoredWorkflowDraft:
+        graph_result = validate_dag(
+            tuple(step.identifier for step in workflow.steps),
+            tuple(
+                DAGEdge(
+                    dependency.predecessor_identifier,
+                    dependency.successor_identifier,
+                )
+                for dependency in workflow.dependencies
+            ),
+        )
+        if not graph_result.is_valid:
+            raise WorkflowValidationError.from_graph(graph_result)
         dependencies = _resolve_dependencies(workflow)
         try:
             async with self._repository.transaction() as transaction:

@@ -16,6 +16,7 @@ from taskforge.workflows.domain import (
     create_draft_dependency,
     create_draft_step,
     create_workflow_draft,
+    replace_workflow_draft,
 )
 from taskforge.workflows.task_types import (
     JSONMapping,
@@ -87,7 +88,7 @@ def test_description_is_optional_but_bounded() -> None:
         name="Valid workflow",
         description=None,
         status=WorkflowDefinitionStatus.DRAFT,
-        steps=(),
+        steps=(step(),),
     )
     with pytest.raises(WorkflowValidationError) as error:
         create_workflow_draft(
@@ -212,3 +213,63 @@ def test_dependencies_are_typed_without_performing_later_graph_validation() -> N
     )
 
     assert dependency.predecessor_identifier == dependency.successor_identifier
+
+
+def test_workflow_factory_rejects_invalid_graph_through_existing_error_family() -> None:
+    first = step("first")
+    dependency = create_draft_dependency(
+        dependency_id=uuid4(),
+        predecessor_identifier="first",
+        successor_identifier="missing",
+    )
+
+    with pytest.raises(WorkflowValidationError) as error:
+        create_workflow_draft(
+            workflow_id=uuid4(),
+            owner_principal_id=uuid4(),
+            name="Invalid graph",
+            description=None,
+            status=WorkflowDefinitionStatus.DRAFT,
+            steps=(first,),
+            dependencies=(dependency,),
+        )
+
+    assert error.value.issues == ()
+    assert error.value.graph_result is not None
+    assert error.value.graph_result.violations == ("missing_dependency_reference",)
+
+
+def test_draft_replacement_preserves_identity_owner_and_status_and_validates_graph() -> (
+    None
+):
+    original = create_workflow_draft(
+        workflow_id=uuid4(),
+        owner_principal_id=uuid4(),
+        name="Original",
+        description=None,
+        status=WorkflowDefinitionStatus.DRAFT,
+        steps=(step("first"),),
+    )
+    replacement_steps = (step("replacement"),)
+
+    replaced = replace_workflow_draft(
+        original,
+        name="Replacement",
+        description="Changed",
+        steps=replacement_steps,
+    )
+
+    assert (replaced.id, replaced.owner_principal_id, replaced.status) == (
+        original.id,
+        original.owner_principal_id,
+        original.status,
+    )
+    assert replaced.name == "Replacement"
+    with pytest.raises(WorkflowValidationError) as error:
+        replace_workflow_draft(
+            original,
+            name="Invalid replacement",
+            description=None,
+            steps=(),
+        )
+    assert error.value.graph_result is not None
