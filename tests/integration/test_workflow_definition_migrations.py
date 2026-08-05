@@ -47,6 +47,15 @@ IDENTITY_TABLES = {
     "worker_credentials",
     "worker_identities",
 }
+IMMUTABLE_SQLSTATE = "TF001"
+IMMUTABLE_MESSAGE = "workflow version snapshots are immutable"
+IMMUTABILITY_TRIGGERS = {
+    "workflow_versions": "trg_workflow_versions_reject_mutation",
+    "workflow_version_steps": "trg_workflow_version_steps_reject_mutation",
+    "workflow_version_dependencies": (
+        "trg_workflow_version_dependencies_reject_mutation"
+    ),
+}
 
 
 async def insert_principal(connection: asyncpg.Connection[asyncpg.Record]) -> UUID:
@@ -123,16 +132,91 @@ async def insert_version_step(
     *,
     task_type: str = "test.task",
     parameters: str = '{"value": 1}',
+    execution_policy: str | None = None,
 ) -> None:
     await connection.execute(
         "INSERT INTO workflow_version_steps "
-        "(workflow_version_id, step_identifier, task_type, parameters) "
-        "VALUES ($1, $2, $3, $4::jsonb)",
+        "(workflow_version_id, step_identifier, task_type, parameters, "
+        "execution_policy) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)",
         version_id,
         identifier,
         task_type,
         parameters,
+        execution_policy,
     )
+
+
+async def assert_immutable_mutation_rejected(
+    connection: asyncpg.Connection[asyncpg.Record],
+    workflow_id: UUID,
+    statement: str,
+    *arguments: object,
+    unchanged_query: str,
+    unchanged_arguments: tuple[object, ...],
+) -> None:
+    before = await connection.fetchrow(unchanged_query, *unchanged_arguments)
+    original_description = await connection.fetchval(
+        "SELECT description FROM workflow_definitions WHERE id = $1", workflow_id
+    )
+    transaction = connection.transaction()
+    await transaction.start()
+    try:
+        await connection.execute(
+            "UPDATE workflow_definitions SET description = $1 WHERE id = $2",
+            "must roll back",
+            workflow_id,
+        )
+        try:
+            await connection.execute(statement, *arguments)
+        except asyncpg.PostgresError as error:
+            assert error.sqlstate == IMMUTABLE_SQLSTATE
+            assert error.message == IMMUTABLE_MESSAGE
+        else:
+            pytest.fail("snapshot mutation was not rejected")
+        assert connection.is_in_transaction()
+        with pytest.raises(asyncpg.InFailedSQLTransactionError):
+            await connection.fetchval("SELECT 1")
+    finally:
+        await transaction.rollback()
+    assert (
+        await connection.fetchval(
+            "SELECT description FROM workflow_definitions WHERE id = $1", workflow_id
+        )
+        == original_description
+    )
+    assert await connection.fetchrow(unchanged_query, *unchanged_arguments) == before
+
+
+async def assert_immutability_triggers(
+    connection: asyncpg.Connection[asyncpg.Record],
+) -> None:
+    assert await connection.fetchval(
+        "SELECT EXISTS (SELECT FROM pg_proc p JOIN pg_namespace n "
+        "ON n.oid = p.pronamespace WHERE n.nspname = 'public' "
+        "AND p.proname = 'reject_workflow_version_snapshot_mutation' "
+        "AND p.pronargs = 0)"
+    )
+    rows = await connection.fetch(
+        "SELECT t.tgname, c.relname AS table_name, t.tgenabled::text AS tgenabled, "
+        "t.tgtype "
+        "FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public' AND NOT t.tgisinternal "
+        "AND t.tgname = ANY($1::text[]) ORDER BY c.relname",
+        list(IMMUTABILITY_TRIGGERS.values()),
+    )
+    assert len(rows) == 3
+    for row in rows:
+        assert row["tgname"] == IMMUTABILITY_TRIGGERS[row["table_name"]]
+        assert row["tgenabled"] == "O"
+        trigger_type = row["tgtype"]
+        assert trigger_type & 1  # FOR EACH ROW
+        assert trigger_type & 2  # BEFORE
+        assert not trigger_type & 4  # not INSERT
+        assert trigger_type & 8  # DELETE
+        assert trigger_type & 16  # UPDATE
+        assert not trigger_type & 32  # not TRUNCATE
+        assert trigger_type == 27
 
 
 async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
@@ -160,6 +244,7 @@ async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
             "SELECT EXISTS (SELECT FROM pg_indexes WHERE schemaname = 'public' "
             "AND indexname = 'ix_workflow_definitions_owner_principal_id')"
         )
+        await assert_immutability_triggers(connection)
 
         principal_id = await insert_principal(connection)
         workflow_id = await insert_workflow(connection, principal_id)
@@ -358,15 +443,13 @@ async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
             )
         with pytest.raises(asyncpg.UniqueViolationError):
             await insert_version_step(connection, version_id, "first")
-        await insert_version_step(connection, other_version_id, "first")
-        await insert_version_step(connection, other_version_id, "other-only")
-        await connection.execute(
-            "UPDATE workflow_version_steps SET execution_policy = $1::jsonb "
-            "WHERE workflow_version_id = $2 AND step_identifier = $3",
-            '{"placeholder": true}',
+        await insert_version_step(
+            connection,
             other_version_id,
             "first",
+            execution_policy='{"placeholder": true}',
         )
+        await insert_version_step(connection, other_version_id, "other-only")
         with pytest.raises(asyncpg.CheckViolationError):
             await connection.execute(
                 "INSERT INTO workflow_version_steps "
@@ -430,31 +513,99 @@ async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
                 "second",
             )
 
-        with pytest.raises(asyncpg.RestrictViolationError):
-            await connection.execute(
-                "DELETE FROM workflow_versions WHERE id = $1",
-                version_id,
-            )
-        with pytest.raises(asyncpg.RestrictViolationError):
-            await connection.execute(
-                "DELETE FROM workflow_version_steps "
-                "WHERE workflow_version_id = $1 AND step_identifier = $2",
-                version_id,
-                "first",
-            )
-        with pytest.raises(asyncpg.RestrictViolationError):
-            await connection.execute(
+        version_query = "SELECT * FROM workflow_versions WHERE id = $1"
+        step_query = (
+            "SELECT * FROM workflow_version_steps WHERE workflow_version_id = $1 "
+            "AND step_identifier = $2"
+        )
+        dependency_query = (
+            "SELECT * FROM workflow_version_dependencies "
+            "WHERE workflow_version_id = $1 AND predecessor_step_identifier = $2 "
+            "AND successor_step_identifier = $3"
+        )
+        mutations = (
+            (
                 "UPDATE workflow_versions SET id = $1 WHERE id = $2",
-                uuid4(),
-                version_id,
-            )
-        with pytest.raises(asyncpg.RestrictViolationError):
-            await connection.execute(
+                (uuid4(), version_id),
+                version_query,
+                (version_id,),
+            ),
+            (
+                "UPDATE workflow_versions SET name = $1 WHERE id = $2",
+                ("Rewritten history", version_id),
+                version_query,
+                (version_id,),
+            ),
+            (
+                "DELETE FROM workflow_versions WHERE id = $1",
+                (version_id,),
+                version_query,
+                (version_id,),
+            ),
+            (
                 "UPDATE workflow_version_steps SET step_identifier = $1 "
                 "WHERE workflow_version_id = $2 AND step_identifier = $3",
-                "renamed",
-                version_id,
-                "first",
+                ("renamed", version_id, "first"),
+                step_query,
+                (version_id, "first"),
+            ),
+            (
+                "UPDATE workflow_version_steps SET parameters = $1::jsonb "
+                "WHERE workflow_version_id = $2 AND step_identifier = $3",
+                ('{"rewritten": true}', version_id, "first"),
+                step_query,
+                (version_id, "first"),
+            ),
+            (
+                "DELETE FROM workflow_version_steps "
+                "WHERE workflow_version_id = $1 AND step_identifier = $2",
+                (version_id, "first"),
+                step_query,
+                (version_id, "first"),
+            ),
+            (
+                "UPDATE workflow_version_dependencies SET workflow_version_id = $1 "
+                "WHERE workflow_version_id = $2 AND predecessor_step_identifier = $3 "
+                "AND successor_step_identifier = $4",
+                (other_version_id, version_id, "first", "second"),
+                dependency_query,
+                (version_id, "first", "second"),
+            ),
+            (
+                "UPDATE workflow_version_dependencies "
+                "SET predecessor_step_identifier = $1 "
+                "WHERE workflow_version_id = $2 AND predecessor_step_identifier = $3 "
+                "AND successor_step_identifier = $4",
+                ("second", version_id, "first", "second"),
+                dependency_query,
+                (version_id, "first", "second"),
+            ),
+            (
+                "UPDATE workflow_version_dependencies "
+                "SET successor_step_identifier = $1 "
+                "WHERE workflow_version_id = $2 AND predecessor_step_identifier = $3 "
+                "AND successor_step_identifier = $4",
+                ("first", version_id, "first", "second"),
+                dependency_query,
+                (version_id, "first", "second"),
+            ),
+            (
+                "DELETE FROM workflow_version_dependencies "
+                "WHERE workflow_version_id = $1 AND predecessor_step_identifier = $2 "
+                "AND successor_step_identifier = $3",
+                (version_id, "first", "second"),
+                dependency_query,
+                (version_id, "first", "second"),
+            ),
+        )
+        for statement, arguments, query, query_arguments in mutations:
+            await assert_immutable_mutation_rejected(
+                connection,
+                workflow_id,
+                statement,
+                *arguments,
+                unchanged_query=query,
+                unchanged_arguments=query_arguments,
             )
         restricted_workflow_id = await insert_workflow(connection, principal_id)
         await insert_version(connection, restricted_workflow_id, 1)
@@ -464,20 +615,34 @@ async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
                 restricted_workflow_id,
             )
 
-        await connection.execute(
-            "DELETE FROM workflow_version_dependencies WHERE workflow_version_id = $1",
-            version_id,
+    finally:
+        await connection.close()
+
+
+async def inspect_immutability_downgrade(database_url: URL) -> None:
+    connection = await asyncpg.connect(asyncpg_dsn(database_url))
+    try:
+        assert not await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM pg_proc p JOIN pg_namespace n "
+            "ON n.oid = p.pronamespace WHERE n.nspname = 'public' "
+            "AND p.proname = 'reject_workflow_version_snapshot_mutation')"
         )
-        await connection.execute(
-            "DELETE FROM workflow_version_steps WHERE workflow_version_id = $1",
-            version_id,
+        assert not await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM pg_trigger WHERE NOT tgisinternal "
+            "AND tgname = ANY($1::text[]))",
+            list(IMMUTABILITY_TRIGGERS.values()),
         )
+        version_id = await connection.fetchval(
+            "SELECT id FROM workflow_versions LIMIT 1"
+        )
+        assert version_id is not None
         assert (
             await connection.execute(
-                "DELETE FROM workflow_versions WHERE id = $1",
+                "UPDATE workflow_versions SET description = $1 WHERE id = $2",
+                "mutable at revision 0004",
                 version_id,
             )
-            == "DELETE 1"
+            == "UPDATE 1"
         )
     finally:
         await connection.close()
@@ -554,6 +719,8 @@ def test_workflow_migration_constraints_and_reversible_boundary() -> None:
         with migration_database_url(alembic_url):
             command.upgrade(configuration, "head")
             asyncio.run(inspect_upgraded_workflow_schema(database_url))
+            command.downgrade(configuration, "0004_versions")
+            asyncio.run(inspect_immutability_downgrade(database_url))
             command.downgrade(configuration, "0003_workflow_list")
             asyncio.run(inspect_version_downgrade(database_url))
             command.downgrade(configuration, "0002_workflows")

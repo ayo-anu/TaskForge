@@ -11,6 +11,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.identity.schema import api_principals
@@ -131,6 +132,69 @@ async def count_version_rows(
     )
 
 
+async def verify_published_snapshot_rejects_mutation(
+    sessions: async_sessionmaker[AsyncSession],
+    workflow_id: UUID,
+    version_id: UUID,
+) -> None:
+    async with sessions() as session:
+        before = (
+            await session.execute(
+                select(workflow_versions).where(workflow_versions.c.id == version_id)
+            )
+        ).one()
+        original_description = await session.scalar(
+            select(workflow_definitions.c.description).where(
+                workflow_definitions.c.id == workflow_id
+            )
+        )
+
+    session = sessions()
+    try:
+        await session.begin()
+        await session.execute(
+            update(workflow_definitions)
+            .where(workflow_definitions.c.id == workflow_id)
+            .values(description="must roll back")
+        )
+        with pytest.raises(DBAPIError) as caught:
+            await session.execute(
+                update(workflow_versions)
+                .where(workflow_versions.c.id == version_id)
+                .values(name="Rewritten history")
+            )
+        assert caught.value.orig is not None
+        database_error = caught.value.orig.__cause__
+        assert database_error is not None
+        assert getattr(database_error, "sqlstate", None) == "TF001"
+        assert (
+            getattr(database_error, "message", None)
+            == "workflow version snapshots are immutable"
+        )
+        assert session.in_transaction()
+        with pytest.raises(DBAPIError):
+            await session.scalar(select(1))
+    finally:
+        await session.rollback()
+        await session.close()
+
+    async with sessions() as session:
+        after = (
+            await session.execute(
+                select(workflow_versions).where(workflow_versions.c.id == version_id)
+            )
+        ).one()
+        assert after == before
+        assert (
+            await session.scalar(
+                select(workflow_definitions.c.description).where(
+                    workflow_definitions.c.id == workflow_id
+                )
+            )
+            == original_description
+        )
+
+
 async def verify_workflow_persistence(database_url: URL) -> None:
     engine = build_async_engine(settings_for(database_url))
     sessions = build_session_factory(engine)
@@ -227,6 +291,11 @@ async def verify_workflow_persistence(database_url: URL) -> None:
             )
             for row in version_dependencies
         ] == [("first", "second")]
+        await verify_published_snapshot_rejects_mutation(
+            sessions,
+            created_input.id,
+            first_publication.id,
+        )
 
         enabled = await service.set_availability(
             created_input.id,
