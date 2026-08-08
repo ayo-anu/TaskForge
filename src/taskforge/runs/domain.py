@@ -234,6 +234,31 @@ class RunnableTransitionResult:
         return len(self.transitioned_task_ids)
 
 
+@dataclass(frozen=True)
+class DependencyFailurePropagationResult:
+    """The immutable outcome of one persisted dependency-failure propagation."""
+
+    workflow_run_id: UUID
+    skipped_task_ids: tuple[UUID, ...]
+    skipped_step_identifiers: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.skipped_task_ids) != len(self.skipped_step_identifiers):
+            raise ValueError(
+                "dependency-failure propagation identities must remain paired"
+            )
+        if len(set(self.skipped_task_ids)) != len(self.skipped_task_ids):
+            raise ValueError("propagated task identifiers must be unique")
+        if len(set(self.skipped_step_identifiers)) != len(
+            self.skipped_step_identifiers
+        ):
+            raise ValueError("propagated step identifiers must be unique")
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped_task_ids)
+
+
 @dataclass(frozen=True, repr=False)
 class WorkflowRunIdempotency:
     key_digest: str

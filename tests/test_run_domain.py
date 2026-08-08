@@ -7,6 +7,7 @@ import pytest
 
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
+    DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
     InspectedTaskRun,
     InspectedWorkflowRun,
@@ -117,6 +118,31 @@ def test_runnable_transition_result_rejects_unpaired_or_duplicate_identities() -
         RunnableTransitionResult(uuid4(), (task_id, task_id), ("one", "two"))
     with pytest.raises(ValueError):
         RunnableTransitionResult(uuid4(), (uuid4(), uuid4()), ("one", "one"))
+
+
+def test_dependency_failure_result_is_immutable_and_counts_skipped_tasks() -> None:
+    run_id, first_id, second_id = uuid4(), uuid4(), uuid4()
+    result = DependencyFailurePropagationResult(
+        run_id, (first_id, second_id), ("first", "second")
+    )
+
+    assert result.skipped_count == 2
+    with pytest.raises(AttributeError):
+        result.workflow_run_id = uuid4()  # type: ignore[misc]
+
+
+def test_empty_dependency_failure_result_is_a_successful_no_op() -> None:
+    assert DependencyFailurePropagationResult(uuid4(), (), ()).skipped_count == 0
+
+
+def test_dependency_failure_result_rejects_unpaired_or_duplicate_identities() -> None:
+    task_id = uuid4()
+    with pytest.raises(ValueError):
+        DependencyFailurePropagationResult(uuid4(), (task_id,), ())
+    with pytest.raises(ValueError):
+        DependencyFailurePropagationResult(uuid4(), (task_id, task_id), ("one", "two"))
+    with pytest.raises(ValueError):
+        DependencyFailurePropagationResult(uuid4(), (uuid4(), uuid4()), ("one", "one"))
 
 
 @pytest.mark.parametrize(

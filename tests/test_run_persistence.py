@@ -14,7 +14,9 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from taskforge.persistence.runs import (
     SQLAlchemyWorkflowRunCreationTransaction,
+    _active_run_progression_lock_statement,
     _definition_lock_statement,
+    _dependency_failure_propagation_statement,
     _idempotent_run_statement,
     _is_idempotency_scope_conflict,
     _locked_version_statement,
@@ -140,6 +142,39 @@ def test_runnable_transition_sql_owns_immutable_dependency_evaluation() -> None:
     assert "workflow_definitions" not in sql
     assert "workflow_steps" not in sql
     assert "RETURNING task_runs.id, task_runs.step_identifier" in sql
+
+
+def test_dependency_failure_sql_is_recursive_and_and_only() -> None:
+    run_id, version_id = uuid4(), uuid4()
+    sql = normalized_sql(
+        _dependency_failure_propagation_statement(run_id, version_id).compile(
+            dialect=postgresql.dialect()  # type: ignore[no-untyped-call]
+        )
+    )
+
+    assert "WITH RECURSIVE dependency_failed_descendants" in sql
+    assert " UNION SELECT " in sql
+    assert "dependency_failed_predecessor.status IN" in sql
+    assert "failure_seed_successor.status IN" in sql
+    assert "propagated_failure_successor.status IN" in sql
+    assert "workflow_version_dependencies" in sql
+    assert "task_runs.status =" in sql
+    assert "SET status=" in sql
+    assert "RETURNING task_runs.id, task_runs.step_identifier" in sql
+    assert "workflow_definitions" not in sql
+    assert "UPDATE workflow_runs" not in sql
+
+
+def test_dependency_failure_progression_lock_is_active_run_scoped() -> None:
+    sql = normalized_sql(
+        _active_run_progression_lock_statement(uuid4()).compile(
+            dialect=postgresql.dialect()  # type: ignore[no-untyped-call]
+        )
+    )
+
+    assert "workflow_runs.id =" in sql
+    assert "workflow_runs.status IN" in sql
+    assert "FOR UPDATE" in sql
 
 
 class PostgreSQLMetadataError(Exception):

@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
+    DependencyFailurePropagationResult,
     InspectedTaskRun,
     InspectedWorkflowRun,
     NewTaskRun,
@@ -139,6 +140,16 @@ class WorkflowRunService:
         """Delegate authoritative dependency evaluation and transition persistence."""
         try:
             return await self._repository.transition_runnable_tasks(workflow_run_id)
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+
+    async def propagate_dependency_failures(
+        self,
+        workflow_run_id: UUID,
+    ) -> DependencyFailurePropagationResult:
+        """Delegate authoritative dependency-failure propagation."""
+        try:
+            return await self._repository.propagate_dependency_failures(workflow_run_id)
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
 

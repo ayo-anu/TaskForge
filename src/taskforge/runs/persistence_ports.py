@@ -10,6 +10,7 @@ from uuid import UUID
 
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
+    DependencyFailurePropagationResult,
     InspectedTaskRun,
     InspectedWorkflowRun,
     NewTaskRun,
@@ -158,6 +159,12 @@ class WorkflowRunRepository(Protocol):
         workflow_run_id: UUID,
     ) -> RunnableTransitionResult:
         """Evaluate immutable dependencies and persist blocked-to-runnable moves."""
+
+    async def propagate_dependency_failures(
+        self,
+        workflow_run_id: UUID,
+    ) -> DependencyFailurePropagationResult:
+        """Persist blocked-to-skipped transitions through immutable dependencies."""
 
     async def resolve_workflow_version(
         self,

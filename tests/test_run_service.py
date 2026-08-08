@@ -12,6 +12,7 @@ import pytest
 
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
+    DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
     InspectedTaskRun,
     InspectedWorkflowRun,
@@ -63,6 +64,7 @@ class FakeRepository:
     task_results: tuple[InspectedTaskRun, ...] | None = None
     task_result: InspectedTaskRun | None = None
     transition_result: RunnableTransitionResult | None = None
+    propagation_result: DependencyFailurePropagationResult | None = None
 
     def __post_init__(self) -> None:
         self.calls: list[tuple[object, ...]] = []
@@ -107,6 +109,16 @@ class FakeRepository:
         if self.failure is not None:
             raise self.failure
         return self.transition_result or RunnableTransitionResult(
+            workflow_run_id, (), ()
+        )
+
+    async def propagate_dependency_failures(
+        self, workflow_run_id: UUID
+    ) -> DependencyFailurePropagationResult:
+        self.calls.append(("propagate_dependency_failures", workflow_run_id))
+        if self.failure is not None:
+            raise self.failure
+        return self.propagation_result or DependencyFailurePropagationResult(
             workflow_run_id, (), ()
         )
 
@@ -324,6 +336,46 @@ def test_empty_runnable_transition_is_successful_and_unavailability_is_normalize
         )
 
 
+def test_service_delegates_dependency_failure_propagation_unchanged() -> None:
+    run_id, task_id = uuid4(), uuid4()
+    result = DependencyFailurePropagationResult(run_id, (task_id,), ("leaf",))
+    repository = FakeRepository(propagation_result=result)
+
+    actual = asyncio.run(
+        WorkflowRunService(repository).propagate_dependency_failures(run_id)
+    )
+
+    assert actual is result
+    assert repository.calls == [("propagate_dependency_failures", run_id)]
+
+
+def test_empty_dependency_failure_propagation_is_successful_and_normalized() -> None:
+    run_id = uuid4()
+    empty = asyncio.run(
+        WorkflowRunService(FakeRepository()).propagate_dependency_failures(run_id)
+    )
+    assert empty == DependencyFailurePropagationResult(run_id, (), ())
+
+    with pytest.raises(WorkflowRunServiceUnavailable):
+        asyncio.run(
+            WorkflowRunService(
+                FakeRepository(failure=WorkflowRunPersistenceUnavailable())
+            ).propagate_dependency_failures(run_id)
+        )
+
+
+@pytest.mark.parametrize("failure", (RuntimeError("bug"), asyncio.CancelledError()))
+def test_dependency_failure_propagation_preserves_unexpected_failures(
+    failure: BaseException,
+) -> None:
+    with pytest.raises(type(failure)):
+        asyncio.run(
+            WorkflowRunService(FakeRepository(failure=failure)).propagate_dependency_failures(
+                uuid4()
+            )
+        )
+
+
 @pytest.mark.parametrize("failure", (RuntimeError("bug"), asyncio.CancelledError()))
 def test_unexpected_and_cancellation_failures_are_not_normalized(
     failure: BaseException,
@@ -473,6 +525,11 @@ class CreationRepository:
         self, workflow_run_id: UUID
     ) -> RunnableTransitionResult:
         raise AssertionError("runnable transition was not expected")
+
+    async def propagate_dependency_failures(
+        self, workflow_run_id: UUID
+    ) -> DependencyFailurePropagationResult:
+        raise AssertionError("dependency failure propagation was not expected")
 
 
 def prepared_creation(

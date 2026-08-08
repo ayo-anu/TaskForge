@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
+    DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
     InspectedTaskRun,
     InspectedWorkflowRun,
@@ -153,6 +154,42 @@ class SQLAlchemyWorkflowRunRepository:
             transitioned_step_identifiers=tuple(
                 row.step_identifier for row in ordered
             ),
+        )
+
+    async def propagate_dependency_failures(
+        self,
+        workflow_run_id: UUID,
+    ) -> DependencyFailurePropagationResult:
+        """Own immutable dependency traversal and blocked-to-skipped persistence."""
+        try:
+            async with self._sessions.begin() as session:
+                # The run row is the shared progression lock. It serializes this
+                # operation with runnable and future run-state transitions while
+                # allowing unrelated runs to progress independently.
+                run = (
+                    await session.execute(
+                        _active_run_progression_lock_statement(workflow_run_id)
+                    )
+                ).one_or_none()
+                if run is None:
+                    rows: Sequence[Row[Any]] = ()
+                else:
+                    rows = (
+                        await session.execute(
+                            _dependency_failure_propagation_statement(
+                                workflow_run_id, run.workflow_version_id
+                            )
+                        )
+                    ).all()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+
+        # PostgreSQL does not guarantee RETURNING order. Stabilize the boundary.
+        ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
+        return DependencyFailurePropagationResult(
+            workflow_run_id=workflow_run_id,
+            skipped_task_ids=tuple(row.id for row in ordered),
+            skipped_step_identifiers=tuple(row.step_identifier for row in ordered),
         )
 
     async def resolve_workflow_version(
@@ -686,6 +723,118 @@ def _runnable_transition_statement(workflow_run_id: UUID) -> Any:
         )
         .values(
             status=TaskRunStatus.RUNNABLE.value,
+            updated_at=func.current_timestamp(),
+        )
+        .returning(task_runs.c.id, task_runs.c.step_identifier)
+    )
+
+
+def _active_run_progression_lock_statement(workflow_run_id: UUID) -> Select[Any]:
+    """Lock one active run as the transaction boundary for task progression."""
+    return (
+        select(workflow_runs.c.workflow_version_id)
+        .where(
+            workflow_runs.c.id == workflow_run_id,
+            workflow_runs.c.status.in_(
+                (WorkflowRunStatus.PENDING.value, WorkflowRunStatus.RUNNING.value)
+            ),
+        )
+        .with_for_update()
+    )
+
+
+def _dependency_failure_propagation_statement(
+    workflow_run_id: UUID,
+    workflow_version_id: UUID,
+) -> Any:
+    """Build authoritative AND-only dependency-failure propagation SQL.
+
+    Every immutable incoming edge is required. Therefore one failed or skipped
+    predecessor makes a still-blocked successor unreachable. Traversal continues
+    only through blocked or already-skipped task runs; progressed states are a
+    conservative boundary. Missing task rows create no failure fact.
+    """
+    predecessor = task_runs.alias("dependency_failed_predecessor")
+    edge = workflow_version_dependencies.alias("failure_seed_dependency")
+    successor = task_runs.alias("failure_seed_successor")
+    traversable_statuses = (
+        TaskRunStatus.BLOCKED.value,
+        TaskRunStatus.SKIPPED.value,
+    )
+    failure_statuses = (
+        TaskRunStatus.FAILED.value,
+        TaskRunStatus.SKIPPED.value,
+    )
+
+    affected_descendants = (
+        select(successor.c.step_identifier)
+        .select_from(
+            predecessor.join(
+                edge,
+                and_(
+                    edge.c.workflow_version_id == workflow_version_id,
+                    edge.c.predecessor_step_identifier == predecessor.c.step_identifier,
+                ),
+            ).join(
+                successor,
+                and_(
+                    successor.c.workflow_run_id == workflow_run_id,
+                    successor.c.workflow_version_id == workflow_version_id,
+                    successor.c.step_identifier == edge.c.successor_step_identifier,
+                ),
+            )
+        )
+        .where(
+            predecessor.c.workflow_run_id == workflow_run_id,
+            predecessor.c.workflow_version_id == workflow_version_id,
+            predecessor.c.status.in_(failure_statuses),
+            successor.c.status.in_(traversable_statuses),
+        )
+        .cte("dependency_failed_descendants", recursive=True)
+    )
+
+    recursive_edge = workflow_version_dependencies.alias(
+        "propagated_failure_dependency"
+    )
+    recursive_successor = task_runs.alias("propagated_failure_successor")
+    affected_descendants = affected_descendants.union(
+        select(recursive_successor.c.step_identifier)
+        .select_from(
+            affected_descendants.join(
+                recursive_edge,
+                and_(
+                    recursive_edge.c.workflow_version_id == workflow_version_id,
+                    recursive_edge.c.predecessor_step_identifier
+                    == affected_descendants.c.step_identifier,
+                ),
+            ).join(
+                recursive_successor,
+                and_(
+                    recursive_successor.c.workflow_run_id == workflow_run_id,
+                    recursive_successor.c.workflow_version_id == workflow_version_id,
+                    recursive_successor.c.step_identifier
+                    == recursive_edge.c.successor_step_identifier,
+                ),
+            )
+        )
+        .where(recursive_successor.c.status.in_(traversable_statuses))
+    )
+
+    # Only blocked task runs transition. Existing skipped intermediates are used
+    # for reachability but are neither returned nor timestamp-rewritten. Zero
+    # matching rows is a successful idempotent no-op.
+    return (
+        update(task_runs)
+        .where(
+            task_runs.c.workflow_run_id == workflow_run_id,
+            task_runs.c.workflow_version_id == workflow_version_id,
+            task_runs.c.status == TaskRunStatus.BLOCKED.value,
+            task_runs.c.step_identifier.in_(
+                select(affected_descendants.c.step_identifier)
+            ),
+        )
+        .values(
+            status=TaskRunStatus.SKIPPED.value,
             updated_at=func.current_timestamp(),
         )
         .returning(task_runs.c.id, task_runs.c.step_identifier)
