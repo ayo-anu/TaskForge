@@ -14,6 +14,7 @@ from taskforge.runs.domain import (
     InspectedWorkflowRun,
     NewTaskRun,
     NewWorkflowRun,
+    RunnableTransitionResult,
     WorkflowRunIdempotency,
     WorkflowRunInput,
     WorkflowRunVersionSnapshot,
@@ -151,6 +152,12 @@ class WorkflowRunRepository(Protocol):
         task_run_id: UUID,
         owner_principal_id: UUID,
     ) -> InspectedTaskRun | None: ...
+
+    async def transition_runnable_tasks(
+        self,
+        workflow_run_id: UUID,
+    ) -> RunnableTransitionResult:
+        """Evaluate immutable dependencies and persist blocked-to-runnable moves."""
 
     async def resolve_workflow_version(
         self,

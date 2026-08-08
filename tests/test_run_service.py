@@ -19,6 +19,7 @@ from taskforge.runs.domain import (
     LatestWorkflowVersion,
     NewTaskRun,
     NewWorkflowRun,
+    RunnableTransitionResult,
     TaskRunStatus,
     WorkflowRunIdempotency,
     WorkflowRunIdempotencyConflict,
@@ -61,9 +62,10 @@ class FakeRepository:
     run_result: InspectedWorkflowRun | None = None
     task_results: tuple[InspectedTaskRun, ...] | None = None
     task_result: InspectedTaskRun | None = None
+    transition_result: RunnableTransitionResult | None = None
 
     def __post_init__(self) -> None:
-        self.calls: list[tuple[UUID, UUID, WorkflowVersionSelection]] = []
+        self.calls: list[tuple[object, ...]] = []
 
     def creation_transaction(self) -> WorkflowRunCreationTransactionContext:
         raise AssertionError("creation transaction was not expected")
@@ -97,6 +99,16 @@ class FakeRepository:
         if self.failure is not None:
             raise self.failure
         return self.task_result
+
+    async def transition_runnable_tasks(
+        self, workflow_run_id: UUID
+    ) -> RunnableTransitionResult:
+        self.calls.append(("transition_runnable_tasks", workflow_run_id))
+        if self.failure is not None:
+            raise self.failure
+        return self.transition_result or RunnableTransitionResult(
+            workflow_run_id, (), ()
+        )
 
     async def resolve_workflow_version(
         self,
@@ -284,6 +296,34 @@ def test_inspection_not_found_and_unavailability_are_normalized() -> None:
         asyncio.run(unavailable.get_run(uuid4(), owner_principal_id=uuid4()))
 
 
+def test_service_delegates_runnable_transition_without_reinterpreting_result() -> None:
+    run_id, task_id = uuid4(), uuid4()
+    result = RunnableTransitionResult(run_id, (task_id,), ("leaf",))
+    repository = FakeRepository(transition_result=result)
+
+    actual = asyncio.run(
+        WorkflowRunService(repository).transition_runnable_tasks(run_id)
+    )
+
+    assert actual is result
+    assert repository.calls == [("transition_runnable_tasks", run_id)]
+
+
+def test_empty_runnable_transition_is_successful_and_unavailability_is_normalized() -> None:
+    run_id = uuid4()
+    empty = asyncio.run(
+        WorkflowRunService(FakeRepository()).transition_runnable_tasks(run_id)
+    )
+    assert empty == RunnableTransitionResult(run_id, (), ())
+
+    with pytest.raises(WorkflowRunServiceUnavailable):
+        asyncio.run(
+            WorkflowRunService(
+                FakeRepository(failure=WorkflowRunPersistenceUnavailable())
+            ).transition_runnable_tasks(run_id)
+        )
+
+
 @pytest.mark.parametrize("failure", (RuntimeError("bug"), asyncio.CancelledError()))
 def test_unexpected_and_cancellation_failures_are_not_normalized(
     failure: BaseException,
@@ -428,6 +468,11 @@ class CreationRepository:
     async def get_task_run(self, task_run_id: UUID, owner_principal_id: UUID) -> None:
         del task_run_id, owner_principal_id
         raise AssertionError("task inspection was not expected")
+
+    async def transition_runnable_tasks(
+        self, workflow_run_id: UUID
+    ) -> RunnableTransitionResult:
+        raise AssertionError("runnable transition was not expected")
 
 
 def prepared_creation(

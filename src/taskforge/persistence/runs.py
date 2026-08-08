@@ -7,7 +7,7 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Select, and_, func, insert, select, true
+from sqlalchemy import Select, and_, exists, func, insert, select, true, update
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -19,6 +19,7 @@ from taskforge.runs.domain import (
     InspectedWorkflowRun,
     NewTaskRun,
     NewWorkflowRun,
+    RunnableTransitionResult,
     TaskRunStatus,
     WorkflowRunIdempotency,
     WorkflowRunInput,
@@ -131,6 +132,28 @@ class SQLAlchemyWorkflowRunRepository:
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
         return _inspected_task_run(row) if row is not None else None
+
+    async def transition_runnable_tasks(
+        self,
+        workflow_run_id: UUID,
+    ) -> RunnableTransitionResult:
+        """Own dependency evaluation and persist only blocked-to-runnable moves."""
+        statement = _runnable_transition_statement(workflow_run_id)
+        try:
+            async with self._sessions.begin() as session:
+                rows = (await session.execute(statement)).all()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+
+        # PostgreSQL does not guarantee RETURNING order. Stabilize the boundary.
+        ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
+        return RunnableTransitionResult(
+            workflow_run_id=workflow_run_id,
+            transitioned_task_ids=tuple(row.id for row in ordered),
+            transitioned_step_identifiers=tuple(
+                row.step_identifier for row in ordered
+            ),
+        )
 
     async def resolve_workflow_version(
         self,
@@ -592,6 +615,80 @@ def _task_run_inspection_statement(
             task_runs.c.id == task_run_id,
             workflow_definitions.c.owner_principal_id == owner_principal_id,
         )
+    )
+
+
+def _runnable_transition_statement(workflow_run_id: UUID) -> Any:
+    """Build the repository's authoritative dependency-transition statement.
+
+    Dependencies come only from the run's bound immutable workflow version. A
+    missing predecessor task fails closed, and only ``succeeded`` satisfies an
+    edge. The mutation repeats the ``blocked`` guard so concurrent evaluators
+    cannot move an already-transitioned or progressed task.
+    """
+    candidate = task_runs.alias("runnable_candidate")
+    run = workflow_runs.alias("candidate_run")
+    edge = workflow_version_dependencies.alias("required_dependency")
+    predecessor = task_runs.alias("required_predecessor")
+
+    succeeded_predecessor_exists = exists(
+        select(1)
+        .where(
+            predecessor.c.workflow_run_id == candidate.c.workflow_run_id,
+            predecessor.c.workflow_version_id == candidate.c.workflow_version_id,
+            predecessor.c.step_identifier == edge.c.predecessor_step_identifier,
+            predecessor.c.status == TaskRunStatus.SUCCEEDED.value,
+        )
+        .correlate(candidate, edge)
+    )
+    unsatisfied_dependency_exists = exists(
+        select(1)
+        .where(
+            edge.c.workflow_version_id == run.c.workflow_version_id,
+            edge.c.successor_step_identifier == candidate.c.step_identifier,
+            ~succeeded_predecessor_exists,
+        )
+        .correlate(candidate, run)
+    )
+
+    eligible_tasks = (
+        select(candidate.c.id)
+        .select_from(
+            candidate.join(
+                run,
+                and_(
+                    run.c.id == candidate.c.workflow_run_id,
+                    run.c.workflow_version_id == candidate.c.workflow_version_id,
+                ),
+            )
+        )
+        .where(
+            candidate.c.workflow_run_id == workflow_run_id,
+            candidate.c.status == TaskRunStatus.BLOCKED.value,
+            run.c.status.in_(
+                (WorkflowRunStatus.PENDING.value, WorkflowRunStatus.RUNNING.value)
+            ),
+            ~unsatisfied_dependency_exists,
+        )
+        # Serialize this operation with future run-level transitions such as
+        # cancellation. Whichever transaction locks the run first establishes
+        # whether runnable promotion precedes or follows that run-state change.
+        .with_for_update(of=run)
+        .cte("eligible_runnable_tasks")
+    )
+
+    # Zero matching rows is a successful idempotent no-op.
+    return (
+        update(task_runs)
+        .where(
+            task_runs.c.id.in_(select(eligible_tasks.c.id)),
+            task_runs.c.status == TaskRunStatus.BLOCKED.value,
+        )
+        .values(
+            status=TaskRunStatus.RUNNABLE.value,
+            updated_at=func.current_timestamp(),
+        )
+        .returning(task_runs.c.id, task_runs.c.step_identifier)
     )
 
 

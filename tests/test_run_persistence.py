@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from taskforge.persistence.runs import (
@@ -19,6 +20,7 @@ from taskforge.persistence.runs import (
     _locked_version_statement,
     _owner_scoped_run_exists_statement,
     _run_inspection_statement,
+    _runnable_transition_statement,
     _task_run_inspection_statement,
     _task_run_list_statement,
     _version_resolution_statement,
@@ -117,6 +119,27 @@ def test_run_and_task_inspection_sql_is_owner_scoped_read_only_and_ordered() -> 
     assert "workflow_run_inputs" not in run
     assert "workflow_run_idempotency" not in run
     assert "ORDER BY task_runs.step_identifier" in tasks
+
+
+def test_runnable_transition_sql_owns_immutable_dependency_evaluation() -> None:
+    sql = normalized_sql(
+        _runnable_transition_statement(uuid4()).compile(
+            dialect=postgresql.dialect()  # type: ignore[no-untyped-call]
+        )
+    )
+
+    assert "WITH eligible_runnable_tasks AS" in sql
+    assert "UPDATE task_runs SET status=" in sql
+    assert "task_runs.status =" in sql
+    assert "candidate_run.status IN" in sql
+    assert "FOR UPDATE OF candidate_run" in sql
+    assert "workflow_version_dependencies" in sql
+    assert "required_predecessor.status =" in sql
+    assert "required_predecessor, task_runs AS runnable_candidate" not in sql
+    assert "NOT (EXISTS" in sql
+    assert "workflow_definitions" not in sql
+    assert "workflow_steps" not in sql
+    assert "RETURNING task_runs.id, task_runs.step_identifier" in sql
 
 
 class PostgreSQLMetadataError(Exception):

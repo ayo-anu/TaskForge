@@ -15,6 +15,7 @@ from taskforge.runs.domain import (
     InvalidWorkflowVersionSelection,
     LatestWorkflowVersion,
     ResolvedWorkflowVersion,
+    RunnableTransitionResult,
     TaskRunStatus,
     WorkflowRunIdempotency,
     WorkflowRunStatus,
@@ -91,6 +92,31 @@ def test_inspection_records_require_aware_timestamps() -> None:
             now,
             datetime.now(),
         )
+
+
+def test_runnable_transition_result_is_immutable_and_counts_transitions() -> None:
+    run_id, first_id, second_id = uuid4(), uuid4(), uuid4()
+    result = RunnableTransitionResult(
+        run_id, (first_id, second_id), ("first", "second")
+    )
+
+    assert result.transitioned_count == 2
+    with pytest.raises(AttributeError):
+        result.workflow_run_id = uuid4()  # type: ignore[misc]
+
+
+def test_empty_runnable_transition_result_is_a_successful_no_op() -> None:
+    assert RunnableTransitionResult(uuid4(), (), ()).transitioned_count == 0
+
+
+def test_runnable_transition_result_rejects_unpaired_or_duplicate_identities() -> None:
+    task_id = uuid4()
+    with pytest.raises(ValueError):
+        RunnableTransitionResult(uuid4(), (task_id,), ())
+    with pytest.raises(ValueError):
+        RunnableTransitionResult(uuid4(), (task_id, task_id), ("one", "two"))
+    with pytest.raises(ValueError):
+        RunnableTransitionResult(uuid4(), (uuid4(), uuid4()), ("one", "one"))
 
 
 @pytest.mark.parametrize(

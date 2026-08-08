@@ -209,6 +209,31 @@ class InspectedTaskRun:
         object.__setattr__(self, "updated_at", self.updated_at.astimezone(UTC))
 
 
+@dataclass(frozen=True)
+class RunnableTransitionResult:
+    """The immutable outcome of one persisted runnable-transition evaluation."""
+
+    workflow_run_id: UUID
+    transitioned_task_ids: tuple[UUID, ...]
+    transitioned_step_identifiers: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.transitioned_task_ids) != len(
+            self.transitioned_step_identifiers
+        ):
+            raise ValueError("runnable transition identities must remain paired")
+        if len(set(self.transitioned_task_ids)) != len(self.transitioned_task_ids):
+            raise ValueError("runnable transition task identifiers must be unique")
+        if len(set(self.transitioned_step_identifiers)) != len(
+            self.transitioned_step_identifiers
+        ):
+            raise ValueError("runnable transition step identifiers must be unique")
+
+    @property
+    def transitioned_count(self) -> int:
+        return len(self.transitioned_task_ids)
+
+
 @dataclass(frozen=True, repr=False)
 class WorkflowRunIdempotency:
     key_digest: str

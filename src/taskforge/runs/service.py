@@ -11,6 +11,7 @@ from taskforge.runs.domain import (
     NewTaskRun,
     NewWorkflowRun,
     ResolvedWorkflowVersion,
+    RunnableTransitionResult,
     TaskRunStatus,
     WorkflowRunIdempotency,
     WorkflowRunIdempotencyConflict,
@@ -130,6 +131,16 @@ class WorkflowRunService:
         if task is None:
             raise TaskRunNotFound
         return task
+
+    async def transition_runnable_tasks(
+        self,
+        workflow_run_id: UUID,
+    ) -> RunnableTransitionResult:
+        """Delegate authoritative dependency evaluation and transition persistence."""
+        try:
+            return await self._repository.transition_runnable_tasks(workflow_run_id)
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
 
     async def create_run(
         self,
