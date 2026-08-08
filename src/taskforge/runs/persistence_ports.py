@@ -10,6 +10,8 @@ from uuid import UUID
 
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
+    InspectedTaskRun,
+    InspectedWorkflowRun,
     NewTaskRun,
     NewWorkflowRun,
     WorkflowRunIdempotency,
@@ -131,6 +133,24 @@ class WorkflowRunRepository(Protocol):
         workflow_id: UUID,
         key_digest: str,
     ) -> ExistingIdempotentWorkflowRun | None: ...
+
+    async def get_run(
+        self,
+        run_id: UUID,
+        owner_principal_id: UUID,
+    ) -> InspectedWorkflowRun | None: ...
+
+    async def list_task_runs(
+        self,
+        run_id: UUID,
+        owner_principal_id: UUID,
+    ) -> tuple[InspectedTaskRun, ...] | None: ...
+
+    async def get_task_run(
+        self,
+        task_run_id: UUID,
+        owner_principal_id: UUID,
+    ) -> InspectedTaskRun | None: ...
 
     async def resolve_workflow_version(
         self,

@@ -15,8 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
     ExplicitWorkflowVersion,
+    InspectedTaskRun,
+    InspectedWorkflowRun,
     NewTaskRun,
     NewWorkflowRun,
+    TaskRunStatus,
     WorkflowRunIdempotency,
     WorkflowRunInput,
     WorkflowRunStatus,
@@ -75,6 +78,59 @@ class SQLAlchemyWorkflowRunRepository:
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
         return _existing_idempotent_run(row) if row is not None else None
+
+    async def get_run(
+        self,
+        run_id: UUID,
+        owner_principal_id: UUID,
+    ) -> InspectedWorkflowRun | None:
+        try:
+            async with self._sessions() as session, session.begin():
+                row = (
+                    await session.execute(
+                        _run_inspection_statement(run_id, owner_principal_id)
+                    )
+                ).one_or_none()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        return _inspected_run(row) if row is not None else None
+
+    async def list_task_runs(
+        self,
+        run_id: UUID,
+        owner_principal_id: UUID,
+    ) -> tuple[InspectedTaskRun, ...] | None:
+        try:
+            async with self._sessions() as session, session.begin():
+                exists = await session.scalar(
+                    _owner_scoped_run_exists_statement(run_id, owner_principal_id)
+                )
+                if not exists:
+                    return None
+                rows = (
+                    await session.execute(
+                        _task_run_list_statement(run_id, owner_principal_id)
+                    )
+                ).all()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        return tuple(_inspected_task_run(row) for row in rows)
+
+    async def get_task_run(
+        self,
+        task_run_id: UUID,
+        owner_principal_id: UUID,
+    ) -> InspectedTaskRun | None:
+        try:
+            async with self._sessions() as session, session.begin():
+                row = (
+                    await session.execute(
+                        _task_run_inspection_statement(task_run_id, owner_principal_id)
+                    )
+                ).one_or_none()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        return _inspected_task_run(row) if row is not None else None
 
     async def resolve_workflow_version(
         self,
@@ -429,6 +485,138 @@ def _idempotent_run_statement(
             workflow_run_idempotency.c.workflow_definition_id == workflow_id,
             workflow_run_idempotency.c.idempotency_key_digest == key_digest,
         )
+    )
+
+
+def _run_inspection_statement(
+    run_id: UUID,
+    owner_principal_id: UUID,
+) -> Select[Any]:
+    return (
+        select(
+            workflow_runs.c.id,
+            workflow_runs.c.workflow_definition_id,
+            workflow_runs.c.workflow_version_id,
+            workflow_versions.c.version_number,
+            workflow_runs.c.requested_by_principal_id,
+            workflow_runs.c.status,
+            workflow_runs.c.created_at,
+            workflow_runs.c.updated_at,
+        )
+        .select_from(
+            workflow_runs.join(
+                workflow_definitions,
+                workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
+            ).join(
+                workflow_versions,
+                workflow_versions.c.id == workflow_runs.c.workflow_version_id,
+            )
+        )
+        .where(
+            workflow_runs.c.id == run_id,
+            workflow_definitions.c.owner_principal_id == owner_principal_id,
+        )
+    )
+
+
+def _owner_scoped_run_exists_statement(
+    run_id: UUID,
+    owner_principal_id: UUID,
+) -> Select[Any]:
+    return (
+        select(workflow_runs.c.id)
+        .select_from(
+            workflow_runs.join(
+                workflow_definitions,
+                workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
+            )
+        )
+        .where(
+            workflow_runs.c.id == run_id,
+            workflow_definitions.c.owner_principal_id == owner_principal_id,
+        )
+    )
+
+
+def _task_run_columns() -> tuple[Any, ...]:
+    return (
+        task_runs.c.id,
+        task_runs.c.workflow_run_id,
+        task_runs.c.workflow_version_id,
+        task_runs.c.step_identifier,
+        task_runs.c.status,
+        task_runs.c.created_at,
+        task_runs.c.updated_at,
+    )
+
+
+def _task_run_list_statement(
+    run_id: UUID,
+    owner_principal_id: UUID,
+) -> Select[Any]:
+    return (
+        select(*_task_run_columns())
+        .select_from(
+            task_runs.join(
+                workflow_runs,
+                workflow_runs.c.id == task_runs.c.workflow_run_id,
+            ).join(
+                workflow_definitions,
+                workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
+            )
+        )
+        .where(
+            task_runs.c.workflow_run_id == run_id,
+            workflow_definitions.c.owner_principal_id == owner_principal_id,
+        )
+        .order_by(task_runs.c.step_identifier)
+    )
+
+
+def _task_run_inspection_statement(
+    task_run_id: UUID,
+    owner_principal_id: UUID,
+) -> Select[Any]:
+    return (
+        select(*_task_run_columns())
+        .select_from(
+            task_runs.join(
+                workflow_runs,
+                workflow_runs.c.id == task_runs.c.workflow_run_id,
+            ).join(
+                workflow_definitions,
+                workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
+            )
+        )
+        .where(
+            task_runs.c.id == task_run_id,
+            workflow_definitions.c.owner_principal_id == owner_principal_id,
+        )
+    )
+
+
+def _inspected_run(row: Row[Any]) -> InspectedWorkflowRun:
+    return InspectedWorkflowRun(
+        id=row.id,
+        workflow_definition_id=row.workflow_definition_id,
+        workflow_version_id=row.workflow_version_id,
+        version_number=row.version_number,
+        requested_by_principal_id=row.requested_by_principal_id,
+        status=WorkflowRunStatus(row.status),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _inspected_task_run(row: Row[Any]) -> InspectedTaskRun:
+    return InspectedTaskRun(
+        id=row.id,
+        workflow_run_id=row.workflow_run_id,
+        workflow_version_id=row.workflow_version_id,
+        step_identifier=row.step_identifier,
+        status=TaskRunStatus(row.status),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 

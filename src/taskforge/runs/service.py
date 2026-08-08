@@ -6,6 +6,8 @@ from uuid import UUID, uuid4
 
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
+    InspectedTaskRun,
+    InspectedWorkflowRun,
     NewTaskRun,
     NewWorkflowRun,
     ResolvedWorkflowVersion,
@@ -48,6 +50,14 @@ class WorkflowRunPersistenceConflict(Exception):
     """A complete workflow run could not be persisted."""
 
 
+class WorkflowRunNotFound(Exception):
+    """A workflow run is absent from the requested owner's scope."""
+
+
+class TaskRunNotFound(Exception):
+    """A task run is absent from the requested owner's scope."""
+
+
 class WorkflowRunService:
     def __init__(self, repository: WorkflowRunRepository) -> None:
         self._repository = repository
@@ -78,6 +88,48 @@ class WorkflowRunService:
             workflow_version_id=record.workflow_version_id,
             version_number=record.version_number,
         )
+
+    async def get_run(
+        self,
+        run_id: UUID,
+        *,
+        owner_principal_id: UUID,
+    ) -> InspectedWorkflowRun:
+        try:
+            run = await self._repository.get_run(run_id, owner_principal_id)
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        if run is None:
+            raise WorkflowRunNotFound
+        return run
+
+    async def list_task_runs(
+        self,
+        run_id: UUID,
+        *,
+        owner_principal_id: UUID,
+    ) -> tuple[InspectedTaskRun, ...]:
+        try:
+            tasks = await self._repository.list_task_runs(run_id, owner_principal_id)
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        if tasks is None:
+            raise WorkflowRunNotFound
+        return tasks
+
+    async def get_task_run(
+        self,
+        task_run_id: UUID,
+        *,
+        owner_principal_id: UUID,
+    ) -> InspectedTaskRun:
+        try:
+            task = await self._repository.get_task_run(task_run_id, owner_principal_id)
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        if task is None:
+            raise TaskRunNotFound
+        return task
 
     async def create_run(
         self,

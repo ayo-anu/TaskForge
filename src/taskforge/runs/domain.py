@@ -53,11 +53,24 @@ class WorkflowRunIdempotencyConflict(Exception):
 
 class WorkflowRunStatus(StrEnum):
     PENDING = "pending"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class TaskRunStatus(StrEnum):
     BLOCKED = "blocked"
     RUNNABLE = "runnable"
+    DISPATCHED = "dispatched"
+    CLAIMED = "claimed"
+    RUNNING = "running"
+    RETRY_SCHEDULED = "retry_scheduled"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)
@@ -159,6 +172,41 @@ class CreatedWorkflowRun:
         if self.created_at.tzinfo is None:
             raise ValueError("run creation timestamp must be timezone-aware")
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class InspectedWorkflowRun:
+    id: UUID
+    workflow_definition_id: UUID
+    workflow_version_id: UUID
+    version_number: int
+    requested_by_principal_id: UUID
+    status: WorkflowRunStatus
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.created_at.tzinfo is None or self.updated_at.tzinfo is None:
+            raise ValueError("workflow run timestamps must be timezone-aware")
+        object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
+        object.__setattr__(self, "updated_at", self.updated_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class InspectedTaskRun:
+    id: UUID
+    workflow_run_id: UUID
+    workflow_version_id: UUID
+    step_identifier: str
+    status: TaskRunStatus
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.created_at.tzinfo is None or self.updated_at.tzinfo is None:
+            raise ValueError("task run timestamps must be timezone-aware")
+        object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
+        object.__setattr__(self, "updated_at", self.updated_at.astimezone(UTC))
 
 
 @dataclass(frozen=True, repr=False)

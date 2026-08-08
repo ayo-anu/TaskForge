@@ -22,6 +22,7 @@ from taskforge.api.health import (
     ReadinessResponse,
 )
 from taskforge.api.principals import router as principals_router
+from taskforge.api.runs import router as runs_router
 from taskforge.api.workflows import router as workflows_router
 from taskforge.settings import Settings
 from taskforge.workflows.task_types import TaskTypeRegistry
@@ -64,6 +65,7 @@ def create_app(
     install_error_handling(app)
     app.include_router(principals_router)
     app.include_router(workflows_router)
+    app.include_router(runs_router)
 
     @app.get(
         "/health",

@@ -57,7 +57,7 @@ workflow-persistence-test:
 workflow-route-test:
 	@test "$${TASKFORGE_RUN_WORKFLOW_ROUTE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_WORKFLOW_ROUTE_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_WORKFLOW_ROUTE_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_WORKFLOW_ROUTE_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_workflow_routes.py
+	uv run pytest tests/integration/test_workflow_routes.py tests/integration/test_workflow_run_routes.py
 
 check: format-check lint typecheck coverage migrations-check
 

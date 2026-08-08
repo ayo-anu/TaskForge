@@ -17,6 +17,10 @@ from taskforge.persistence.runs import (
     _idempotent_run_statement,
     _is_idempotency_scope_conflict,
     _locked_version_statement,
+    _owner_scoped_run_exists_statement,
+    _run_inspection_statement,
+    _task_run_inspection_statement,
+    _task_run_list_statement,
     _version_resolution_statement,
 )
 from taskforge.runs.domain import (
@@ -97,6 +101,22 @@ def test_idempotency_lookup_is_fully_scoped_and_loads_original_result() -> None:
     assert "workflow_run_idempotency.idempotency_key_digest =" in sql
     assert "workflow_runs" in sql
     assert "workflow_versions" in sql
+
+
+def test_run_and_task_inspection_sql_is_owner_scoped_read_only_and_ordered() -> None:
+    run = normalized_sql(_run_inspection_statement(uuid4(), uuid4()))
+    exists = normalized_sql(_owner_scoped_run_exists_statement(uuid4(), uuid4()))
+    tasks = normalized_sql(_task_run_list_statement(uuid4(), uuid4()))
+    task = normalized_sql(_task_run_inspection_statement(uuid4(), uuid4()))
+
+    for sql in (run, exists, tasks, task):
+        assert "workflow_definitions.owner_principal_id =" in sql
+        assert "FOR UPDATE" not in sql
+        assert "FOR SHARE" not in sql
+    assert "workflow_versions.version_number" in run
+    assert "workflow_run_inputs" not in run
+    assert "workflow_run_idempotency" not in run
+    assert "ORDER BY task_runs.step_identifier" in tasks
 
 
 class PostgreSQLMetadataError(Exception):

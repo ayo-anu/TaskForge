@@ -1,6 +1,6 @@
 """Workflow run target selection domain tests."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
@@ -8,6 +8,8 @@ import pytest
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
     ExplicitWorkflowVersion,
+    InspectedTaskRun,
+    InspectedWorkflowRun,
     InvalidWorkflowRunIdempotencyKey,
     InvalidWorkflowRunInput,
     InvalidWorkflowVersionSelection,
@@ -25,6 +27,7 @@ from taskforge.runs.domain import (
     materialize_initial_tasks,
     require_run_available,
 )
+from taskforge.runs.schema import TASK_RUN_STATUSES, WORKFLOW_RUN_STATUSES
 from taskforge.workflows.domain import WorkflowDefinitionStatus
 
 
@@ -65,6 +68,31 @@ def test_resolved_version_and_created_run_reject_invalid_metadata() -> None:
         )
 
 
+def test_inspection_records_require_aware_timestamps() -> None:
+    now = datetime.now(UTC)
+    with pytest.raises(ValueError):
+        InspectedWorkflowRun(
+            uuid4(),
+            uuid4(),
+            uuid4(),
+            1,
+            uuid4(),
+            WorkflowRunStatus.PENDING,
+            datetime.now(),
+            now,
+        )
+    with pytest.raises(ValueError):
+        InspectedTaskRun(
+            uuid4(),
+            uuid4(),
+            uuid4(),
+            "root",
+            TaskRunStatus.RUNNABLE,
+            now,
+            datetime.now(),
+        )
+
+
 @pytest.mark.parametrize(
     "status",
     (
@@ -85,6 +113,11 @@ def test_only_enabled_definitions_are_available_for_new_runs(
 
 def test_enabled_definition_is_available_for_resolution() -> None:
     require_run_available(WorkflowDefinitionStatus.ENABLED)
+
+
+def test_domain_run_statuses_cover_the_persisted_task_one_vocabulary() -> None:
+    assert {status.value for status in WorkflowRunStatus} == set(WORKFLOW_RUN_STATUSES)
+    assert {status.value for status in TaskRunStatus} == set(TASK_RUN_STATUSES)
 
 
 def test_run_input_reuses_bounded_validation_and_defensively_copies() -> None:

@@ -13,6 +13,8 @@ import pytest
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
     ExplicitWorkflowVersion,
+    InspectedTaskRun,
+    InspectedWorkflowRun,
     InvalidWorkflowRunInput,
     LatestWorkflowVersion,
     NewTaskRun,
@@ -41,6 +43,8 @@ from taskforge.runs.persistence_ports import (
     WorkflowVersionResolutionRecord,
 )
 from taskforge.runs.service import (
+    TaskRunNotFound,
+    WorkflowRunNotFound,
     WorkflowRunPersistenceConflict,
     WorkflowRunService,
     WorkflowRunServiceUnavailable,
@@ -54,6 +58,9 @@ from taskforge.workflows.domain import WorkflowDefinitionStatus
 class FakeRepository:
     result: WorkflowVersionResolutionRecord | None = None
     failure: BaseException | None = None
+    run_result: InspectedWorkflowRun | None = None
+    task_results: tuple[InspectedTaskRun, ...] | None = None
+    task_result: InspectedTaskRun | None = None
 
     def __post_init__(self) -> None:
         self.calls: list[tuple[UUID, UUID, WorkflowVersionSelection]] = []
@@ -66,6 +73,30 @@ class FakeRepository:
     ) -> ExistingIdempotentWorkflowRun | None:
         del principal_id, workflow_id, key_digest
         raise AssertionError("idempotency recovery was not expected")
+
+    async def get_run(
+        self, run_id: UUID, owner_principal_id: UUID
+    ) -> InspectedWorkflowRun | None:
+        del run_id, owner_principal_id
+        if self.failure is not None:
+            raise self.failure
+        return self.run_result
+
+    async def list_task_runs(
+        self, run_id: UUID, owner_principal_id: UUID
+    ) -> tuple[InspectedTaskRun, ...] | None:
+        del run_id, owner_principal_id
+        if self.failure is not None:
+            raise self.failure
+        return self.task_results
+
+    async def get_task_run(
+        self, task_run_id: UUID, owner_principal_id: UUID
+    ) -> InspectedTaskRun | None:
+        del task_run_id, owner_principal_id
+        if self.failure is not None:
+            raise self.failure
+        return self.task_result
 
     async def resolve_workflow_version(
         self,
@@ -178,6 +209,79 @@ def test_persistence_unavailability_is_normalized() -> None:
                 selection=LatestWorkflowVersion(),
             )
         )
+
+
+def inspected_values() -> tuple[InspectedWorkflowRun, InspectedTaskRun]:
+    now = datetime.now(UTC)
+    run_id, workflow_id, version_id, principal_id = (
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        uuid4(),
+    )
+    return (
+        InspectedWorkflowRun(
+            run_id,
+            workflow_id,
+            version_id,
+            1,
+            principal_id,
+            WorkflowRunStatus.PENDING,
+            now,
+            now,
+        ),
+        InspectedTaskRun(
+            uuid4(),
+            run_id,
+            version_id,
+            "root",
+            TaskRunStatus.RUNNABLE,
+            now,
+            now,
+        ),
+    )
+
+
+def test_service_returns_owner_scoped_run_and_task_inspection() -> None:
+    run, task = inspected_values()
+    service = WorkflowRunService(
+        FakeRepository(run_result=run, task_results=(task,), task_result=task)
+    )
+
+    assert (
+        asyncio.run(
+            service.get_run(run.id, owner_principal_id=run.requested_by_principal_id)
+        )
+        is run
+    )
+    assert asyncio.run(
+        service.list_task_runs(run.id, owner_principal_id=run.requested_by_principal_id)
+    ) == (task,)
+    assert (
+        asyncio.run(
+            service.get_task_run(
+                task.id, owner_principal_id=run.requested_by_principal_id
+            )
+        )
+        is task
+    )
+
+
+def test_inspection_not_found_and_unavailability_are_normalized() -> None:
+    service = WorkflowRunService(FakeRepository())
+
+    with pytest.raises(WorkflowRunNotFound):
+        asyncio.run(service.get_run(uuid4(), owner_principal_id=uuid4()))
+    with pytest.raises(WorkflowRunNotFound):
+        asyncio.run(service.list_task_runs(uuid4(), owner_principal_id=uuid4()))
+    with pytest.raises(TaskRunNotFound):
+        asyncio.run(service.get_task_run(uuid4(), owner_principal_id=uuid4()))
+
+    unavailable = WorkflowRunService(
+        FakeRepository(failure=WorkflowRunPersistenceUnavailable())
+    )
+    with pytest.raises(WorkflowRunServiceUnavailable):
+        asyncio.run(unavailable.get_run(uuid4(), owner_principal_id=uuid4()))
 
 
 @pytest.mark.parametrize("failure", (RuntimeError("bug"), asyncio.CancelledError()))
@@ -312,6 +416,18 @@ class CreationRepository:
         if self.recovery_failure is not None:
             raise self.recovery_failure
         return self.recovery
+
+    async def get_run(self, run_id: UUID, owner_principal_id: UUID) -> None:
+        del run_id, owner_principal_id
+        raise AssertionError("run inspection was not expected")
+
+    async def list_task_runs(self, run_id: UUID, owner_principal_id: UUID) -> None:
+        del run_id, owner_principal_id
+        raise AssertionError("task inspection was not expected")
+
+    async def get_task_run(self, task_run_id: UUID, owner_principal_id: UUID) -> None:
+        del task_run_id, owner_principal_id
+        raise AssertionError("task inspection was not expected")
 
 
 def prepared_creation(

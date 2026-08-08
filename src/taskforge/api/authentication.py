@@ -30,7 +30,9 @@ from taskforge.persistence.authentication import (
 from taskforge.persistence.authorization import SQLAlchemyPrincipalRoleRepository
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.principals import SQLAlchemyPrincipalProfileRepository
+from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.persistence.workflows import SQLAlchemyWorkflowRepository
+from taskforge.runs.service import WorkflowRunService
 from taskforge.settings import Settings
 from taskforge.workflows.service import WorkflowService
 from taskforge.workflows.task_types import TaskTypeRegistry
@@ -59,6 +61,7 @@ class AuthenticationRuntime:
         authorization_service: AuthorizationService,
         principal_profile_service: PrincipalProfileService,
         workflow_service: WorkflowService,
+        workflow_run_service: WorkflowRunService,
         task_type_registry: TaskTypeRegistry,
     ) -> None:
         self._engine = engine
@@ -67,6 +70,7 @@ class AuthenticationRuntime:
         self.authorization_service = authorization_service
         self.principal_profile_service = principal_profile_service
         self.workflow_service = workflow_service
+        self.workflow_run_service = workflow_run_service
         self.task_type_registry = task_type_registry
 
     async def close(self) -> None:
@@ -101,6 +105,9 @@ def build_authentication_runtime(
         workflow_service=WorkflowService(
             SQLAlchemyWorkflowRepository(sessions),
             task_type_registry,
+        ),
+        workflow_run_service=WorkflowRunService(
+            SQLAlchemyWorkflowRunRepository(sessions)
         ),
         task_type_registry=task_type_registry,
     )
