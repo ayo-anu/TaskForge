@@ -18,7 +18,7 @@ SAFE_DATABASE_NAME = re.compile(
     r"taskforge_authorization_test|taskforge_protected_route_test|"
     r"taskforge_credential_bootstrap|taskforge_workflow_persistence|"
     r"taskforge_workflow_route|taskforge_run_migration|"
-    r"taskforge_version_resolution)_[0-9a-f]{32}\Z"
+    r"taskforge_version_resolution|taskforge_run_creation)_[0-9a-f]{32}\Z"
 )
 
 
