@@ -7,7 +7,19 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Select, and_, exists, func, insert, select, true, update
+from sqlalchemy import (
+    Select,
+    and_,
+    case,
+    cast,
+    exists,
+    func,
+    insert,
+    or_,
+    select,
+    true,
+    update,
+)
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -22,6 +34,7 @@ from taskforge.runs.domain import (
     NewWorkflowRun,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunInput,
     WorkflowRunStatus,
@@ -191,6 +204,49 @@ class SQLAlchemyWorkflowRunRepository:
             skipped_task_ids=tuple(row.id for row in ordered),
             skipped_step_identifiers=tuple(row.step_identifier for row in ordered),
         )
+
+    async def evaluate_workflow_run_state(
+        self,
+        workflow_run_id: UUID,
+    ) -> WorkflowRunEvaluationResult:
+        """Persist at most one workflow transition under the progression lock."""
+        try:
+            async with self._sessions.begin() as session:
+                locked = (
+                    await session.execute(
+                        _workflow_run_evaluation_lock_statement(workflow_run_id)
+                    )
+                ).one_or_none()
+                if locked is None:
+                    return WorkflowRunEvaluationResult(
+                        workflow_run_id, False, None, None
+                    )
+
+                previous_status = WorkflowRunStatus(locked.status)
+                statement: Any | None = None
+                if previous_status is WorkflowRunStatus.PENDING:
+                    statement = _pending_to_running_statement(workflow_run_id)
+                elif previous_status is WorkflowRunStatus.RUNNING:
+                    statement = _running_terminal_transition_statement(
+                        workflow_run_id
+                    )
+
+                resulting_status = previous_status
+                if statement is not None:
+                    transitioned = (await session.execute(statement)).one_or_none()
+                    if transitioned is not None:
+                        resulting_status = WorkflowRunStatus(transitioned.status)
+
+                # Source-status branching above deliberately permits at most one
+                # guarded UPDATE. A selected transition ends this invocation.
+                return WorkflowRunEvaluationResult(
+                    workflow_run_id,
+                    True,
+                    previous_status,
+                    resulting_status,
+                )
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
 
     async def resolve_workflow_version(
         self,
@@ -740,6 +796,103 @@ def _active_run_progression_lock_statement(workflow_run_id: UUID) -> Select[Any]
             ),
         )
         .with_for_update()
+    )
+
+
+def _workflow_run_evaluation_lock_statement(
+    workflow_run_id: UUID,
+) -> Select[Any]:
+    """Lock the run first, preserving the shared progression lock order."""
+    return (
+        select(workflow_runs.c.status)
+        .where(workflow_runs.c.id == workflow_run_id)
+        .with_for_update()
+    )
+
+
+def _pending_to_running_statement(workflow_run_id: UUID) -> Any:
+    """Build the sole transition valid for a pending workflow run."""
+    execution_progress_exists = exists(
+        select(1).where(
+            task_runs.c.workflow_run_id == workflow_runs.c.id,
+            task_runs.c.status.in_(
+                (
+                    TaskRunStatus.RUNNABLE.value,
+                    TaskRunStatus.DISPATCHED.value,
+                    TaskRunStatus.CLAIMED.value,
+                    TaskRunStatus.RUNNING.value,
+                    TaskRunStatus.RETRY_SCHEDULED.value,
+                    TaskRunStatus.SUCCEEDED.value,
+                    TaskRunStatus.FAILED.value,
+                )
+            ),
+        )
+    )
+    return (
+        update(workflow_runs)
+        .where(
+            workflow_runs.c.id == workflow_run_id,
+            workflow_runs.c.status == WorkflowRunStatus.PENDING.value,
+            execution_progress_exists,
+        )
+        .values(
+            status=WorkflowRunStatus.RUNNING.value,
+            updated_at=func.current_timestamp(),
+        )
+        .returning(workflow_runs.c.status)
+    )
+
+
+def _running_terminal_transition_statement(workflow_run_id: UUID) -> Any:
+    """Build failure-first terminal evaluation for a running workflow run."""
+    has_tasks = exists(
+        select(1).where(task_runs.c.workflow_run_id == workflow_runs.c.id)
+    )
+    has_failed_task = exists(
+        select(1).where(
+            task_runs.c.workflow_run_id == workflow_runs.c.id,
+            task_runs.c.status == TaskRunStatus.FAILED.value,
+        )
+    )
+    has_unsettled_failure_task = exists(
+        select(1).where(
+            task_runs.c.workflow_run_id == workflow_runs.c.id,
+            task_runs.c.status.not_in(
+                (
+                    TaskRunStatus.SUCCEEDED.value,
+                    TaskRunStatus.FAILED.value,
+                    TaskRunStatus.SKIPPED.value,
+                )
+            ),
+        )
+    )
+    has_non_succeeded_task = exists(
+        select(1).where(
+            task_runs.c.workflow_run_id == workflow_runs.c.id,
+            task_runs.c.status != TaskRunStatus.SUCCEEDED.value,
+        )
+    )
+    terminal_failure = and_(has_failed_task, ~has_unsettled_failure_task)
+    terminal_success = and_(has_tasks, ~has_non_succeeded_task)
+
+    # Failure precedence is explicit. Valid state cannot satisfy both predicates,
+    # but CASE ordering makes defensive behavior deterministic.
+    target_status = cast(
+        case(
+            (terminal_failure, WorkflowRunStatus.FAILED.value),
+            (terminal_success, WorkflowRunStatus.SUCCEEDED.value),
+        ),
+        workflow_runs.c.status.type,
+    )
+    return (
+        update(workflow_runs)
+        .where(
+            workflow_runs.c.id == workflow_run_id,
+            workflow_runs.c.status == WorkflowRunStatus.RUNNING.value,
+            or_(terminal_failure, terminal_success),
+        )
+        .values(status=target_status, updated_at=func.current_timestamp())
+        .returning(workflow_runs.c.status)
     )
 
 

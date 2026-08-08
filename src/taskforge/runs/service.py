@@ -14,6 +14,7 @@ from taskforge.runs.domain import (
     ResolvedWorkflowVersion,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
@@ -150,6 +151,16 @@ class WorkflowRunService:
         """Delegate authoritative dependency-failure propagation."""
         try:
             return await self._repository.propagate_dependency_failures(workflow_run_id)
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+
+    async def evaluate_workflow_run_state(
+        self,
+        workflow_run_id: UUID,
+    ) -> WorkflowRunEvaluationResult:
+        """Delegate authoritative workflow-run state evaluation."""
+        try:
+            return await self._repository.evaluate_workflow_run_state(workflow_run_id)
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
 

@@ -16,6 +16,7 @@ from taskforge.runs.domain import (
     NewTaskRun,
     NewWorkflowRun,
     RunnableTransitionResult,
+    WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunInput,
     WorkflowRunVersionSnapshot,
@@ -165,6 +166,12 @@ class WorkflowRunRepository(Protocol):
         workflow_run_id: UUID,
     ) -> DependencyFailurePropagationResult:
         """Persist blocked-to-skipped transitions through immutable dependencies."""
+
+    async def evaluate_workflow_run_state(
+        self,
+        workflow_run_id: UUID,
+    ) -> WorkflowRunEvaluationResult:
+        """Derive and persist at most one guarded workflow-run transition."""
 
     async def resolve_workflow_version(
         self,

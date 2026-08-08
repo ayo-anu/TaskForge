@@ -18,6 +18,7 @@ from taskforge.runs.domain import (
     ResolvedWorkflowVersion,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
@@ -143,6 +144,47 @@ def test_dependency_failure_result_rejects_unpaired_or_duplicate_identities() ->
         DependencyFailurePropagationResult(uuid4(), (task_id, task_id), ("one", "two"))
     with pytest.raises(ValueError):
         DependencyFailurePropagationResult(uuid4(), (uuid4(), uuid4()), ("one", "one"))
+
+
+def test_workflow_run_evaluation_result_distinguishes_transition_and_no_op() -> None:
+    run_id = uuid4()
+    transitioned = WorkflowRunEvaluationResult(
+        run_id,
+        True,
+        WorkflowRunStatus.PENDING,
+        WorkflowRunStatus.RUNNING,
+    )
+    no_op = WorkflowRunEvaluationResult(
+        run_id,
+        True,
+        WorkflowRunStatus.RUNNING,
+        WorkflowRunStatus.RUNNING,
+    )
+    missing = WorkflowRunEvaluationResult(run_id, False, None, None)
+
+    assert transitioned.transitioned
+    assert not no_op.transitioned
+    assert not missing.transitioned
+    with pytest.raises(AttributeError):
+        transitioned.found = False  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("found", "previous", "resulting"),
+    (
+        (False, WorkflowRunStatus.PENDING, WorkflowRunStatus.PENDING),
+        (True, None, None),
+        (True, WorkflowRunStatus.PENDING, None),
+        (False, None, WorkflowRunStatus.RUNNING),
+    ),
+)
+def test_workflow_run_evaluation_result_enforces_presence_invariants(
+    found: bool,
+    previous: WorkflowRunStatus | None,
+    resulting: WorkflowRunStatus | None,
+) -> None:
+    with pytest.raises(ValueError):
+        WorkflowRunEvaluationResult(uuid4(), found, previous, resulting)
 
 
 @pytest.mark.parametrize(

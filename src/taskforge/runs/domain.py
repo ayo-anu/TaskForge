@@ -259,6 +259,34 @@ class DependencyFailurePropagationResult:
         return len(self.skipped_task_ids)
 
 
+@dataclass(frozen=True)
+class WorkflowRunEvaluationResult:
+    """The immutable outcome of one workflow-run state evaluation."""
+
+    workflow_run_id: UUID
+    found: bool
+    previous_status: WorkflowRunStatus | None
+    resulting_status: WorkflowRunStatus | None
+
+    def __post_init__(self) -> None:
+        if self.found and (
+            self.previous_status is None or self.resulting_status is None
+        ):
+            raise ValueError("workflow run presence and evaluation statuses disagree")
+        if not self.found and (
+            self.previous_status is not None or self.resulting_status is not None
+        ):
+            raise ValueError("workflow run presence and evaluation statuses disagree")
+
+    @property
+    def transitioned(self) -> bool:
+        return (
+            self.found
+            and self.previous_status is not None
+            and self.previous_status is not self.resulting_status
+        )
+
+
 @dataclass(frozen=True, repr=False)
 class WorkflowRunIdempotency:
     key_digest: str

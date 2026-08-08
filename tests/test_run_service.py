@@ -22,6 +22,7 @@ from taskforge.runs.domain import (
     NewWorkflowRun,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
@@ -65,6 +66,7 @@ class FakeRepository:
     task_result: InspectedTaskRun | None = None
     transition_result: RunnableTransitionResult | None = None
     propagation_result: DependencyFailurePropagationResult | None = None
+    evaluation_result: WorkflowRunEvaluationResult | None = None
 
     def __post_init__(self) -> None:
         self.calls: list[tuple[object, ...]] = []
@@ -120,6 +122,19 @@ class FakeRepository:
             raise self.failure
         return self.propagation_result or DependencyFailurePropagationResult(
             workflow_run_id, (), ()
+        )
+
+    async def evaluate_workflow_run_state(
+        self, workflow_run_id: UUID
+    ) -> WorkflowRunEvaluationResult:
+        self.calls.append(("evaluate_workflow_run_state", workflow_run_id))
+        if self.failure is not None:
+            raise self.failure
+        return self.evaluation_result or WorkflowRunEvaluationResult(
+            workflow_run_id,
+            False,
+            None,
+            None,
         )
 
     async def resolve_workflow_version(
@@ -376,6 +391,36 @@ def test_dependency_failure_propagation_preserves_unexpected_failures(
         )
 
 
+def test_service_delegates_workflow_run_evaluation_unchanged() -> None:
+    run_id = uuid4()
+    result = WorkflowRunEvaluationResult(
+        run_id, True, WorkflowRunStatus.PENDING, WorkflowRunStatus.RUNNING
+    )
+    repository = FakeRepository(evaluation_result=result)
+
+    actual = asyncio.run(
+        WorkflowRunService(repository).evaluate_workflow_run_state(run_id)
+    )
+
+    assert actual is result
+    assert repository.calls == [("evaluate_workflow_run_state", run_id)]
+
+
+def test_missing_workflow_run_evaluation_is_successful_and_normalized() -> None:
+    run_id = uuid4()
+    missing = asyncio.run(
+        WorkflowRunService(FakeRepository()).evaluate_workflow_run_state(run_id)
+    )
+    assert missing == WorkflowRunEvaluationResult(run_id, False, None, None)
+
+    with pytest.raises(WorkflowRunServiceUnavailable):
+        asyncio.run(
+            WorkflowRunService(
+                FakeRepository(failure=WorkflowRunPersistenceUnavailable())
+            ).evaluate_workflow_run_state(run_id)
+        )
+
+
 @pytest.mark.parametrize("failure", (RuntimeError("bug"), asyncio.CancelledError()))
 def test_unexpected_and_cancellation_failures_are_not_normalized(
     failure: BaseException,
@@ -530,6 +575,11 @@ class CreationRepository:
         self, workflow_run_id: UUID
     ) -> DependencyFailurePropagationResult:
         raise AssertionError("dependency failure propagation was not expected")
+
+    async def evaluate_workflow_run_state(
+        self, workflow_run_id: UUID
+    ) -> WorkflowRunEvaluationResult:
+        raise AssertionError("workflow run evaluation was not expected")
 
 
 def prepared_creation(

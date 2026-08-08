@@ -14,6 +14,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from taskforge.persistence.runs import (
     SQLAlchemyWorkflowRunCreationTransaction,
+    SQLAlchemyWorkflowRunRepository,
     _active_run_progression_lock_statement,
     _definition_lock_statement,
     _dependency_failure_propagation_statement,
@@ -21,11 +22,14 @@ from taskforge.persistence.runs import (
     _is_idempotency_scope_conflict,
     _locked_version_statement,
     _owner_scoped_run_exists_statement,
+    _pending_to_running_statement,
     _run_inspection_statement,
     _runnable_transition_statement,
+    _running_terminal_transition_statement,
     _task_run_inspection_statement,
     _task_run_list_statement,
     _version_resolution_statement,
+    _workflow_run_evaluation_lock_statement,
 )
 from taskforge.runs.domain import (
     ExplicitWorkflowVersion,
@@ -33,6 +37,7 @@ from taskforge.runs.domain import (
     NewTaskRun,
     NewWorkflowRun,
     TaskRunStatus,
+    WorkflowRunEvaluationResult,
     WorkflowRunInput,
     WorkflowRunStatus,
     WorkflowRunVersionSnapshot,
@@ -177,6 +182,53 @@ def test_dependency_failure_progression_lock_is_active_run_scoped() -> None:
     assert "FOR UPDATE" in sql
 
 
+def test_workflow_run_evaluation_lock_preserves_shared_lock_order() -> None:
+    sql = normalized_sql(
+        _workflow_run_evaluation_lock_statement(uuid4()).compile(
+            dialect=postgresql.dialect()  # type: ignore[no-untyped-call]
+        )
+    )
+
+    assert "FROM workflow_runs" in sql
+    assert "workflow_runs.id =" in sql
+    assert "task_runs" not in sql
+    assert "FOR UPDATE" in sql
+
+
+def test_pending_evaluation_only_transitions_to_running_on_execution_evidence() -> None:
+    sql = normalized_sql(
+        _pending_to_running_statement(uuid4()).compile(
+            dialect=postgresql.dialect()  # type: ignore[no-untyped-call]
+        )
+    )
+
+    assert "UPDATE workflow_runs SET status=" in sql
+    assert "workflow_runs.status =" in sql
+    assert "EXISTS (SELECT 1 FROM task_runs" in sql
+    assert "RETURNING workflow_runs.status" in sql
+    assert "CASE" not in sql
+    assert "workflow_definitions" not in sql
+    assert "workflow_versions" not in sql
+    assert "workflow_version_dependencies" not in sql
+
+
+def test_running_terminal_evaluation_is_failure_first_and_task_relational() -> None:
+    sql = normalized_sql(
+        _running_terminal_transition_statement(uuid4()).compile(
+            dialect=postgresql.dialect()  # type: ignore[no-untyped-call]
+        )
+    )
+
+    assert "UPDATE workflow_runs SET status=CAST(CASE WHEN" in sql
+    assert sql.count("WHEN") == 2
+    assert "EXISTS (SELECT 1 FROM task_runs" in sql
+    assert "workflow_runs.status =" in sql
+    assert "RETURNING workflow_runs.status" in sql
+    assert "workflow_definitions" not in sql
+    assert "workflow_versions" not in sql
+    assert "workflow_version_dependencies" not in sql
+
+
 class PostgreSQLMetadataError(Exception):
     def __init__(self, sqlstate: str | None, constraint_name: str | None) -> None:
         self.sqlstate = sqlstate
@@ -257,6 +309,111 @@ class FakeSession:
 
     async def close(self) -> None:
         self.calls.append("close")
+
+
+class FakeRepositoryTransactionContext:
+    def __init__(self, session: FakeSession) -> None:
+        self.session = session
+
+    async def __aenter__(self) -> FakeSession:
+        self.session.calls.append("context_enter")
+        return self.session
+
+    async def __aexit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object,
+    ) -> None:
+        del exception_type, exception, traceback
+        self.session.calls.append("rollback" if self.session.execute_failure else "commit")
+        self.session.calls.append("context_exit")
+
+
+class FakeRepositorySessions:
+    def __init__(self, session: FakeSession) -> None:
+        self.session = session
+
+    def begin(self) -> FakeRepositoryTransactionContext:
+        return FakeRepositoryTransactionContext(self.session)
+
+
+def evaluation_repository(session: FakeSession) -> SQLAlchemyWorkflowRunRepository:
+    return SQLAlchemyWorkflowRunRepository(
+        FakeRepositorySessions(session)  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "returned", "expected"),
+    (
+        (
+            WorkflowRunStatus.PENDING,
+            WorkflowRunStatus.RUNNING,
+            WorkflowRunStatus.RUNNING,
+        ),
+        (
+            WorkflowRunStatus.RUNNING,
+            WorkflowRunStatus.SUCCEEDED,
+            WorkflowRunStatus.SUCCEEDED,
+        ),
+        (WorkflowRunStatus.RUNNING, None, WorkflowRunStatus.RUNNING),
+        (WorkflowRunStatus.CANCELLING, None, WorkflowRunStatus.CANCELLING),
+        (WorkflowRunStatus.FAILED, None, WorkflowRunStatus.FAILED),
+    ),
+)
+def test_repository_evaluates_at_most_one_transition_and_returns_result(
+    source: WorkflowRunStatus,
+    returned: WorkflowRunStatus | None,
+    expected: WorkflowRunStatus,
+) -> None:
+    run_id = uuid4()
+    results = [FakeResult([SimpleNamespace(status=source.value)])]
+    if source in (WorkflowRunStatus.PENDING, WorkflowRunStatus.RUNNING):
+        results.append(
+            FakeResult(
+                [SimpleNamespace(status=returned.value)] if returned is not None else []
+            )
+        )
+    session = FakeSession(results)
+
+    result = asyncio.run(
+        evaluation_repository(session).evaluate_workflow_run_state(run_id)
+    )
+
+    assert result == WorkflowRunEvaluationResult(run_id, True, source, expected)
+    assert session.execute_count <= 2
+    assert session.calls[-2:] == ["commit", "context_exit"]
+
+
+def test_repository_returns_explicit_missing_run_result_without_update() -> None:
+    run_id = uuid4()
+    session = FakeSession([FakeResult([])])
+
+    result = asyncio.run(
+        evaluation_repository(session).evaluate_workflow_run_state(run_id)
+    )
+
+    assert result == WorkflowRunEvaluationResult(run_id, False, None, None)
+    assert session.execute_count == 1
+    assert session.calls[-2:] == ["commit", "context_exit"]
+
+
+def test_repository_rolls_back_and_normalizes_evaluation_database_failure() -> None:
+    database_error = DBAPIError("UPDATE", {}, Exception("injected failure"))
+    session = FakeSession(
+        [FakeResult([SimpleNamespace(status=WorkflowRunStatus.PENDING.value)])],
+        execute_failure_at=2,
+        execute_failure=database_error,
+    )
+
+    with pytest.raises(WorkflowRunPersistenceUnavailable) as caught:
+        asyncio.run(
+            evaluation_repository(session).evaluate_workflow_run_state(uuid4())
+        )
+
+    assert caught.value.__cause__ is database_error
+    assert session.calls[-2:] == ["rollback", "context_exit"]
 
 
 def transaction(session: FakeSession) -> SQLAlchemyWorkflowRunCreationTransaction:
