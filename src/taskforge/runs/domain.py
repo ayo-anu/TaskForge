@@ -60,6 +60,9 @@ class WorkflowRunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+MAX_WORKFLOW_RECONCILIATION_ITERATIONS = 8
+
+
 class TaskRunStatus(StrEnum):
     BLOCKED = "blocked"
     RUNNABLE = "runnable"
@@ -233,6 +236,10 @@ class RunnableTransitionResult:
     def transitioned_count(self) -> int:
         return len(self.transitioned_task_ids)
 
+    @property
+    def made_progress(self) -> bool:
+        return self.transitioned_count > 0
+
 
 @dataclass(frozen=True)
 class DependencyFailurePropagationResult:
@@ -257,6 +264,10 @@ class DependencyFailurePropagationResult:
     @property
     def skipped_count(self) -> int:
         return len(self.skipped_task_ids)
+
+    @property
+    def made_progress(self) -> bool:
+        return self.skipped_count > 0
 
 
 @dataclass(frozen=True)
@@ -285,6 +296,53 @@ class WorkflowRunEvaluationResult:
             and self.previous_status is not None
             and self.previous_status is not self.resulting_status
         )
+
+    @property
+    def made_progress(self) -> bool:
+        return self.transitioned
+
+
+@dataclass(frozen=True)
+class WorkflowRunReconciliationResult:
+    """The bounded outcome of reconciling one workflow run."""
+
+    workflow_run_id: UUID
+    found: bool
+    iterations: int
+    runnable_transition_count: int
+    skipped_transition_count: int
+    workflow_transition_count: int
+    final_status: WorkflowRunStatus | None
+    quiescent: bool
+    bound_reached: bool
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.iterations <= MAX_WORKFLOW_RECONCILIATION_ITERATIONS:
+            raise ValueError("reconciliation iteration count is outside its bound")
+        counts = (
+            self.runnable_transition_count,
+            self.skipped_transition_count,
+            self.workflow_transition_count,
+        )
+        if any(count < 0 for count in counts):
+            raise ValueError("reconciliation transition counts cannot be negative")
+        if self.workflow_transition_count > self.iterations:
+            raise ValueError("workflow transitions cannot exceed reconciliation iterations")
+        if self.found is (self.final_status is None):
+            raise ValueError("reconciliation presence and final status disagree")
+        if self.quiescent and self.bound_reached:
+            raise ValueError("quiescent reconciliation cannot exhaust its bound")
+        if self.bound_reached and self.iterations != MAX_WORKFLOW_RECONCILIATION_ITERATIONS:
+            raise ValueError("reconciliation bound was not fully consumed")
+        if not self.found and (self.quiescent or self.bound_reached):
+            raise ValueError("missing workflow run cannot be reconciled")
+        if self.final_status in (
+            WorkflowRunStatus.CANCELLING,
+            WorkflowRunStatus.SUCCEEDED,
+            WorkflowRunStatus.FAILED,
+            WorkflowRunStatus.CANCELLED,
+        ) and (not self.quiescent or self.bound_reached):
+            raise ValueError("inactive workflow status must stop reconciliation")
 
 
 @dataclass(frozen=True, repr=False)

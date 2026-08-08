@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from taskforge.runs.domain import (
+    MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
@@ -20,6 +21,7 @@ from taskforge.runs.domain import (
     TaskRunStatus,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
+    WorkflowRunReconciliationResult,
     WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
     WorkflowRunVersionDependency,
@@ -103,12 +105,15 @@ def test_runnable_transition_result_is_immutable_and_counts_transitions() -> Non
     )
 
     assert result.transitioned_count == 2
+    assert result.made_progress
     with pytest.raises(AttributeError):
         result.workflow_run_id = uuid4()  # type: ignore[misc]
 
 
 def test_empty_runnable_transition_result_is_a_successful_no_op() -> None:
-    assert RunnableTransitionResult(uuid4(), (), ()).transitioned_count == 0
+    result = RunnableTransitionResult(uuid4(), (), ())
+    assert result.transitioned_count == 0
+    assert not result.made_progress
 
 
 def test_runnable_transition_result_rejects_unpaired_or_duplicate_identities() -> None:
@@ -128,12 +133,15 @@ def test_dependency_failure_result_is_immutable_and_counts_skipped_tasks() -> No
     )
 
     assert result.skipped_count == 2
+    assert result.made_progress
     with pytest.raises(AttributeError):
         result.workflow_run_id = uuid4()  # type: ignore[misc]
 
 
 def test_empty_dependency_failure_result_is_a_successful_no_op() -> None:
-    assert DependencyFailurePropagationResult(uuid4(), (), ()).skipped_count == 0
+    result = DependencyFailurePropagationResult(uuid4(), (), ())
+    assert result.skipped_count == 0
+    assert not result.made_progress
 
 
 def test_dependency_failure_result_rejects_unpaired_or_duplicate_identities() -> None:
@@ -163,8 +171,11 @@ def test_workflow_run_evaluation_result_distinguishes_transition_and_no_op() -> 
     missing = WorkflowRunEvaluationResult(run_id, False, None, None)
 
     assert transitioned.transitioned
+    assert transitioned.made_progress
     assert not no_op.transitioned
+    assert not no_op.made_progress
     assert not missing.transitioned
+    assert not missing.made_progress
     with pytest.raises(AttributeError):
         transitioned.found = False  # type: ignore[misc]
 
@@ -185,6 +196,67 @@ def test_workflow_run_evaluation_result_enforces_presence_invariants(
 ) -> None:
     with pytest.raises(ValueError):
         WorkflowRunEvaluationResult(uuid4(), found, previous, resulting)
+
+
+def reconciliation_result(
+    **overrides: object,
+) -> WorkflowRunReconciliationResult:
+    values: dict[str, object] = {
+        "workflow_run_id": uuid4(),
+        "found": True,
+        "iterations": 1,
+        "runnable_transition_count": 0,
+        "skipped_transition_count": 0,
+        "workflow_transition_count": 0,
+        "final_status": WorkflowRunStatus.RUNNING,
+        "quiescent": True,
+        "bound_reached": False,
+    }
+    values.update(overrides)
+    return WorkflowRunReconciliationResult(**values)  # type: ignore[arg-type]
+
+
+def test_reconciliation_result_supports_quiescence_bound_and_missing_outcomes() -> None:
+    quiescent = reconciliation_result()
+    bounded = reconciliation_result(
+        iterations=MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
+        quiescent=False,
+        bound_reached=True,
+    )
+    missing = reconciliation_result(
+        found=False,
+        final_status=None,
+        quiescent=False,
+    )
+
+    assert quiescent.quiescent
+    assert bounded.bound_reached
+    assert not missing.found
+    with pytest.raises(AttributeError):
+        quiescent.quiescent = False  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"iterations": 0},
+        {"iterations": MAX_WORKFLOW_RECONCILIATION_ITERATIONS + 1},
+        {"runnable_transition_count": -1},
+        {"skipped_transition_count": -1},
+        {"workflow_transition_count": 2},
+        {"found": False},
+        {"final_status": None},
+        {"quiescent": True, "bound_reached": True},
+        {"bound_reached": True, "quiescent": False},
+        {"found": False, "final_status": None, "quiescent": True},
+        {"final_status": WorkflowRunStatus.FAILED, "quiescent": False},
+    ),
+)
+def test_reconciliation_result_rejects_inconsistent_outcomes(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        reconciliation_result(**overrides)
 
 
 @pytest.mark.parametrize(

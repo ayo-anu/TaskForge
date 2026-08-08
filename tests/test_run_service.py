@@ -6,11 +6,13 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
+from typing import TypeVar
 from uuid import UUID, uuid4
 
 import pytest
 
 from taskforge.runs.domain import (
+    MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
@@ -26,6 +28,7 @@ from taskforge.runs.domain import (
     WorkflowRunIdempotency,
     WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
+    WorkflowRunReconciliationResult,
     WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
     WorkflowRunVersionDependency,
@@ -55,6 +58,8 @@ from taskforge.runs.service import (
     WorkflowVersionUnavailable,
 )
 from taskforge.workflows.domain import WorkflowDefinitionStatus
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -967,3 +972,217 @@ def test_idempotency_conflict_recovery_fails_closed(
         )
 
     assert sum(call[0] == "recover" for call in transaction.calls) == 1
+
+
+class ScriptedProgressionRepository:
+    def __init__(
+        self,
+        run_id: UUID,
+        runnable: list[RunnableTransitionResult],
+        skipped: list[DependencyFailurePropagationResult],
+        workflow: list[WorkflowRunEvaluationResult],
+        *,
+        failure_at: tuple[str, int] | None = None,
+    ) -> None:
+        self.run_id = run_id
+        self.runnable = runnable
+        self.skipped = skipped
+        self.workflow = workflow
+        self.failure_at = failure_at
+        self.calls: list[str] = []
+
+    def _take(self, name: str, values: list[T]) -> T:
+        self.calls.append(name)
+        occurrence = self.calls.count(name)
+        if self.failure_at == (name, occurrence):
+            raise WorkflowRunPersistenceUnavailable
+        return values.pop(0)
+
+    async def transition_runnable_tasks(
+        self, workflow_run_id: UUID
+    ) -> RunnableTransitionResult:
+        assert workflow_run_id == self.run_id
+        return self._take("runnable", self.runnable)
+
+    async def propagate_dependency_failures(
+        self, workflow_run_id: UUID
+    ) -> DependencyFailurePropagationResult:
+        assert workflow_run_id == self.run_id
+        return self._take("skipped", self.skipped)
+
+    async def evaluate_workflow_run_state(
+        self, workflow_run_id: UUID
+    ) -> WorkflowRunEvaluationResult:
+        assert workflow_run_id == self.run_id
+        return self._take("workflow", self.workflow)
+
+
+def empty_runnable(run_id: UUID) -> RunnableTransitionResult:
+    return RunnableTransitionResult(run_id, (), ())
+
+
+def progressed_runnable(run_id: UUID, step: str) -> RunnableTransitionResult:
+    return RunnableTransitionResult(run_id, (uuid4(),), (step,))
+
+
+def empty_skipped(run_id: UUID) -> DependencyFailurePropagationResult:
+    return DependencyFailurePropagationResult(run_id, (), ())
+
+
+def workflow_result(
+    run_id: UUID,
+    previous: WorkflowRunStatus,
+    resulting: WorkflowRunStatus | None = None,
+) -> WorkflowRunEvaluationResult:
+    return WorkflowRunEvaluationResult(
+        run_id,
+        True,
+        previous,
+        resulting or previous,
+    )
+
+
+def reconciliation_service(
+    repository: ScriptedProgressionRepository,
+) -> WorkflowRunService:
+    return WorkflowRunService(repository)  # type: ignore[arg-type]
+
+
+def test_reconciler_calls_existing_operations_in_order_and_stops_at_quiescence() -> None:
+    run_id = uuid4()
+    repository = ScriptedProgressionRepository(
+        run_id,
+        [empty_runnable(run_id)],
+        [empty_skipped(run_id)],
+        [workflow_result(run_id, WorkflowRunStatus.RUNNING)],
+    )
+
+    result = asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
+
+    assert result == WorkflowRunReconciliationResult(
+        run_id, True, 1, 0, 0, 0, WorkflowRunStatus.RUNNING, True, False
+    )
+    assert repository.calls == ["runnable", "skipped", "workflow"]
+
+
+def test_reconciler_completes_late_pending_success_without_post_terminal_cycle() -> None:
+    run_id = uuid4()
+    repository = ScriptedProgressionRepository(
+        run_id,
+        [empty_runnable(run_id), empty_runnable(run_id)],
+        [empty_skipped(run_id), empty_skipped(run_id)],
+        [
+            workflow_result(
+                run_id, WorkflowRunStatus.PENDING, WorkflowRunStatus.RUNNING
+            ),
+            workflow_result(
+                run_id, WorkflowRunStatus.RUNNING, WorkflowRunStatus.SUCCEEDED
+            ),
+        ],
+    )
+
+    result = asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
+
+    assert result.iterations == 2
+    assert result.workflow_transition_count == 2
+    assert result.final_status is WorkflowRunStatus.SUCCEEDED
+    assert result.quiescent and not result.bound_reached
+    assert repository.calls == ["runnable", "skipped", "workflow"] * 2
+
+
+def test_reconciler_reports_missing_and_cancelling_without_another_cycle() -> None:
+    run_id = uuid4()
+    missing_repository = ScriptedProgressionRepository(
+        run_id,
+        [empty_runnable(run_id)],
+        [empty_skipped(run_id)],
+        [WorkflowRunEvaluationResult(run_id, False, None, None)],
+    )
+    missing = asyncio.run(
+        reconciliation_service(missing_repository).reconcile_workflow_run(run_id)
+    )
+    assert not missing.found and not missing.quiescent
+
+    cancelling_repository = ScriptedProgressionRepository(
+        run_id,
+        [empty_runnable(run_id)],
+        [empty_skipped(run_id)],
+        [workflow_result(run_id, WorkflowRunStatus.CANCELLING)],
+    )
+    cancelling = asyncio.run(
+        reconciliation_service(cancelling_repository).reconcile_workflow_run(run_id)
+    )
+    assert cancelling.final_status is WorkflowRunStatus.CANCELLING
+    assert cancelling.quiescent
+    assert cancelling_repository.calls == ["runnable", "skipped", "workflow"]
+
+
+def test_reconciler_enforces_behavioral_iteration_budget_without_ninth_cycle() -> None:
+    run_id = uuid4()
+    repository = ScriptedProgressionRepository(
+        run_id,
+        [
+            progressed_runnable(run_id, f"step-{iteration}")
+            for iteration in range(MAX_WORKFLOW_RECONCILIATION_ITERATIONS)
+        ],
+        [
+            empty_skipped(run_id)
+            for _ in range(MAX_WORKFLOW_RECONCILIATION_ITERATIONS)
+        ],
+        [
+            workflow_result(run_id, WorkflowRunStatus.RUNNING)
+            for _ in range(MAX_WORKFLOW_RECONCILIATION_ITERATIONS)
+        ],
+    )
+
+    result = asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
+
+    assert result.iterations == MAX_WORKFLOW_RECONCILIATION_ITERATIONS
+    assert result.runnable_transition_count == MAX_WORKFLOW_RECONCILIATION_ITERATIONS
+    assert result.bound_reached and not result.quiescent
+    assert len(repository.calls) == MAX_WORKFLOW_RECONCILIATION_ITERATIONS * 3
+
+
+def test_reconciler_can_prove_quiescence_on_final_budgeted_iteration() -> None:
+    run_id = uuid4()
+    progress_iterations = MAX_WORKFLOW_RECONCILIATION_ITERATIONS - 1
+    repository = ScriptedProgressionRepository(
+        run_id,
+        [
+            *(
+                progressed_runnable(run_id, f"step-{iteration}")
+                for iteration in range(progress_iterations)
+            ),
+            empty_runnable(run_id),
+        ],
+        [empty_skipped(run_id) for _ in range(MAX_WORKFLOW_RECONCILIATION_ITERATIONS)],
+        [
+            workflow_result(run_id, WorkflowRunStatus.RUNNING)
+            for _ in range(MAX_WORKFLOW_RECONCILIATION_ITERATIONS)
+        ],
+    )
+
+    result = asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
+
+    assert result.iterations == MAX_WORKFLOW_RECONCILIATION_ITERATIONS
+    assert result.quiescent and not result.bound_reached
+
+
+@pytest.mark.parametrize("failure_operation", ("runnable", "skipped", "workflow"))
+def test_reconciler_propagates_operation_failure_and_stops_iteration(
+    failure_operation: str,
+) -> None:
+    run_id = uuid4()
+    repository = ScriptedProgressionRepository(
+        run_id,
+        [empty_runnable(run_id)],
+        [empty_skipped(run_id)],
+        [workflow_result(run_id, WorkflowRunStatus.RUNNING)],
+        failure_at=(failure_operation, 1),
+    )
+
+    with pytest.raises(WorkflowRunServiceUnavailable):
+        asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
+
+    expected = ["runnable", "skipped", "workflow"]
+    assert repository.calls == expected[: expected.index(failure_operation) + 1]

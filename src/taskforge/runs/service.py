@@ -5,6 +5,7 @@ from __future__ import annotations
 from uuid import UUID, uuid4
 
 from taskforge.runs.domain import (
+    MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     InspectedTaskRun,
@@ -18,6 +19,7 @@ from taskforge.runs.domain import (
     WorkflowRunIdempotency,
     WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
+    WorkflowRunReconciliationResult,
     WorkflowRunStatus,
     WorkflowVersionSelection,
     create_workflow_run_idempotency,
@@ -163,6 +165,105 @@ class WorkflowRunService:
             return await self._repository.evaluate_workflow_run_state(workflow_run_id)
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
+
+    async def reconcile_workflow_run(
+        self,
+        workflow_run_id: UUID,
+    ) -> WorkflowRunReconciliationResult:
+        """Boundedly compose the three authoritative progression operations."""
+        runnable_count = 0
+        skipped_count = 0
+        workflow_transition_count = 0
+        last_status: WorkflowRunStatus | None = None
+        inactive_statuses = (
+            WorkflowRunStatus.CANCELLING,
+            WorkflowRunStatus.SUCCEEDED,
+            WorkflowRunStatus.FAILED,
+            WorkflowRunStatus.CANCELLED,
+        )
+
+        for iteration in range(1, MAX_WORKFLOW_RECONCILIATION_ITERATIONS + 1):
+            # A terminal/cancelling status observed by the prior iteration must
+            # never begin another Task 1 -> Task 2 -> Task 3 cycle.
+            if last_status in inactive_statuses:
+                assert last_status is not None
+                return WorkflowRunReconciliationResult(
+                    workflow_run_id,
+                    True,
+                    iteration - 1,
+                    runnable_count,
+                    skipped_count,
+                    workflow_transition_count,
+                    last_status,
+                    True,
+                    False,
+                )
+
+            runnable = await self.transition_runnable_tasks(workflow_run_id)
+            skipped = await self.propagate_dependency_failures(workflow_run_id)
+            workflow = await self.evaluate_workflow_run_state(workflow_run_id)
+            runnable_count += runnable.transitioned_count
+            skipped_count += skipped.skipped_count
+            workflow_transition_count += int(workflow.transitioned)
+
+            if not workflow.found:
+                return WorkflowRunReconciliationResult(
+                    workflow_run_id,
+                    False,
+                    iteration,
+                    runnable_count,
+                    skipped_count,
+                    workflow_transition_count,
+                    None,
+                    False,
+                    False,
+                )
+
+            assert workflow.resulting_status is not None
+            last_status = workflow.resulting_status
+            if last_status in inactive_statuses:
+                return WorkflowRunReconciliationResult(
+                    workflow_run_id,
+                    True,
+                    iteration,
+                    runnable_count,
+                    skipped_count,
+                    workflow_transition_count,
+                    last_status,
+                    True,
+                    False,
+                )
+
+            iteration_made_progress = (
+                runnable.made_progress
+                or skipped.made_progress
+                or workflow.made_progress
+            )
+            if not iteration_made_progress:
+                return WorkflowRunReconciliationResult(
+                    workflow_run_id,
+                    True,
+                    iteration,
+                    runnable_count,
+                    skipped_count,
+                    workflow_transition_count,
+                    last_status,
+                    True,
+                    False,
+                )
+
+        assert last_status is not None
+        return WorkflowRunReconciliationResult(
+            workflow_run_id,
+            True,
+            MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
+            runnable_count,
+            skipped_count,
+            workflow_transition_count,
+            last_status,
+            False,
+            True,
+        )
 
     async def create_run(
         self,
