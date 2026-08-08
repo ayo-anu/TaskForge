@@ -9,8 +9,10 @@ from typing import Protocol
 from uuid import UUID
 
 from taskforge.runs.domain import (
+    CreatedWorkflowRun,
     NewTaskRun,
     NewWorkflowRun,
+    WorkflowRunIdempotency,
     WorkflowRunInput,
     WorkflowRunVersionSnapshot,
     WorkflowVersionSelection,
@@ -24,6 +26,10 @@ class WorkflowRunPersistenceUnavailable(Exception):
 
 class WorkflowRunRecordConflict(Exception):
     """A database constraint rejected complete run creation."""
+
+
+class WorkflowRunIdempotencyRecordConflict(Exception):
+    """The scoped idempotency row already exists."""
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,17 @@ class PreparedWorkflowRunCreation:
 
 
 @dataclass(frozen=True)
+class ExistingIdempotentWorkflowRun:
+    request_fingerprint: str
+    run: CreatedWorkflowRun
+
+
+IdempotentCreationPreparation = (
+    PreparedWorkflowRunCreation | ExistingIdempotentWorkflowRun
+)
+
+
+@dataclass(frozen=True)
 class WorkflowRunTimestamps:
     created_at: datetime
     updated_at: datetime
@@ -73,12 +90,22 @@ class WorkflowRunCreationTransaction(Protocol):
         selection: WorkflowVersionSelection,
     ) -> PreparedWorkflowRunCreation | None: ...
 
+    async def prepare_idempotent_creation(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+        principal_id: UUID,
+        selection: WorkflowVersionSelection,
+        key_digest: str,
+    ) -> IdempotentCreationPreparation | None: ...
+
     async def insert_complete_run(
         self,
         prepared: PreparedWorkflowRunCreation,
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        idempotency: WorkflowRunIdempotency | None = None,
     ) -> WorkflowRunTimestamps: ...
 
     async def commit(self) -> None: ...
@@ -97,6 +124,13 @@ class WorkflowRunCreationTransactionContext(Protocol):
 
 class WorkflowRunRepository(Protocol):
     def creation_transaction(self) -> WorkflowRunCreationTransactionContext: ...
+
+    async def find_idempotent_run(
+        self,
+        principal_id: UUID,
+        workflow_id: UUID,
+        key_digest: str,
+    ) -> ExistingIdempotentWorkflowRun | None: ...
 
     async def resolve_workflow_version(
         self,

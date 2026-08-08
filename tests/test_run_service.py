@@ -11,27 +11,37 @@ from uuid import UUID, uuid4
 import pytest
 
 from taskforge.runs.domain import (
+    CreatedWorkflowRun,
     ExplicitWorkflowVersion,
     InvalidWorkflowRunInput,
     LatestWorkflowVersion,
     NewTaskRun,
     NewWorkflowRun,
     TaskRunStatus,
+    WorkflowRunIdempotency,
+    WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
     WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
     WorkflowRunVersionDependency,
     WorkflowRunVersionSnapshot,
     WorkflowVersionSelection,
+    create_workflow_run_idempotency,
 )
 from taskforge.runs.persistence_ports import (
+    ExistingIdempotentWorkflowRun,
+    IdempotentCreationPreparation,
     PreparedWorkflowRunCreation,
+    WorkflowRunCreationTransaction,
     WorkflowRunCreationTransactionContext,
+    WorkflowRunIdempotencyRecordConflict,
     WorkflowRunPersistenceUnavailable,
+    WorkflowRunRecordConflict,
     WorkflowRunTimestamps,
     WorkflowVersionResolutionRecord,
 )
 from taskforge.runs.service import (
+    WorkflowRunPersistenceConflict,
     WorkflowRunService,
     WorkflowRunServiceUnavailable,
     WorkflowRunTargetNotFound,
@@ -50,6 +60,12 @@ class FakeRepository:
 
     def creation_transaction(self) -> WorkflowRunCreationTransactionContext:
         raise AssertionError("creation transaction was not expected")
+
+    async def find_idempotent_run(
+        self, principal_id: UUID, workflow_id: UUID, key_digest: str
+    ) -> ExistingIdempotentWorkflowRun | None:
+        del principal_id, workflow_id, key_digest
+        raise AssertionError("idempotency recovery was not expected")
 
     async def resolve_workflow_version(
         self,
@@ -181,7 +197,7 @@ def test_unexpected_and_cancellation_failures_are_not_normalized(
 
 
 class FakeCreationTransaction:
-    def __init__(self, prepared: PreparedWorkflowRunCreation | None) -> None:
+    def __init__(self, prepared: IdempotentCreationPreparation | None) -> None:
         self.prepared = prepared
         self.calls: list[tuple[object, ...]] = []
         self.inserted: (
@@ -190,13 +206,14 @@ class FakeCreationTransaction:
                 NewWorkflowRun,
                 WorkflowRunInput,
                 tuple[NewTaskRun, ...],
+                WorkflowRunIdempotency | None,
             ]
             | None
         ) = None
         self.failure_for: str | None = None
         self.failure: BaseException | None = None
 
-    async def __aenter__(self) -> FakeCreationTransaction:
+    async def __aenter__(self) -> WorkflowRunCreationTransaction:
         self._record("enter")
         return self
 
@@ -216,6 +233,28 @@ class FakeCreationTransaction:
         selection: WorkflowVersionSelection,
     ) -> PreparedWorkflowRunCreation | None:
         self._record("prepare", workflow_id, owner_principal_id, selection)
+        return (
+            self.prepared
+            if isinstance(self.prepared, PreparedWorkflowRunCreation)
+            else None
+        )
+
+    async def prepare_idempotent_creation(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+        principal_id: UUID,
+        selection: WorkflowVersionSelection,
+        key_digest: str,
+    ) -> IdempotentCreationPreparation | None:
+        self._record(
+            "prepare_idempotent",
+            workflow_id,
+            owner_principal_id,
+            principal_id,
+            selection,
+            key_digest,
+        )
         return self.prepared
 
     async def insert_complete_run(
@@ -224,9 +263,16 @@ class FakeCreationTransaction:
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        idempotency: WorkflowRunIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         self._record("insert_complete_run")
-        self.inserted = (prepared, run, input_snapshot, task_run_values)
+        self.inserted = (
+            prepared,
+            run,
+            input_snapshot,
+            task_run_values,
+            idempotency,
+        )
         now = datetime.now(UTC)
         return WorkflowRunTimestamps(now, now)
 
@@ -242,6 +288,8 @@ class FakeCreationTransaction:
 @dataclass
 class CreationRepository:
     transaction: FakeCreationTransaction
+    recovery: ExistingIdempotentWorkflowRun | None = None
+    recovery_failure: BaseException | None = None
 
     def creation_transaction(self) -> WorkflowRunCreationTransactionContext:
         return self.transaction
@@ -254,6 +302,16 @@ class CreationRepository:
     ) -> WorkflowVersionResolutionRecord | None:
         del workflow_id, owner_principal_id, selection
         raise AssertionError("unlocked Task 2 resolution must not admit a run")
+
+    async def find_idempotent_run(
+        self, principal_id: UUID, workflow_id: UUID, key_digest: str
+    ) -> ExistingIdempotentWorkflowRun | None:
+        self.transaction.calls.append(
+            ("recover", principal_id, workflow_id, key_digest)
+        )
+        if self.recovery_failure is not None:
+            raise self.recovery_failure
+        return self.recovery
 
 
 def prepared_creation(
@@ -300,7 +358,7 @@ def test_create_run_inserts_one_pending_complete_graph_then_commits() -> None:
         "exit",
     ]
     assert transaction.inserted is not None
-    _, run, stored_input, tasks = transaction.inserted
+    _, run, stored_input, tasks, idempotency = transaction.inserted
     assert run.status is WorkflowRunStatus.PENDING
     assert run.requested_by_principal_id == requester_id
     assert stored_input == accepted_input
@@ -310,6 +368,7 @@ def test_create_run_inserts_one_pending_complete_graph_then_commits() -> None:
         ("root", TaskRunStatus.RUNNABLE),
     ]
     assert len({task.id for task in tasks}) == 2
+    assert idempotency is None
     assert created.id == run.id
     assert created.status is WorkflowRunStatus.PENDING
     assert created.task_count == 2
@@ -389,3 +448,254 @@ def test_creation_transaction_entry_unavailability_is_service_normalized() -> No
         )
 
     assert transaction.calls == [("enter",)]
+
+
+def existing_idempotent(
+    request_fingerprint: str,
+) -> ExistingIdempotentWorkflowRun:
+    return ExistingIdempotentWorkflowRun(
+        request_fingerprint=request_fingerprint,
+        run=CreatedWorkflowRun(
+            id=uuid4(),
+            workflow_definition_id=uuid4(),
+            workflow_version_id=uuid4(),
+            version_number=2,
+            requested_by_principal_id=uuid4(),
+            status=WorkflowRunStatus.PENDING,
+            created_at=datetime.now(UTC),
+            task_count=2,
+            runnable_task_count=1,
+            blocked_task_count=1,
+        ),
+    )
+
+
+def test_identical_idempotent_replay_returns_existing_without_generating_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_id, principal_id = uuid4(), uuid4()
+    accepted = WorkflowRunInput({}, {})
+    request = create_workflow_run_idempotency(
+        "abcdefghijklmnop",
+        workflow_definition_id=workflow_id,
+        requested_by_principal_id=principal_id,
+        selection=LatestWorkflowVersion(),
+        input_snapshot=accepted,
+    )
+    existing = existing_idempotent(request.request_fingerprint)
+    transaction = FakeCreationTransaction(existing)
+    service = WorkflowRunService(CreationRepository(transaction))
+    monkeypatch.setattr(
+        "taskforge.runs.service.uuid4",
+        lambda: pytest.fail("replay must not generate identifiers"),
+    )
+
+    result = asyncio.run(
+        service.create_idempotent_run(
+            workflow_id,
+            owner_principal_id=principal_id,
+            requested_by_principal_id=principal_id,
+            selection=LatestWorkflowVersion(),
+            input_snapshot=accepted,
+            idempotency_key="abcdefghijklmnop",
+        )
+    )
+
+    assert result is existing.run
+    assert [call[0] for call in transaction.calls] == [
+        "enter",
+        "prepare_idempotent",
+        "exit",
+    ]
+
+
+def test_conflicting_idempotent_reuse_writes_nothing_and_generates_no_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_id, owner_id, principal_id = uuid4(), uuid4(), uuid4()
+    transaction = FakeCreationTransaction(existing_idempotent("sha256:v1:other"))
+    service = WorkflowRunService(CreationRepository(transaction))
+    monkeypatch.setattr(
+        "taskforge.runs.service.uuid4",
+        lambda: pytest.fail("conflict must not generate identifiers"),
+    )
+
+    with pytest.raises(WorkflowRunIdempotencyConflict):
+        asyncio.run(
+            service.create_idempotent_run(
+                workflow_id,
+                owner_principal_id=owner_id,
+                requested_by_principal_id=principal_id,
+                selection=LatestWorkflowVersion(),
+                input_snapshot=WorkflowRunInput({}, {}),
+                idempotency_key="abcdefghijklmnop",
+            )
+        )
+
+    assert [call[0] for call in transaction.calls] == [
+        "enter",
+        "prepare_idempotent",
+        "exit",
+    ]
+
+
+def test_first_idempotent_use_inserts_fact_with_complete_graph() -> None:
+    transaction = FakeCreationTransaction(prepared_creation())
+    service = WorkflowRunService(CreationRepository(transaction))
+
+    created = asyncio.run(
+        service.create_idempotent_run(
+            uuid4(),
+            owner_principal_id=uuid4(),
+            requested_by_principal_id=uuid4(),
+            selection=ExplicitWorkflowVersion(4),
+            input_snapshot=WorkflowRunInput({"value": 1}, {}),
+            idempotency_key="abcdefghijklmnop",
+        )
+    )
+
+    assert transaction.inserted is not None
+    _, run, _, tasks, idempotency = transaction.inserted
+    assert created.id == run.id
+    assert len(tasks) == 2
+    assert idempotency is not None
+    assert idempotency.key_digest.startswith("sha256:v1:")
+    assert [call[0] for call in transaction.calls] == [
+        "enter",
+        "prepare_idempotent",
+        "insert_complete_run",
+        "commit",
+        "exit",
+    ]
+
+
+def test_uniqueness_conflict_recovers_identical_winner_once() -> None:
+    transaction = FakeCreationTransaction(prepared_creation())
+    transaction.failure_for = "insert_complete_run"
+    transaction.failure = WorkflowRunIdempotencyRecordConflict()
+    repository = CreationRepository(transaction)
+    service = WorkflowRunService(repository)
+    workflow_id, principal_id = uuid4(), uuid4()
+    request = create_workflow_run_idempotency(
+        "abcdefghijklmnop",
+        workflow_definition_id=workflow_id,
+        requested_by_principal_id=principal_id,
+        selection=LatestWorkflowVersion(),
+        input_snapshot=WorkflowRunInput({}, {}),
+    )
+    repository.recovery = existing_idempotent(request.request_fingerprint)
+
+    result = asyncio.run(
+        service.create_idempotent_run(
+            workflow_id,
+            owner_principal_id=principal_id,
+            requested_by_principal_id=principal_id,
+            selection=LatestWorkflowVersion(),
+            input_snapshot=WorkflowRunInput({}, {}),
+            idempotency_key="abcdefghijklmnop",
+        )
+    )
+
+    assert result is repository.recovery.run
+    assert sum(call[0] == "recover" for call in transaction.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("prepared", "expected_error"),
+    (
+        (None, WorkflowRunTargetNotFound),
+        (
+            prepared_creation(WorkflowDefinitionStatus.DISABLED, with_snapshot=False),
+            WorkflowRunTargetUnavailable,
+        ),
+        (prepared_creation(with_snapshot=False), WorkflowVersionUnavailable),
+    ),
+)
+def test_idempotent_first_use_rejects_unavailable_targets_before_writing(
+    prepared: PreparedWorkflowRunCreation | None,
+    expected_error: type[Exception],
+) -> None:
+    transaction = FakeCreationTransaction(prepared)
+    service = WorkflowRunService(CreationRepository(transaction))
+
+    with pytest.raises(expected_error):
+        asyncio.run(
+            service.create_idempotent_run(
+                uuid4(),
+                owner_principal_id=uuid4(),
+                requested_by_principal_id=uuid4(),
+                selection=LatestWorkflowVersion(),
+                input_snapshot=WorkflowRunInput({}, {}),
+                idempotency_key="abcdefghijklmnop",
+            )
+        )
+
+    assert [call[0] for call in transaction.calls] == [
+        "enter",
+        "prepare_idempotent",
+        "exit",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    (
+        (WorkflowRunRecordConflict(), WorkflowRunPersistenceConflict),
+        (WorkflowRunPersistenceUnavailable(), WorkflowRunServiceUnavailable),
+    ),
+)
+def test_idempotent_creation_normalizes_persistence_failures(
+    failure: BaseException,
+    expected_error: type[Exception],
+) -> None:
+    transaction = FakeCreationTransaction(prepared_creation())
+    transaction.failure_for = "insert_complete_run"
+    transaction.failure = failure
+    service = WorkflowRunService(CreationRepository(transaction))
+
+    with pytest.raises(expected_error):
+        asyncio.run(
+            service.create_idempotent_run(
+                uuid4(),
+                owner_principal_id=uuid4(),
+                requested_by_principal_id=uuid4(),
+                selection=LatestWorkflowVersion(),
+                input_snapshot=WorkflowRunInput({}, {}),
+                idempotency_key="abcdefghijklmnop",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("recovery_failure", "expected_error"),
+    (
+        (None, WorkflowRunPersistenceConflict),
+        (WorkflowRunPersistenceUnavailable(), WorkflowRunServiceUnavailable),
+    ),
+)
+def test_idempotency_conflict_recovery_fails_closed(
+    recovery_failure: BaseException | None,
+    expected_error: type[Exception],
+) -> None:
+    transaction = FakeCreationTransaction(prepared_creation())
+    transaction.failure_for = "insert_complete_run"
+    transaction.failure = WorkflowRunIdempotencyRecordConflict()
+    repository = CreationRepository(
+        transaction,
+        recovery_failure=recovery_failure,
+    )
+    service = WorkflowRunService(repository)
+
+    with pytest.raises(expected_error):
+        asyncio.run(
+            service.create_idempotent_run(
+                uuid4(),
+                owner_principal_id=uuid4(),
+                requested_by_principal_id=uuid4(),
+                selection=LatestWorkflowVersion(),
+                input_snapshot=WorkflowRunInput({}, {}),
+                idempotency_key="abcdefghijklmnop",
+            )
+        )
+
+    assert sum(call[0] == "recover" for call in transaction.calls) == 1

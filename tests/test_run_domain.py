@@ -1,20 +1,26 @@
 """Workflow run target selection domain tests."""
 
-from uuid import uuid4
+from datetime import datetime
+from uuid import UUID, uuid4
 
 import pytest
 
 from taskforge.runs.domain import (
+    CreatedWorkflowRun,
     ExplicitWorkflowVersion,
+    InvalidWorkflowRunIdempotencyKey,
     InvalidWorkflowRunInput,
     InvalidWorkflowVersionSelection,
     LatestWorkflowVersion,
     ResolvedWorkflowVersion,
     TaskRunStatus,
+    WorkflowRunIdempotency,
+    WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
     WorkflowRunVersionDependency,
     WorkflowRunVersionSnapshot,
     WorkflowVersionSnapshotInvalid,
+    create_workflow_run_idempotency,
     create_workflow_run_input,
     materialize_initial_tasks,
     require_run_available,
@@ -38,6 +44,25 @@ def test_version_selectors_and_resolved_identity_are_immutable() -> None:
     assert ResolvedWorkflowVersion(workflow_id, version_id, 2) == (
         ResolvedWorkflowVersion(workflow_id, version_id, 2)
     )
+
+
+def test_resolved_version_and_created_run_reject_invalid_metadata() -> None:
+    with pytest.raises(ValueError):
+        ResolvedWorkflowVersion(uuid4(), uuid4(), 0)
+
+    with pytest.raises(ValueError):
+        CreatedWorkflowRun(
+            id=uuid4(),
+            workflow_definition_id=uuid4(),
+            workflow_version_id=uuid4(),
+            version_number=1,
+            requested_by_principal_id=uuid4(),
+            status=WorkflowRunStatus.PENDING,
+            created_at=datetime.now(),
+            task_count=0,
+            runnable_task_count=0,
+            blocked_task_count=0,
+        )
 
 
 @pytest.mark.parametrize(
@@ -158,3 +183,99 @@ def test_invalid_version_snapshots_fail_closed(
 ) -> None:
     with pytest.raises(WorkflowVersionSnapshotInvalid):
         materialize_initial_tasks(invalid_snapshot)
+
+
+def test_snapshot_rejects_non_positive_version_number() -> None:
+    invalid = snapshot(("root",), ())
+    object.__setattr__(invalid, "version_number", 0)
+
+    with pytest.raises(WorkflowVersionSnapshotInvalid):
+        materialize_initial_tasks(invalid)
+
+
+def idempotency_for(
+    key: object = "abcdefghijklmnop",
+    *,
+    selection: object | None = None,
+    payload: object | None = None,
+    workflow_id: object | None = None,
+    principal_id: object | None = None,
+) -> WorkflowRunIdempotency:
+    return create_workflow_run_idempotency(
+        key,
+        workflow_definition_id=(
+            workflow_id if isinstance(workflow_id, UUID) else UUID(int=1)
+        ),
+        requested_by_principal_id=(
+            principal_id if isinstance(principal_id, UUID) else UUID(int=2)
+        ),
+        selection=(
+            selection
+            if isinstance(selection, (ExplicitWorkflowVersion, LatestWorkflowVersion))
+            else LatestWorkflowVersion()
+        ),
+        input_snapshot=create_workflow_run_input(
+            payload if payload is not None else {}, {}
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        "!" * 16,
+        "~" * 128,
+        "punctuation!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
+    ),
+)
+def test_idempotency_keys_accept_bounded_non_whitespace_printable_ascii(
+    key: str,
+) -> None:
+    value = idempotency_for(key)
+
+    assert value.key_digest.startswith("sha256:v1:")
+    assert key not in repr(value)
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        None,
+        "short",
+        "a" * 129,
+        "contains space---",
+        "contains\ttab----",
+        "contains\nline---",
+        "non-ascii-é------",
+        "control-\x7f------",
+    ),
+)
+def test_invalid_idempotency_keys_are_rejected_safely(key: object) -> None:
+    with pytest.raises(InvalidWorkflowRunIdempotencyKey) as caught:
+        idempotency_for(key)
+
+    assert str(key) not in str(caught.value)
+
+
+def test_request_fingerprint_is_canonical_and_covers_request_semantics() -> None:
+    first = idempotency_for(payload={"b": 2, "a": 1})
+    reordered = idempotency_for(payload={"a": 1, "b": 2})
+    explicit = idempotency_for(selection=ExplicitWorkflowVersion(1))
+    different_payload = idempotency_for(payload={"a": 2, "b": 2})
+    different_workflow = idempotency_for(workflow_id=UUID(int=3))
+    different_principal = idempotency_for(principal_id=UUID(int=4))
+
+    assert first.request_fingerprint == reordered.request_fingerprint
+    assert (
+        len(
+            {
+                first.request_fingerprint,
+                explicit.request_fingerprint,
+                different_payload.request_fingerprint,
+                different_workflow.request_fingerprint,
+                different_principal.request_fingerprint,
+            }
+        )
+        == 5
+    )
+    assert first.key_digest == explicit.key_digest

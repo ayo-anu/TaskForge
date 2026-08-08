@@ -9,11 +9,13 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from taskforge.persistence.runs import (
     SQLAlchemyWorkflowRunCreationTransaction,
     _definition_lock_statement,
+    _idempotent_run_statement,
+    _is_idempotency_scope_conflict,
     _locked_version_statement,
     _version_resolution_statement,
 )
@@ -84,6 +86,43 @@ def test_locked_creation_resolution_keeps_explicit_and_latest_rules() -> None:
     assert "ORDER BY" not in explicit
     assert "ORDER BY workflow_versions.version_number DESC" in latest
     assert "workflow_versions.id DESC" not in latest
+
+
+def test_idempotency_lookup_is_fully_scoped_and_loads_original_result() -> None:
+    statement = _idempotent_run_statement(uuid4(), uuid4(), "sha256:v1:digest")
+    sql = normalized_sql(statement)
+
+    assert "workflow_run_idempotency.principal_id =" in sql
+    assert "workflow_run_idempotency.workflow_definition_id =" in sql
+    assert "workflow_run_idempotency.idempotency_key_digest =" in sql
+    assert "workflow_runs" in sql
+    assert "workflow_versions" in sql
+
+
+class PostgreSQLMetadataError(Exception):
+    def __init__(self, sqlstate: str | None, constraint_name: str | None) -> None:
+        self.sqlstate = sqlstate
+        self.constraint_name = constraint_name
+
+
+@pytest.mark.parametrize(
+    ("sqlstate", "constraint_name", "expected"),
+    (
+        ("23505", "pk_workflow_run_idempotency", True),
+        ("23503", "pk_workflow_run_idempotency", False),
+        ("23505", "another_constraint", False),
+        (None, "pk_workflow_run_idempotency", False),
+    ),
+)
+def test_idempotency_conflict_classification_requires_state_and_constraint(
+    sqlstate: str | None,
+    constraint_name: str | None,
+    expected: bool,
+) -> None:
+    metadata_error = PostgreSQLMetadataError(sqlstate, constraint_name)
+    integrity_error = IntegrityError("INSERT", {}, metadata_error)
+
+    assert _is_idempotency_scope_conflict(integrity_error) is expected
 
 
 class FakeResult:

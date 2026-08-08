@@ -7,28 +7,39 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Select, and_, insert, select, true
+from sqlalchemy import Select, and_, func, insert, select, true
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.runs.domain import (
+    CreatedWorkflowRun,
     ExplicitWorkflowVersion,
     NewTaskRun,
     NewWorkflowRun,
+    WorkflowRunIdempotency,
     WorkflowRunInput,
+    WorkflowRunStatus,
     WorkflowRunVersionDependency,
     WorkflowRunVersionSnapshot,
     WorkflowVersionSelection,
 )
 from taskforge.runs.persistence_ports import (
+    ExistingIdempotentWorkflowRun,
+    IdempotentCreationPreparation,
     PreparedWorkflowRunCreation,
+    WorkflowRunIdempotencyRecordConflict,
     WorkflowRunPersistenceUnavailable,
     WorkflowRunRecordConflict,
     WorkflowRunTimestamps,
     WorkflowVersionResolutionRecord,
 )
-from taskforge.runs.schema import task_runs, workflow_run_inputs, workflow_runs
+from taskforge.runs.schema import (
+    task_runs,
+    workflow_run_idempotency,
+    workflow_run_inputs,
+    workflow_runs,
+)
 from taskforge.workflows.domain import WorkflowDefinitionStatus
 from taskforge.workflows.schema import (
     workflow_definitions,
@@ -37,6 +48,9 @@ from taskforge.workflows.schema import (
     workflow_versions,
 )
 
+POSTGRES_UNIQUE_VIOLATION = "23505"
+IDEMPOTENCY_SCOPE_CONSTRAINT = "pk_workflow_run_idempotency"
+
 
 class SQLAlchemyWorkflowRunRepository:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
@@ -44,6 +58,23 @@ class SQLAlchemyWorkflowRunRepository:
 
     def creation_transaction(self) -> SQLAlchemyWorkflowRunCreationTransaction:
         return SQLAlchemyWorkflowRunCreationTransaction(self._sessions)
+
+    async def find_idempotent_run(
+        self,
+        principal_id: UUID,
+        workflow_id: UUID,
+        key_digest: str,
+    ) -> ExistingIdempotentWorkflowRun | None:
+        try:
+            async with self._sessions() as session, session.begin():
+                row = (
+                    await session.execute(
+                        _idempotent_run_statement(principal_id, workflow_id, key_digest)
+                    )
+                ).one_or_none()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        return _existing_idempotent_run(row) if row is not None else None
 
     async def resolve_workflow_version(
         self,
@@ -162,12 +193,76 @@ class SQLAlchemyWorkflowRunCreationTransaction:
         snapshot = _creation_snapshot(version, step_rows, dependency_rows)
         return PreparedWorkflowRunCreation(workflow_id, status, snapshot)
 
+    async def prepare_idempotent_creation(
+        self,
+        workflow_id: UUID,
+        owner_principal_id: UUID,
+        principal_id: UUID,
+        selection: WorkflowVersionSelection,
+        key_digest: str,
+    ) -> IdempotentCreationPreparation | None:
+        session = self._required_session()
+        try:
+            definition = (
+                await session.execute(
+                    _definition_lock_statement(workflow_id, owner_principal_id)
+                )
+            ).one_or_none()
+            if definition is None:
+                return None
+            existing = (
+                await session.execute(
+                    _idempotent_run_statement(principal_id, workflow_id, key_digest)
+                )
+            ).one_or_none()
+            if existing is not None:
+                return _existing_idempotent_run(existing)
+            status = WorkflowDefinitionStatus(definition.status)
+            if status is not WorkflowDefinitionStatus.ENABLED:
+                return PreparedWorkflowRunCreation(workflow_id, status, None)
+            version = (
+                await session.execute(_locked_version_statement(workflow_id, selection))
+            ).one_or_none()
+            if version is None:
+                return PreparedWorkflowRunCreation(workflow_id, status, None)
+            step_rows = (
+                await session.execute(
+                    select(workflow_version_steps.c.step_identifier)
+                    .where(workflow_version_steps.c.workflow_version_id == version.id)
+                    .order_by(workflow_version_steps.c.step_identifier)
+                )
+            ).all()
+            dependency_rows = (
+                await session.execute(
+                    select(
+                        workflow_version_dependencies.c.predecessor_step_identifier,
+                        workflow_version_dependencies.c.successor_step_identifier,
+                    )
+                    .where(
+                        workflow_version_dependencies.c.workflow_version_id
+                        == version.id
+                    )
+                    .order_by(
+                        workflow_version_dependencies.c.predecessor_step_identifier,
+                        workflow_version_dependencies.c.successor_step_identifier,
+                    )
+                )
+            ).all()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        return PreparedWorkflowRunCreation(
+            workflow_id,
+            status,
+            _creation_snapshot(version, step_rows, dependency_rows),
+        )
+
     async def insert_complete_run(
         self,
         prepared: PreparedWorkflowRunCreation,
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        idempotency: WorkflowRunIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         snapshot = prepared.snapshot
         if snapshot is None:
@@ -211,7 +306,19 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                         for task in task_run_values
                     ],
                 )
+            if idempotency is not None:
+                await session.execute(
+                    insert(workflow_run_idempotency).values(
+                        principal_id=run.requested_by_principal_id,
+                        workflow_definition_id=prepared.workflow_definition_id,
+                        idempotency_key_digest=idempotency.key_digest,
+                        request_fingerprint=idempotency.request_fingerprint,
+                        workflow_run_id=run.id,
+                    )
+                )
         except IntegrityError as error:
+            if _is_idempotency_scope_conflict(error):
+                raise WorkflowRunIdempotencyRecordConflict from error
             raise WorkflowRunRecordConflict from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
@@ -262,6 +369,113 @@ def _definition_lock_statement(
             workflow_definitions.c.owner_principal_id == owner_principal_id,
         )
         .with_for_update()
+    )
+
+
+def _idempotent_run_statement(
+    principal_id: UUID,
+    workflow_id: UUID,
+    key_digest: str,
+) -> Select[Any]:
+    total_tasks = (
+        select(func.count())
+        .select_from(task_runs)
+        .where(task_runs.c.workflow_run_id == workflow_runs.c.id)
+        .scalar_subquery()
+    )
+    runnable_tasks = (
+        select(func.count())
+        .select_from(task_runs)
+        .where(
+            task_runs.c.workflow_run_id == workflow_runs.c.id,
+            task_runs.c.status == "runnable",
+        )
+        .scalar_subquery()
+    )
+    blocked_tasks = (
+        select(func.count())
+        .select_from(task_runs)
+        .where(
+            task_runs.c.workflow_run_id == workflow_runs.c.id,
+            task_runs.c.status == "blocked",
+        )
+        .scalar_subquery()
+    )
+    return (
+        select(
+            workflow_run_idempotency.c.request_fingerprint,
+            workflow_runs.c.id.label("run_id"),
+            workflow_runs.c.workflow_definition_id,
+            workflow_runs.c.workflow_version_id,
+            workflow_runs.c.requested_by_principal_id,
+            workflow_runs.c.status,
+            workflow_runs.c.created_at,
+            workflow_versions.c.version_number,
+            total_tasks.label("task_count"),
+            runnable_tasks.label("runnable_task_count"),
+            blocked_tasks.label("blocked_task_count"),
+        )
+        .select_from(
+            workflow_run_idempotency.join(
+                workflow_runs,
+                workflow_runs.c.id == workflow_run_idempotency.c.workflow_run_id,
+            ).join(
+                workflow_versions,
+                workflow_versions.c.id == workflow_runs.c.workflow_version_id,
+            )
+        )
+        .where(
+            workflow_run_idempotency.c.principal_id == principal_id,
+            workflow_run_idempotency.c.workflow_definition_id == workflow_id,
+            workflow_run_idempotency.c.idempotency_key_digest == key_digest,
+        )
+    )
+
+
+def _existing_idempotent_run(row: Row[Any]) -> ExistingIdempotentWorkflowRun:
+    return ExistingIdempotentWorkflowRun(
+        request_fingerprint=row.request_fingerprint,
+        run=CreatedWorkflowRun(
+            id=row.run_id,
+            workflow_definition_id=row.workflow_definition_id,
+            workflow_version_id=row.workflow_version_id,
+            version_number=row.version_number,
+            requested_by_principal_id=row.requested_by_principal_id,
+            status=WorkflowRunStatus(row.status),
+            created_at=row.created_at,
+            task_count=row.task_count,
+            runnable_task_count=row.runnable_task_count,
+            blocked_task_count=row.blocked_task_count,
+        ),
+    )
+
+
+def _is_idempotency_scope_conflict(error: IntegrityError) -> bool:
+    sqlstate: str | None = None
+    constraint_name: str | None = None
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        candidate_state = getattr(current, "sqlstate", None)
+        candidate_constraint = getattr(current, "constraint_name", None)
+        if isinstance(candidate_state, str):
+            sqlstate = candidate_state
+        if isinstance(candidate_constraint, str):
+            constraint_name = candidate_constraint
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        original = getattr(current, "orig", None)
+        if isinstance(original, BaseException):
+            pending.append(original)
+    return (
+        sqlstate == POSTGRES_UNIQUE_VIOLATION
+        and constraint_name == IDEMPOTENCY_SCOPE_CONSTRAINT
     )
 
 

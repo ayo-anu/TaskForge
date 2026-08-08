@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -38,6 +41,14 @@ class InvalidWorkflowRunInput(ValueError):
 
 class WorkflowVersionSnapshotInvalid(Exception):
     """A published version cannot be materialized safely."""
+
+
+class InvalidWorkflowRunIdempotencyKey(ValueError):
+    """An idempotency key is not a bounded printable ASCII token."""
+
+
+class WorkflowRunIdempotencyConflict(Exception):
+    """A scoped idempotency key was reused for a different request."""
 
 
 class WorkflowRunStatus(StrEnum):
@@ -150,6 +161,18 @@ class CreatedWorkflowRun:
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
 
 
+@dataclass(frozen=True, repr=False)
+class WorkflowRunIdempotency:
+    key_digest: str
+    request_fingerprint: str
+
+    def __repr__(self) -> str:
+        return (
+            "WorkflowRunIdempotency(key_digest=<redacted>, "
+            "request_fingerprint=<redacted>)"
+        )
+
+
 def require_run_available(status: WorkflowDefinitionStatus) -> None:
     """Reject every definition state except enabled."""
     if status is not WorkflowDefinitionStatus.ENABLED:
@@ -174,6 +197,67 @@ def create_workflow_run_input(
         payload=deepcopy(validated_payload),
         input_references=deepcopy(validated_references),
     )
+
+
+def create_workflow_run_idempotency(
+    key: object,
+    *,
+    workflow_definition_id: UUID,
+    requested_by_principal_id: UUID,
+    selection: WorkflowVersionSelection,
+    input_snapshot: WorkflowRunInput,
+) -> WorkflowRunIdempotency:
+    """Validate an opaque key and fingerprint one normalized start request."""
+    if (
+        not isinstance(key, str)
+        or not 16 <= len(key) <= 128
+        or any(not 0x21 <= ord(character) <= 0x7E for character in key)
+    ):
+        raise InvalidWorkflowRunIdempotencyKey("idempotency key is invalid")
+    key_digest = _versioned_sha256(
+        b"taskforge:workflow-run-idempotency-key:v1\0" + key.encode("ascii")
+    )
+    selector: dict[str, object]
+    if isinstance(selection, ExplicitWorkflowVersion):
+        selector = {
+            "kind": "explicit",
+            "version_number": selection.version_number,
+        }
+    else:
+        selector = {"kind": "latest"}
+    normalized_request = {
+        "operation": "workflow_run_start",
+        "requested_by_principal_id": str(requested_by_principal_id),
+        "schema_version": 1,
+        "selection": selector,
+        "workflow_definition_id": str(workflow_definition_id),
+        "input": {
+            "payload": input_snapshot.payload,
+            "input_references": input_snapshot.input_references,
+        },
+    }
+    encoded = json.dumps(
+        normalized_request,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return WorkflowRunIdempotency(
+        key_digest=key_digest,
+        request_fingerprint=_versioned_sha256(
+            b"taskforge:workflow-run-request-fingerprint:v1\0" + encoded
+        ),
+    )
+
+
+def idempotency_fingerprints_match(left: str, right: str) -> bool:
+    """Compare stored request fingerprints without early mismatch behavior."""
+    return hmac.compare_digest(left, right)
+
+
+def _versioned_sha256(value: bytes) -> str:
+    return f"sha256:v1:{hashlib.sha256(value).hexdigest()}"
 
 
 def materialize_initial_tasks(
