@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Integer,
     String,
     Table,
     UniqueConstraint,
@@ -195,6 +196,84 @@ Index(
     "ix_task_runs_workflow_version_id_step_identifier",
     task_runs.c.workflow_version_id,
     task_runs.c.step_identifier,
+)
+
+task_attempts = Table(
+    "task_attempts",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column(
+        "task_run_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "task_runs.id",
+            name="fk_task_attempts_task_run_id_task_runs",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column("attempt_number", Integer, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    ),
+    UniqueConstraint(
+        "task_run_id",
+        "attempt_number",
+        name="uq_task_attempts_task_run_id_attempt_number",
+    ),
+    CheckConstraint(
+        "attempt_number > 0",
+        name="attempt_number_positive",
+    ),
+)
+
+task_dispatch_outbox = Table(
+    "task_dispatch_outbox",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column(
+        "task_attempt_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "task_attempts.id",
+            name="fk_task_dispatch_outbox_task_attempt_id_task_attempts",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column("route", String(255), nullable=False),
+    Column("payload", JSONB, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.current_timestamp(),
+    ),
+    Column("published_at", DateTime(timezone=True), nullable=True),
+    UniqueConstraint(
+        "task_attempt_id",
+        name="uq_task_dispatch_outbox_task_attempt_id",
+    ),
+    CheckConstraint(
+        "length(btrim(route)) > 0",
+        name="route_not_blank",
+    ),
+    CheckConstraint(
+        "jsonb_typeof(payload) = 'object'",
+        name="payload_object",
+    ),
+)
+
+Index(
+    "ix_task_dispatch_outbox_unpublished_created_at_id",
+    task_dispatch_outbox.c.created_at,
+    task_dispatch_outbox.c.id,
+    postgresql_where=task_dispatch_outbox.c.published_at.is_(None),
 )
 
 workflow_run_idempotency = Table(

@@ -53,17 +53,19 @@ def check_texts(table: Table) -> set[str]:
     }
 
 
-def test_shared_metadata_registers_only_the_task_one_run_tables() -> None:
+def test_shared_metadata_registers_run_and_dispatch_foundation_tables() -> None:
     assert {
         "workflow_runs",
         "workflow_run_inputs",
         "task_runs",
+        "task_attempts",
+        "task_dispatch_outbox",
         "workflow_run_idempotency",
     } <= set(metadata.tables)
     assert not any(
         fragment in table_name
         for table_name in metadata.tables
-        for fragment in ("attempt", "dispatch", "claim", "lease", "replay", "audit")
+        for fragment in ("claim", "lease", "replay", "audit")
     )
 
 
