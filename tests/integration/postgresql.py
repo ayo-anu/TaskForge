@@ -20,7 +20,7 @@ SAFE_DATABASE_NAME = re.compile(
     r"taskforge_workflow_route|taskforge_run_migration|"
     r"taskforge_version_resolution|taskforge_run_creation|"
     r"taskforge_run_idempotency|taskforge_workflow_run_route|"
-    r"taskforge_task_dispatch)_[0-9a-f]{32}\Z"
+    r"taskforge_task_dispatch|taskforge_broker_dispatch)_[0-9a-f]{32}\Z"
 )
 
 

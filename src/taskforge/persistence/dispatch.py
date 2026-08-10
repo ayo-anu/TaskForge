@@ -7,7 +7,7 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, insert, select, tuple_, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Select, Update
@@ -19,6 +19,14 @@ from taskforge.dispatch.persistence_ports import (
     TaskDispatchPersistenceConflict,
     TaskDispatchPersistenceUnavailable,
     TaskDispatchStateConflict,
+)
+from taskforge.dispatch.publisher_ports import (
+    DispatchAcknowledgementPersistenceFailure,
+    DispatchOutboxPersistenceUnavailable,
+    DispatchPublicationInvariantConflict,
+    PublicationAcknowledgement,
+    StoredDispatch,
+    UnpublishedDispatchCursor,
 )
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
 from taskforge.runs.schema import (
@@ -36,6 +44,68 @@ class SQLAlchemyTaskDispatchRepository:
 
     def dispatch_transaction(self) -> SQLAlchemyTaskDispatchTransaction:
         return SQLAlchemyTaskDispatchTransaction(self._sessions)
+
+
+class SQLAlchemyDispatchOutboxRepository:
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def list_unpublished_page(
+        self,
+        *,
+        after: UnpublishedDispatchCursor | None,
+        limit: int,
+    ) -> tuple[StoredDispatch, ...]:
+        try:
+            async with self._sessions() as session:
+                rows = (
+                    await session.execute(
+                        _unpublished_dispatch_page_statement(after, limit)
+                    )
+                ).all()
+        except DBAPIError as error:
+            raise DispatchOutboxPersistenceUnavailable from error
+        return tuple(
+            StoredDispatch(
+                row.id,
+                row.task_attempt_id,
+                row.route,
+                deepcopy(row.payload),
+                row.created_at,
+            )
+            for row in rows
+        )
+
+    async def record_accepted_publication(
+        self, expected: StoredDispatch
+    ) -> PublicationAcknowledgement:
+        try:
+            async with self._sessions.begin() as session:
+                published_at = await session.scalar(
+                    _record_publication_acknowledgement_statement(expected)
+                )
+                if published_at is not None:
+                    return PublicationAcknowledgement.RECORDED
+                current = (
+                    await session.execute(
+                        _dispatch_acknowledgement_snapshot_statement(
+                            expected.dispatch_id
+                        )
+                    )
+                ).one_or_none()
+                if current is None:
+                    raise DispatchPublicationInvariantConflict
+                if (
+                    current.task_attempt_id != expected.task_attempt_id
+                    or current.route != expected.route
+                    or current.payload != expected.payload
+                ):
+                    raise DispatchPublicationInvariantConflict
+                if current.published_at is None:
+                    raise DispatchAcknowledgementPersistenceFailure
+                return PublicationAcknowledgement.ALREADY_RECORDED
+        except DBAPIError as error:
+            raise DispatchOutboxPersistenceUnavailable from error
 
 
 class SQLAlchemyTaskDispatchTransaction:
@@ -258,3 +328,58 @@ def _runnable_to_dispatched_statement(
         )
         .returning(task_runs.c.id)
     )
+
+
+def _unpublished_dispatch_page_statement(
+    after: UnpublishedDispatchCursor | None,
+    limit: int,
+) -> Select[Any]:
+    statement = (
+        select(
+            task_dispatch_outbox.c.id,
+            task_dispatch_outbox.c.task_attempt_id,
+            task_dispatch_outbox.c.route,
+            task_dispatch_outbox.c.payload,
+            task_dispatch_outbox.c.created_at,
+        )
+        .where(task_dispatch_outbox.c.published_at.is_(None))
+        .order_by(
+            task_dispatch_outbox.c.created_at,
+            task_dispatch_outbox.c.id,
+        )
+        .limit(limit)
+    )
+    if after is not None:
+        statement = statement.where(
+            tuple_(task_dispatch_outbox.c.created_at, task_dispatch_outbox.c.id)
+            > (after.created_at, after.dispatch_id)
+        )
+    return statement
+
+
+def _record_publication_acknowledgement_statement(
+    expected: StoredDispatch,
+) -> Update:
+    return (
+        update(task_dispatch_outbox)
+        .where(
+            task_dispatch_outbox.c.id == expected.dispatch_id,
+            task_dispatch_outbox.c.task_attempt_id == expected.task_attempt_id,
+            task_dispatch_outbox.c.route == expected.route,
+            task_dispatch_outbox.c.payload == expected.payload,
+            task_dispatch_outbox.c.published_at.is_(None),
+        )
+        .values(published_at=func.current_timestamp())
+        .returning(task_dispatch_outbox.c.published_at)
+    )
+
+
+def _dispatch_acknowledgement_snapshot_statement(
+    dispatch_id: UUID,
+) -> Select[Any]:
+    return select(
+        task_dispatch_outbox.c.task_attempt_id,
+        task_dispatch_outbox.c.route,
+        task_dispatch_outbox.c.payload,
+        task_dispatch_outbox.c.published_at,
+    ).where(task_dispatch_outbox.c.id == dispatch_id)

@@ -1,4 +1,4 @@
-.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test check clean
+.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test check clean
 
 install:
 	uv sync --locked --dev
@@ -52,12 +52,18 @@ credential-bootstrap-test:
 workflow-persistence-test:
 	@test "$${TASKFORGE_RUN_WORKFLOW_PERSISTENCE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_WORKFLOW_PERSISTENCE_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_workflow_persistence.py tests/integration/test_workflow_version_resolution.py tests/integration/test_workflow_run_creation.py tests/integration/test_workflow_run_idempotency.py tests/integration/test_task_dispatch_creation.py
+	uv run pytest tests/integration/test_workflow_persistence.py tests/integration/test_workflow_version_resolution.py tests/integration/test_workflow_run_creation.py tests/integration/test_workflow_run_idempotency.py tests/integration/test_task_dispatch_creation.py tests/integration/test_dispatch_publisher_persistence.py
 
 workflow-route-test:
 	@test "$${TASKFORGE_RUN_WORKFLOW_ROUTE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_WORKFLOW_ROUTE_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_WORKFLOW_ROUTE_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_WORKFLOW_ROUTE_TEST_DATABASE_URL is required" >&2; exit 2)
 	uv run pytest tests/integration/test_workflow_routes.py tests/integration/test_workflow_run_routes.py
+
+broker-dispatch-test:
+	@test "$${TASKFORGE_RUN_BROKER_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_BROKER_INTEGRATION=1 is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_BROKER_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_BROKER_TEST_DATABASE_URL is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_BROKER_TEST_AMQP_URL:-}" || (echo "TASKFORGE_BROKER_TEST_AMQP_URL is required" >&2; exit 2)
+	uv run pytest tests/integration/test_dispatch_publisher_broker.py
 
 check: format-check lint typecheck coverage migrations-check
 
