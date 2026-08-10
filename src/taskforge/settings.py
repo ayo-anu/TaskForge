@@ -1,8 +1,10 @@
 """Typed application settings loaded from the process environment."""
 
+from __future__ import annotations
+
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["development", "test", "production"]
@@ -88,3 +90,24 @@ class Settings(BaseSettings):
             "TASKFORGE_RABBITMQ_VHOST",
         ),
     )
+    rabbitmq_dispatch_exchange_name: str = Field(
+        default="taskforge.dispatch.v1",
+        pattern=r"^[a-z][a-z0-9._-]{0,254}$",
+    )
+    rabbitmq_malformed_exchange_name: str = Field(
+        default="taskforge.dispatch.malformed.v1",
+        pattern=r"^[a-z][a-z0-9._-]{0,254}$",
+    )
+    rabbitmq_topology_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+
+    @model_validator(mode="after")
+    def validate_rabbitmq_topology_names(self) -> Settings:
+        names = (
+            self.rabbitmq_dispatch_exchange_name,
+            self.rabbitmq_malformed_exchange_name,
+        )
+        if any(name.startswith("amq.") for name in names):
+            raise ValueError("RabbitMQ topology names cannot use the reserved prefix")
+        if names[0] == names[1]:
+            raise ValueError("RabbitMQ topology exchange names must be distinct")
+        return self

@@ -91,6 +91,13 @@ class TaskTypeRegistry:
     def names(self) -> frozenset[str]:
         return frozenset(self._registered)
 
+    @property
+    def required_capabilities(self) -> frozenset[str]:
+        """Return the unique stable capabilities required by registered handlers."""
+        return frozenset(
+            definition.required_capability for definition in self._registered.values()
+        )
+
     def definition(self, task_type: str) -> TaskTypeDefinition | None:
         """Return the stable registered handler contract for a task type."""
         return self._registered.get(task_type)

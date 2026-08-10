@@ -60,6 +60,7 @@ def test_registry_accepts_only_explicitly_registered_task_types() -> None:
     assert unknown is None
     assert [issue.code for issue in unknown_issues] == ["unsupported_task_type"]
     assert task_types.names == frozenset({"document.extract", "notify-email"})
+    assert task_types.required_capabilities == frozenset({"test-workers"})
     assert task_types.definition("document.extract") == TaskTypeDefinition(
         "document.extract", "test-workers", AcceptParameters()
     )

@@ -63,7 +63,7 @@ broker-dispatch-test:
 	@test "$${TASKFORGE_RUN_BROKER_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_BROKER_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_BROKER_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_BROKER_TEST_DATABASE_URL is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_BROKER_TEST_AMQP_URL:-}" || (echo "TASKFORGE_BROKER_TEST_AMQP_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_dispatch_publisher_broker.py
+	uv run pytest tests/integration/test_dispatch_publisher_broker.py tests/integration/test_dispatch_topology_broker.py
 
 check: format-check lint typecheck coverage migrations-check
 

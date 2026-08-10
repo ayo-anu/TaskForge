@@ -53,6 +53,11 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.postgres_port == 5432
     assert settings.rabbitmq_host == "127.0.0.1"
     assert settings.rabbitmq_port == 5672
+    assert settings.rabbitmq_dispatch_exchange_name == "taskforge.dispatch.v1"
+    assert settings.rabbitmq_malformed_exchange_name == (
+        "taskforge.dispatch.malformed.v1"
+    )
+    assert settings.rabbitmq_topology_timeout_seconds == 5.0
 
 
 def test_settings_accept_prefixed_environment_overrides(
@@ -164,6 +169,9 @@ def test_dependency_passwords_are_redacted() -> None:
         ("TASKFORGE_AUTHENTICATION_TIMEOUT_SECONDS", "0"),
         ("TASKFORGE_DATABASE_POOL_SIZE", "0"),
         ("TASKFORGE_DATABASE_POOL_TIMEOUT_SECONDS", "10.1"),
+        ("TASKFORGE_RABBITMQ_TOPOLOGY_TIMEOUT_SECONDS", "0"),
+        ("TASKFORGE_RABBITMQ_DISPATCH_EXCHANGE_NAME", "amq.reserved"),
+        ("TASKFORGE_RABBITMQ_MALFORMED_EXCHANGE_NAME", "Invalid Name"),
     ),
 )
 def test_settings_reject_invalid_runtime_values(
@@ -172,6 +180,16 @@ def test_settings_reject_invalid_runtime_values(
     invalid_value: str,
 ) -> None:
     monkeypatch.setenv(variable_name, invalid_value)
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_settings_require_distinct_topology_exchange_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_RABBITMQ_DISPATCH_EXCHANGE_NAME", "same.exchange")
+    monkeypatch.setenv("TASKFORGE_RABBITMQ_MALFORMED_EXCHANGE_NAME", "same.exchange")
 
     with pytest.raises(ValidationError):
         Settings()

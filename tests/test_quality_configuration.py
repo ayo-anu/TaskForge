@@ -105,6 +105,7 @@ def test_makefile_exposes_consistent_developer_commands() -> None:
     assert "ruff check src tests migrations" in makefile
     assert "TASKFORGE_RUN_BROKER_INTEGRATION=1 is required" in makefile
     assert "tests/integration/test_dispatch_publisher_broker.py" in makefile
+    assert "tests/integration/test_dispatch_topology_broker.py" in makefile
     assert "check: format-check lint typecheck coverage migrations-check" in makefile
 
 
