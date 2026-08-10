@@ -61,7 +61,9 @@ class AcceptParameters:
 
 
 def registry() -> TaskTypeRegistry:
-    return TaskTypeRegistry((TaskTypeDefinition("test.task", AcceptParameters()),))
+    return TaskTypeRegistry(
+        (TaskTypeDefinition("test.task", "test-workers", AcceptParameters()),)
+    )
 
 
 def workflow_service(repository: FakeRepository) -> WorkflowService:

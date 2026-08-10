@@ -201,7 +201,9 @@ async def verify_workflow_persistence(database_url: URL) -> None:
     repository = SQLAlchemyWorkflowRepository(sessions)
     service = WorkflowService(
         repository,
-        TaskTypeRegistry((TaskTypeDefinition("test.task", AcceptParameters()),)),
+        TaskTypeRegistry(
+            (TaskTypeDefinition("test.task", "test-workers", AcceptParameters()),)
+        ),
     )
     owner_id, other_owner_id, disabled_owner_id = uuid4(), uuid4(), uuid4()
     try:

@@ -42,7 +42,10 @@ class RequireValue:
 
 def registry(*names: str) -> TaskTypeRegistry:
     return TaskTypeRegistry(
-        tuple(TaskTypeDefinition(name, AcceptParameters()) for name in names)
+        tuple(
+            TaskTypeDefinition(name, "test-workers", AcceptParameters())
+            for name in names
+        )
     )
 
 
@@ -57,6 +60,18 @@ def test_registry_accepts_only_explicitly_registered_task_types() -> None:
     assert unknown is None
     assert [issue.code for issue in unknown_issues] == ["unsupported_task_type"]
     assert task_types.names == frozenset({"document.extract", "notify-email"})
+    assert task_types.definition("document.extract") == TaskTypeDefinition(
+        "document.extract", "test-workers", AcceptParameters()
+    )
+    assert task_types.definition("document.unknown") is None
+
+
+@pytest.mark.parametrize("capability", ("", "Uppercase", "has space", ".leading"))
+def test_registry_rejects_invalid_required_capabilities(capability: str) -> None:
+    with pytest.raises(ValueError, match="invalid registered task capability"):
+        TaskTypeRegistry(
+            (TaskTypeDefinition("test.task", capability, AcceptParameters()),)
+        )
 
 
 @pytest.mark.parametrize("name", ("", "Uppercase", "has space", ".leading"))
@@ -72,7 +87,7 @@ def test_registry_rejects_duplicate_definitions() -> None:
 
 def test_task_specific_validation_returns_safe_issues() -> None:
     task_types = TaskTypeRegistry(
-        (TaskTypeDefinition("test.required", RequireValue()),)
+        (TaskTypeDefinition("test.required", "test-workers", RequireValue()),)
     )
 
     validated, issues = task_types.validate(
@@ -94,7 +109,7 @@ def test_unexpected_task_validator_errors_propagate() -> None:
             raise RuntimeError("validator programming error")
 
     task_types = TaskTypeRegistry(
-        (TaskTypeDefinition("test.broken", BrokenValidator()),)
+        (TaskTypeDefinition("test.broken", "test-workers", BrokenValidator()),)
     )
 
     with pytest.raises(RuntimeError, match="validator programming error"):

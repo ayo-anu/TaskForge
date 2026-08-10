@@ -99,7 +99,9 @@ async def verify_workflow_routes(database_url: URL) -> None:
     finally:
         await engine.dispose()
 
-    registry = TaskTypeRegistry((TaskTypeDefinition("test.task", AcceptParameters()),))
+    registry = TaskTypeRegistry(
+        (TaskTypeDefinition("test.task", "test-workers", AcceptParameters()),)
+    )
     app = create_app(
         settings,
         ReadinessCoordinator((AlwaysReady(),), timeout_seconds=1),

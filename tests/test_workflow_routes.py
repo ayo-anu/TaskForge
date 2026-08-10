@@ -251,7 +251,9 @@ def make_app(
     roles: frozenset[str],
 ) -> tuple[FastAPI, Runtime, WorkflowServiceStub, Validator]:
     service, validator = WorkflowServiceStub(), Validator()
-    registry = TaskTypeRegistry((TaskTypeDefinition("test.task", validator),))
+    registry = TaskTypeRegistry(
+        (TaskTypeDefinition("test.task", "test-workers", validator),)
+    )
     runtime = Runtime(uuid4(), roles, service, registry)
     settings = Settings(
         postgres_password=SecretStr("test"), rabbitmq_password=SecretStr("test")

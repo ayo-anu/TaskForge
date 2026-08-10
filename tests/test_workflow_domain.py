@@ -44,7 +44,9 @@ class AcceptParameters:
 
 
 def task_types() -> TaskTypeRegistry:
-    return TaskTypeRegistry((TaskTypeDefinition("test.accepted", AcceptParameters()),))
+    return TaskTypeRegistry(
+        (TaskTypeDefinition("test.accepted", "test-workers", AcceptParameters()),)
+    )
 
 
 def step(identifier: str = "first") -> DraftWorkflowStep:

@@ -24,6 +24,7 @@ type JSONMapping = dict[str, JSONValue]
 type ValidationPath = tuple[str | int, ...]
 
 _TASK_TYPE_NAME = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
+_CAPABILITY_NAME = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class TaskParameterValidator(Protocol):
 @dataclass(frozen=True)
 class TaskTypeDefinition:
     name: str
+    required_capability: str
     parameter_validator: TaskParameterValidator
 
 
@@ -74,18 +76,24 @@ class TaskTypeRegistry:
     """Immutable task-type catalog assembled explicitly at composition time."""
 
     def __init__(self, definitions: tuple[TaskTypeDefinition, ...]) -> None:
-        registered: dict[str, TaskParameterValidator] = {}
+        registered: dict[str, TaskTypeDefinition] = {}
         for definition in definitions:
             if _TASK_TYPE_NAME.fullmatch(definition.name) is None:
                 raise ValueError("invalid registered task type")
+            if _CAPABILITY_NAME.fullmatch(definition.required_capability) is None:
+                raise ValueError("invalid registered task capability")
             if definition.name in registered:
                 raise ValueError("duplicate registered task type")
-            registered[definition.name] = definition.parameter_validator
+            registered[definition.name] = definition
         self._registered = registered
 
     @property
     def names(self) -> frozenset[str]:
         return frozenset(self._registered)
+
+    def definition(self, task_type: str) -> TaskTypeDefinition | None:
+        """Return the stable registered handler contract for a task type."""
+        return self._registered.get(task_type)
 
     def validate(
         self,
@@ -97,8 +105,8 @@ class TaskTypeRegistry:
         structural_issues, validated = validate_parameters(parameters, path=path)
         if structural_issues:
             return None, structural_issues
-        validator = self._registered.get(task_type)
-        if validator is None:
+        definition = self._registered.get(task_type)
+        if definition is None:
             return None, (
                 WorkflowValidationIssue(
                     "unsupported_task_type",
@@ -107,7 +115,7 @@ class TaskTypeRegistry:
                 ),
             )
         assert validated is not None
-        task_issues = validator.validate(validated)
+        task_issues = definition.parameter_validator.validate(validated)
         if task_issues:
             return None, tuple(
                 WorkflowValidationIssue(
