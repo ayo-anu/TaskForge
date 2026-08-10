@@ -10,7 +10,7 @@ from typing import Annotated, Any, Protocol, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
 from taskforge.api.authentication import authenticate_worker
 from taskforge.api.authorization import require_permission
@@ -32,6 +32,12 @@ from taskforge.worker.domain import (
 from taskforge.worker.service import (
     ConflictingWorkerHeartbeatReplay,
     StaleWorkerHeartbeat,
+    WorkerCapabilityInvariantError,
+    WorkerCapabilityRejected,
+    WorkerCapabilityService,
+    WorkerCapabilityServiceUnavailable,
+    WorkerCapabilitySessionInactiveError,
+    WorkerCapabilitySessionUnavailableError,
     WorkerHeartbeatGap,
     WorkerHeartbeatRejected,
     WorkerHeartbeatService,
@@ -74,6 +80,17 @@ class WorkerHealthResponse(BaseModel):
     last_seen_at: datetime
     accepting_work: bool
     availability_changed_at: datetime
+
+
+class ReplaceWorkerCapabilitiesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capabilities: list[StrictStr] = Field(max_length=MAX_WORKER_CAPABILITIES)
+
+
+class ReplacedWorkerCapabilitiesResponse(BaseModel):
+    worker_session_id: UUID
+    capabilities: list[str]
 
 
 class InspectedWorkerIdentityResponse(BaseModel):
@@ -140,6 +157,7 @@ class WorkerRegistrationRuntimeProtocol(Protocol):
     worker_registration_service: WorkerRegistrationService
     worker_heartbeat_service: WorkerHeartbeatService
     worker_inspection_service: WorkerInspectionService
+    worker_capability_service: WorkerCapabilityService
 
 
 router = APIRouter(tags=["worker-sessions"])
@@ -207,6 +225,64 @@ async def register_worker_session(
         id=registered.id,
         registered_at=registered.registered_at,
         capabilities=list(registered.capabilities),
+    )
+
+
+@router.put(
+    "/api/v1/worker-sessions/{worker_session_id}/capabilities",
+    response_model=ReplacedWorkerCapabilitiesResponse,
+    responses=RESPONSES,
+)
+async def replace_worker_session_capabilities(
+    worker_session_id: UUID,
+    body: ReplaceWorkerCapabilitiesRequest,
+    request: Request,
+    authenticated_worker: Annotated[
+        AuthenticatedWorker,
+        Depends(authenticate_worker),
+    ],
+) -> ReplacedWorkerCapabilitiesResponse | Response:
+    try:
+        replaced = await _runtime(request).worker_capability_service.replace(
+            authenticated_worker,
+            worker_session_id,
+            tuple(body.capabilities),
+        )
+    except InvalidWorkerRegistration as error:
+        return error_response(
+            request,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            code="validation_failed",
+            message="The request is invalid.",
+            details=tuple(
+                ErrorDetail(
+                    code=issue.code, path=list(issue.path), message=issue.message
+                )
+                for issue in error.issues
+            ),
+        )
+    except WorkerCapabilityRejected as error:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from error
+    except WorkerCapabilitySessionUnavailableError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except WorkerCapabilitySessionInactiveError:
+        return _conflict_response(
+            request,
+            "worker_session_inactive",
+            "The worker session is inactive.",
+        )
+    except WorkerCapabilityInvariantError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        ) from error
+    except WorkerCapabilityServiceUnavailable as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
+    return ReplacedWorkerCapabilitiesResponse(
+        worker_session_id=replaced.worker_session_id,
+        capabilities=list(replaced.capabilities),
     )
 
 

@@ -34,6 +34,19 @@ class WorkerRegistration:
 
 
 @dataclass(frozen=True)
+class WorkerCapabilityReplacement:
+    """Complete session advertisement affecting future claim checks only."""
+
+    capabilities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReplacedWorkerCapabilities:
+    worker_session_id: UUID
+    capabilities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RegisteredWorkerSession:
     id: UUID
     registered_at: datetime
@@ -173,7 +186,20 @@ def validate_worker_registration(
     *,
     known_capabilities: frozenset[str],
 ) -> WorkerRegistration:
-    """Validate and deterministically canonicalize one complete advertisement."""
+    """Validate one registration advertisement through the shared contract."""
+    return WorkerRegistration(
+        validate_worker_capabilities(
+            capabilities, known_capabilities=known_capabilities
+        )
+    )
+
+
+def validate_worker_capabilities(
+    capabilities: tuple[str, ...],
+    *,
+    known_capabilities: frozenset[str],
+) -> tuple[str, ...]:
+    """Validate and deterministically canonicalize one complete capability set."""
     issues: list[WorkerRegistrationIssue] = []
     if len(capabilities) > MAX_WORKER_CAPABILITIES:
         issues.append(
@@ -216,4 +242,4 @@ def validate_worker_registration(
 
     if issues:
         raise InvalidWorkerRegistration(tuple(issues))
-    return WorkerRegistration(tuple(sorted(first_positions)))
+    return tuple(sorted(first_positions))

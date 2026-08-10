@@ -17,12 +17,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.persistence.workers import (
+    SQLAlchemyWorkerCapabilityRepository,
     SQLAlchemyWorkerHeartbeatRepository,
     SQLAlchemyWorkerInspectionRepository,
     SQLAlchemyWorkerRegistrationRepository,
     _session_inspection_statement,
 )
 from taskforge.worker.domain import (
+    WorkerCapabilityReplacement,
     WorkerHealthThresholds,
     WorkerHeartbeat,
     WorkerRegistration,
@@ -30,6 +32,10 @@ from taskforge.worker.domain import (
     WorkerSessionPageCursor,
 )
 from taskforge.worker.persistence_ports import (
+    WorkerCapabilityAuthorityRejected,
+    WorkerCapabilityPersistenceUnavailable,
+    WorkerCapabilitySessionInactive,
+    WorkerCapabilitySessionUnavailable,
     WorkerHeartbeatAuthorityRejected,
     WorkerHeartbeatInvariantViolation,
     WorkerHeartbeatPersistenceUnavailable,
@@ -120,6 +126,18 @@ def heartbeat_repository_for(
     )
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     return SQLAlchemyWorkerHeartbeatRepository(sessions), engine
+
+
+def capability_repository_for(
+    database_url: URL,
+    application_name: str,
+) -> tuple[SQLAlchemyWorkerCapabilityRepository, object]:
+    engine = create_async_engine(
+        database_url.set(drivername="postgresql+asyncpg"),
+        connect_args={"server_settings": {"application_name": application_name}},
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    return SQLAlchemyWorkerCapabilityRepository(sessions), engine
 
 
 async def seed_registered_session(
@@ -1042,6 +1060,422 @@ async def _inspection_counts(database_url: URL) -> tuple[int, int, int]:
         await connection.close()
 
 
+async def _capability_rows(database_url: URL, session_id: UUID) -> list[asyncpg.Record]:
+    connection = await asyncpg.connect(asyncpg_dsn(database_url))
+    try:
+        return list(
+            await connection.fetch(
+                "SELECT capability, advertised_at FROM worker_session_capabilities "
+                "WHERE worker_session_id = $1 ORDER BY capability",
+                session_id,
+            )
+        )
+    finally:
+        await connection.close()
+
+
+async def assert_capability_replacement(database_url: URL) -> None:
+    authority = await seed_authority(database_url)
+    registration, registration_engine = repository_for(database_url)
+    capability, capability_engine = capability_repository_for(
+        database_url, "capability-basic"
+    )
+    session_id = uuid4()
+    try:
+        await registration.register_session(
+            authority,
+            session_id,
+            WorkerRegistration(("documents", "notifications.email")),
+        )
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            health_before = await connection.fetchrow(
+                "SELECT * FROM worker_session_health WHERE worker_session_id = $1",
+                session_id,
+            )
+            heartbeat_count = await connection.fetchval(
+                "SELECT count(*) FROM worker_heartbeats WHERE worker_session_id = $1",
+                session_id,
+            )
+            await connection.execute(
+                "CREATE FUNCTION reject_identical_capability_mutation() "
+                "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                "RAISE EXCEPTION 'identical replacement wrote'; END $$"
+            )
+            await connection.execute(
+                "CREATE TRIGGER reject_identical_capability_mutation_trigger "
+                "BEFORE INSERT OR DELETE ON worker_session_capabilities "
+                "FOR EACH ROW EXECUTE FUNCTION reject_identical_capability_mutation()"
+            )
+        finally:
+            await connection.close()
+
+        original = await _capability_rows(database_url, session_id)
+        identical = await capability.replace_capabilities(
+            authority,
+            session_id,
+            WorkerCapabilityReplacement(("documents", "notifications.email")),
+        )
+        assert identical.capabilities == ("documents", "notifications.email")
+        assert await _capability_rows(database_url, session_id) == original
+
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            await connection.execute(
+                "DROP TRIGGER reject_identical_capability_mutation_trigger "
+                "ON worker_session_capabilities"
+            )
+            await connection.execute(
+                "DROP FUNCTION reject_identical_capability_mutation()"
+            )
+        finally:
+            await connection.close()
+
+        replaced = await capability.replace_capabilities(
+            authority,
+            session_id,
+            WorkerCapabilityReplacement(("documents", "images")),
+        )
+        assert replaced.capabilities == ("documents", "images")
+        changed = await _capability_rows(database_url, session_id)
+        assert [row["capability"] for row in changed] == ["documents", "images"]
+        assert changed[0]["advertised_at"] == original[0]["advertised_at"]
+
+        inspected_engine = create_async_engine(
+            database_url.set(drivername="postgresql+asyncpg")
+        )
+        inspection = SQLAlchemyWorkerInspectionRepository(
+            async_sessionmaker(inspected_engine, expire_on_commit=False)
+        )
+        try:
+            inspected = await inspection.get_session(
+                session_id, WorkerHealthThresholds(30, 120)
+            )
+            assert inspected.session.capabilities == ("documents", "images")
+        finally:
+            await inspected_engine.dispose()
+
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            assert (
+                await connection.fetchrow(
+                    "SELECT * FROM worker_session_health WHERE worker_session_id = $1",
+                    session_id,
+                )
+                == health_before
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM worker_heartbeats "
+                    "WHERE worker_session_id = $1",
+                    session_id,
+                )
+                == heartbeat_count
+            )
+            await connection.execute(
+                "UPDATE worker_sessions SET ended_at = statement_timestamp() "
+                "WHERE id = $1",
+                session_id,
+            )
+        finally:
+            await connection.close()
+        with pytest.raises(WorkerCapabilitySessionInactive):
+            await capability.replace_capabilities(
+                authority, session_id, WorkerCapabilityReplacement(())
+            )
+        with pytest.raises(WorkerCapabilitySessionUnavailable):
+            await capability.replace_capabilities(
+                authority, uuid4(), WorkerCapabilityReplacement(())
+            )
+        other = await seed_authority(database_url)
+        with pytest.raises(WorkerCapabilitySessionUnavailable):
+            await capability.replace_capabilities(
+                other, session_id, WorkerCapabilityReplacement(())
+            )
+    finally:
+        await registration_engine.dispose()  # type: ignore[attr-defined]
+        await capability_engine.dispose()  # type: ignore[attr-defined]
+
+
+async def assert_capability_replacement_rollback(database_url: URL) -> None:
+    authority, session_id = await seed_registered_session(database_url)
+    capability, engine = capability_repository_for(database_url, "capability-rollback")
+    connection = await asyncpg.connect(asyncpg_dsn(database_url))
+    try:
+        await connection.execute(
+            "INSERT INTO worker_session_capabilities "
+            "(worker_session_id, capability) VALUES ($1, 'documents')",
+            session_id,
+        )
+        before = await _capability_rows(database_url, session_id)
+        await connection.execute(
+            "CREATE FUNCTION reject_capability_insert() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test insert failure'; END $$"
+        )
+        await connection.execute(
+            "CREATE TRIGGER reject_capability_insert_trigger BEFORE INSERT "
+            "ON worker_session_capabilities FOR EACH ROW "
+            "EXECUTE FUNCTION reject_capability_insert()"
+        )
+        with pytest.raises(WorkerCapabilityPersistenceUnavailable):
+            await capability.replace_capabilities(
+                authority,
+                session_id,
+                WorkerCapabilityReplacement(("images",)),
+            )
+        assert await _capability_rows(database_url, session_id) == before
+    finally:
+        await connection.execute(
+            "DROP TRIGGER IF EXISTS reject_capability_insert_trigger "
+            "ON worker_session_capabilities"
+        )
+        await connection.execute("DROP FUNCTION IF EXISTS reject_capability_insert()")
+        await connection.close()
+        await engine.dispose()  # type: ignore[attr-defined]
+
+
+async def assert_concurrent_capability_replacements(database_url: URL) -> None:
+    for identical in (True, False):
+        authority, session_id = await seed_registered_session(database_url)
+        blocker = await asyncpg.connect(asyncpg_dsn(database_url))
+        observer = await asyncpg.connect(asyncpg_dsn(database_url))
+        transaction = blocker.transaction()
+        await transaction.start()
+        first, first_engine = capability_repository_for(
+            database_url, f"capability-first-{identical}"
+        )
+        second, second_engine = capability_repository_for(
+            database_url, f"capability-second-{identical}"
+        )
+        try:
+            await blocker.execute(
+                "SELECT id FROM worker_sessions WHERE id = $1 FOR NO KEY UPDATE",
+                session_id,
+            )
+            first_set = ("documents",)
+            second_set = first_set if identical else ("images",)
+            first_task = asyncio.create_task(
+                first.replace_capabilities(
+                    authority, session_id, WorkerCapabilityReplacement(first_set)
+                )
+            )
+            await wait_for_lock_wait(observer, f"capability-first-{identical}")
+            second_task = asyncio.create_task(
+                second.replace_capabilities(
+                    authority, session_id, WorkerCapabilityReplacement(second_set)
+                )
+            )
+            await wait_for_lock_wait(observer, f"capability-second-{identical}")
+            await transaction.commit()
+            await asyncio.gather(first_task, second_task)
+            rows = await _capability_rows(database_url, session_id)
+            assert [row["capability"] for row in rows] == list(second_set)
+        finally:
+            await blocker.close()
+            await observer.close()
+            await first_engine.dispose()  # type: ignore[attr-defined]
+            await second_engine.dispose()  # type: ignore[attr-defined]
+
+
+async def assert_capability_heartbeat_serialization(database_url: URL) -> None:
+    authority, session_id = await seed_registered_session(database_url)
+    capability, capability_engine = capability_repository_for(
+        database_url, "capability-behind-heartbeat"
+    )
+    heartbeat, heartbeat_engine = heartbeat_repository_for(
+        database_url, "heartbeat-before-capability"
+    )
+    blocker = await asyncpg.connect(asyncpg_dsn(database_url))
+    observer = await asyncpg.connect(asyncpg_dsn(database_url))
+    transaction = blocker.transaction()
+    await transaction.start()
+    try:
+        await blocker.execute(
+            "SELECT worker_session_id FROM worker_session_health "
+            "WHERE worker_session_id = $1 FOR UPDATE",
+            session_id,
+        )
+        heartbeat_task = asyncio.create_task(
+            heartbeat.apply_heartbeat(authority, session_id, WorkerHeartbeat(1, True))
+        )
+        await wait_for_lock_wait(observer, "heartbeat-before-capability")
+        capability_task = asyncio.create_task(
+            capability.replace_capabilities(
+                authority,
+                session_id,
+                WorkerCapabilityReplacement(("documents",)),
+            )
+        )
+        await wait_for_lock_wait(observer, "capability-behind-heartbeat")
+        await transaction.commit()
+        await asyncio.gather(heartbeat_task, capability_task)
+        assert [
+            row["capability"]
+            for row in await _capability_rows(database_url, session_id)
+        ] == ["documents"]
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            health = await connection.fetchrow(
+                "SELECT last_sequence, accepting_work FROM worker_session_health "
+                "WHERE worker_session_id = $1",
+                session_id,
+            )
+            assert tuple(health) == (1, True)
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM worker_heartbeats WHERE worker_session_id = $1",
+                    session_id,
+                )
+                == 1
+            )
+        finally:
+            await connection.close()
+    finally:
+        await blocker.close()
+        await observer.close()
+        await capability_engine.dispose()  # type: ignore[attr-defined]
+        await heartbeat_engine.dispose()  # type: ignore[attr-defined]
+
+
+async def assert_capability_before_heartbeat_serialization(database_url: URL) -> None:
+    authority, session_id = await seed_registered_session(database_url)
+    capability, capability_engine = capability_repository_for(
+        database_url, "capability-before-heartbeat"
+    )
+    heartbeat, heartbeat_engine = heartbeat_repository_for(
+        database_url, "heartbeat-behind-capability"
+    )
+    blocker = await asyncpg.connect(asyncpg_dsn(database_url))
+    observer = await asyncpg.connect(asyncpg_dsn(database_url))
+    setup = await asyncpg.connect(asyncpg_dsn(database_url))
+    advisory_key = 918_273
+    try:
+        await setup.execute(
+            "CREATE FUNCTION block_capability_insert() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN "
+            "PERFORM pg_advisory_xact_lock(918273); RETURN NEW; END $$"
+        )
+        await setup.execute(
+            "CREATE TRIGGER block_capability_insert_trigger BEFORE INSERT "
+            "ON worker_session_capabilities FOR EACH ROW "
+            "EXECUTE FUNCTION block_capability_insert()"
+        )
+        await blocker.execute("SELECT pg_advisory_lock($1)", advisory_key)
+        capability_task = asyncio.create_task(
+            capability.replace_capabilities(
+                authority,
+                session_id,
+                WorkerCapabilityReplacement(("documents",)),
+            )
+        )
+        await wait_for_lock_wait(observer, "capability-before-heartbeat")
+        heartbeat_task = asyncio.create_task(
+            heartbeat.apply_heartbeat(authority, session_id, WorkerHeartbeat(1, False))
+        )
+        await wait_for_lock_wait(observer, "heartbeat-behind-capability")
+        await blocker.execute("SELECT pg_advisory_unlock($1)", advisory_key)
+        await asyncio.gather(capability_task, heartbeat_task)
+        assert [
+            row["capability"]
+            for row in await _capability_rows(database_url, session_id)
+        ] == ["documents"]
+        verification = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            assert (
+                await verification.fetchval(
+                    "SELECT last_sequence FROM worker_session_health "
+                    "WHERE worker_session_id = $1",
+                    session_id,
+                )
+                == 1
+            )
+            assert (
+                await verification.fetchval(
+                    "SELECT count(*) FROM worker_heartbeats WHERE worker_session_id = $1",
+                    session_id,
+                )
+                == 1
+            )
+        finally:
+            await verification.close()
+    finally:
+        await setup.execute(
+            "DROP TRIGGER IF EXISTS block_capability_insert_trigger "
+            "ON worker_session_capabilities"
+        )
+        await setup.execute("DROP FUNCTION IF EXISTS block_capability_insert()")
+        await blocker.close()
+        await observer.close()
+        await setup.close()
+        await capability_engine.dispose()  # type: ignore[attr-defined]
+        await heartbeat_engine.dispose()  # type: ignore[attr-defined]
+
+
+async def assert_session_ending_blocks_capability_replacement(
+    database_url: URL,
+) -> None:
+    authority, session_id = await seed_registered_session(database_url)
+    capability, engine = capability_repository_for(
+        database_url, "capability-behind-ending"
+    )
+    ending = await asyncpg.connect(asyncpg_dsn(database_url))
+    observer = await asyncpg.connect(asyncpg_dsn(database_url))
+    transaction = ending.transaction()
+    await transaction.start()
+    try:
+        await ending.execute(
+            "UPDATE worker_sessions SET ended_at = statement_timestamp() WHERE id = $1",
+            session_id,
+        )
+        replacement = asyncio.create_task(
+            capability.replace_capabilities(
+                authority,
+                session_id,
+                WorkerCapabilityReplacement(("documents",)),
+            )
+        )
+        await wait_for_lock_wait(observer, "capability-behind-ending")
+        await transaction.commit()
+        with pytest.raises(WorkerCapabilitySessionInactive):
+            await replacement
+        assert await _capability_rows(database_url, session_id) == []
+    finally:
+        await ending.close()
+        await observer.close()
+        await engine.dispose()  # type: ignore[attr-defined]
+
+
+async def assert_capability_authority_recheck(database_url: URL) -> None:
+    cases = (
+        ("worker_identities", "disabled_at", "id", "worker_identity_id"),
+        ("worker_credentials", "revoked_at", "id", "credential_id"),
+        ("worker_credentials", "expires_at", "id", "credential_id"),
+    )
+    for table, field, key_column, authority_attribute in cases:
+        authority, session_id = await seed_registered_session(database_url)
+        capability, engine = capability_repository_for(
+            database_url, f"capability-authority-{field}"
+        )
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            operator = "- interval '1 second'" if field == "expires_at" else ""
+            await connection.execute(
+                f"UPDATE {table} SET {field} = statement_timestamp() {operator} "
+                f"WHERE {key_column} = $1",
+                getattr(authority, authority_attribute),
+            )
+            with pytest.raises(WorkerCapabilityAuthorityRejected):
+                await capability.replace_capabilities(
+                    authority,
+                    session_id,
+                    WorkerCapabilityReplacement(("documents",)),
+                )
+            assert await _capability_rows(database_url, session_id) == []
+        finally:
+            await connection.close()
+            await engine.dispose()  # type: ignore[attr-defined]
+
+
 def test_worker_registration_postgresql_invariants() -> None:
     with temporary_database(
         "TASKFORGE_WORKER_REGISTRATION_TEST_DATABASE_URL",
@@ -1066,3 +1500,10 @@ def test_worker_registration_postgresql_invariants() -> None:
         asyncio.run(assert_heartbeat_authority_races(database_url))
         asyncio.run(assert_heartbeat_rollback_after_history(database_url))
         asyncio.run(assert_worker_inspection(database_url))
+        asyncio.run(assert_capability_replacement(database_url))
+        asyncio.run(assert_capability_replacement_rollback(database_url))
+        asyncio.run(assert_concurrent_capability_replacements(database_url))
+        asyncio.run(assert_capability_heartbeat_serialization(database_url))
+        asyncio.run(assert_capability_before_heartbeat_serialization(database_url))
+        asyncio.run(assert_session_ending_blocks_capability_replacement(database_url))
+        asyncio.run(assert_capability_authority_recheck(database_url))

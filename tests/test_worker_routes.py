@@ -37,6 +37,7 @@ from taskforge.worker.domain import (
     InspectedWorkerSessionResource,
     InvalidWorkerRegistration,
     RegisteredWorkerSession,
+    ReplacedWorkerCapabilities,
     WorkerHealthProjection,
     WorkerHealthThresholds,
     WorkerInspectionObservation,
@@ -47,6 +48,10 @@ from taskforge.worker.domain import (
 from taskforge.worker.service import (
     ConflictingWorkerHeartbeatReplay,
     StaleWorkerHeartbeat,
+    WorkerCapabilityRejected,
+    WorkerCapabilityServiceUnavailable,
+    WorkerCapabilitySessionInactiveError,
+    WorkerCapabilitySessionUnavailableError,
     WorkerHeartbeatGap,
     WorkerHeartbeatRejected,
     WorkerHeartbeatServiceUnavailable,
@@ -134,6 +139,25 @@ class HeartbeatServiceStub:
         return self.health
 
 
+class CapabilityServiceStub:
+    def __init__(self) -> None:
+        self.error: Exception | None = None
+        self.calls: list[tuple[AuthenticatedWorker, UUID, tuple[str, ...]]] = []
+
+    async def replace(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        capabilities: tuple[str, ...],
+    ) -> ReplacedWorkerCapabilities:
+        self.calls.append((authenticated_worker, worker_session_id, capabilities))
+        if self.error:
+            raise self.error
+        return ReplacedWorkerCapabilities(
+            worker_session_id, tuple(sorted(capabilities))
+        )
+
+
 class Runtime:
     def __init__(
         self,
@@ -151,6 +175,7 @@ class Runtime:
             RoleRepository(), timeout_seconds=0.05
         )
         self.worker_inspection_service: Any = None
+        self.worker_capability_service: Any = CapabilityServiceStub()
 
     async def close(self) -> None:
         pass
@@ -392,6 +417,62 @@ def test_heartbeat_maps_safe_failures_without_enumerating_foreign_sessions() -> 
         assert response.json()["error"]["code"] == code
 
 
+def test_capability_replacement_uses_authenticated_worker_path_and_narrow_body() -> (
+    None
+):
+    app, worker_value, api_value, _, authenticated = make_app()
+    runtime = app.state.test_runtime
+    service: CapabilityServiceStub = runtime.worker_capability_service
+    session_id = uuid4()
+
+    response = put_capabilities(
+        app,
+        session_id,
+        {"capabilities": ["notifications.email", "documents"]},
+        worker_value,
+    )
+    wrong_scope = put_capabilities(app, session_id, {"capabilities": []}, api_value)
+    extra = put_capabilities(
+        app,
+        session_id,
+        {"capabilities": [], "worker_identity_id": str(uuid4())},
+        worker_value,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "worker_session_id": str(session_id),
+        "capabilities": ["documents", "notifications.email"],
+    }
+    assert service.calls == [
+        (authenticated, session_id, ("notifications.email", "documents"))
+    ]
+    assert wrong_scope.status_code == 401
+    assert extra.status_code == 422
+
+
+def test_capability_replacement_maps_safe_failures() -> None:
+    cases = (
+        (WorkerCapabilityRejected(), 401, "authentication_required"),
+        (WorkerCapabilitySessionUnavailableError(), 404, "resource_not_found"),
+        (
+            WorkerCapabilitySessionInactiveError(),
+            409,
+            "worker_session_inactive",
+        ),
+        (WorkerCapabilityServiceUnavailable(), 503, "service_unavailable"),
+    )
+    for error, status_code, code in cases:
+        app, worker_value, _, _, _ = make_app()
+        service: CapabilityServiceStub = (
+            app.state.test_runtime.worker_capability_service
+        )
+        service.error = error
+        response = put_capabilities(app, uuid4(), {"capabilities": []}, worker_value)
+        assert response.status_code == status_code
+        assert response.json()["error"]["code"] == code
+
+
 def test_worker_inspection_requires_api_principal_and_reports_approved_fields() -> None:
     app, worker_value, api_value, _, _ = make_app()
     worker_record = app.state.test_worker_record
@@ -535,6 +616,27 @@ def post_heartbeat(
                     f"/api/v1/worker-sessions/{session_id}/heartbeats",
                     json=body,
                     headers=headers,
+                )
+
+    return asyncio.run(send())
+
+
+def put_capabilities(
+    app: Any,
+    session_id: UUID,
+    body: object,
+    credential: str,
+) -> httpx2.Response:
+    async def send() -> httpx2.Response:
+        transport = httpx2.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx2.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                return await client.put(
+                    f"/api/v1/worker-sessions/{session_id}/capabilities",
+                    json=body,
+                    headers={"Authorization": f"Bearer {credential}"},
                 )
 
     return asyncio.run(send())

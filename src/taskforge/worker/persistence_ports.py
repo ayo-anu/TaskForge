@@ -11,6 +11,8 @@ from taskforge.worker.domain import (
     InspectedWorkerSessionPage,
     InspectedWorkerSessionResource,
     RegisteredWorkerSession,
+    ReplacedWorkerCapabilities,
+    WorkerCapabilityReplacement,
     WorkerHealthProjection,
     WorkerHealthThresholds,
     WorkerHeartbeat,
@@ -118,3 +120,32 @@ class WorkerInspectionRepository(Protocol):
         before_sequence: int | None,
         limit: int,
     ) -> InspectedWorkerHeartbeatPage: ...
+
+
+class WorkerCapabilityAuthorityRejected(Exception):
+    """Worker authority is invalid at the capability write boundary."""
+
+
+class WorkerCapabilitySessionUnavailable(Exception):
+    """The session is absent from the authenticated worker's scope."""
+
+
+class WorkerCapabilitySessionInactive(Exception):
+    """The authenticated worker session has ended."""
+
+
+class WorkerCapabilityInvariantViolation(Exception):
+    """Capability replacement violated an internal persistence invariant."""
+
+
+class WorkerCapabilityPersistenceUnavailable(Exception):
+    """Capability replacement persistence was operationally unavailable."""
+
+
+class WorkerCapabilityRepository(Protocol):
+    async def replace_capabilities(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        replacement: WorkerCapabilityReplacement,
+    ) -> ReplacedWorkerCapabilities: ...

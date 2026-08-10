@@ -6,7 +6,18 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import DateTime, and_, case, cast, func, insert, literal, or_, select
+from sqlalchemy import (
+    DateTime,
+    and_,
+    case,
+    cast,
+    delete,
+    func,
+    insert,
+    literal,
+    or_,
+    select,
+)
 from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -24,6 +35,8 @@ from taskforge.worker.domain import (
     InspectedWorkerSessionPage,
     InspectedWorkerSessionResource,
     RegisteredWorkerSession,
+    ReplacedWorkerCapabilities,
+    WorkerCapabilityReplacement,
     WorkerHealthProjection,
     WorkerHealthThresholds,
     WorkerHeartbeat,
@@ -33,6 +46,11 @@ from taskforge.worker.domain import (
     WorkerSessionPageCursor,
 )
 from taskforge.worker.persistence_ports import (
+    WorkerCapabilityAuthorityRejected,
+    WorkerCapabilityInvariantViolation,
+    WorkerCapabilityPersistenceUnavailable,
+    WorkerCapabilitySessionInactive,
+    WorkerCapabilitySessionUnavailable,
     WorkerHeartbeatAuthorityRejected,
     WorkerHeartbeatInvariantViolation,
     WorkerHeartbeatPersistenceUnavailable,
@@ -315,6 +333,136 @@ def _health_projection(row: Row[Any]) -> WorkerHealthProjection:
         row.last_seen_at,
         row.accepting_work,
         row.availability_changed_at,
+    )
+
+
+class SQLAlchemyWorkerCapabilityRepository:
+    """Atomically replace one authenticated live session's capability set."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def replace_capabilities(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        replacement: WorkerCapabilityReplacement,
+    ) -> ReplacedWorkerCapabilities:
+        try:
+            async with self._sessions.begin() as session:
+                await _lock_capability_authority(session, authenticated_worker)
+                worker_session = (
+                    await session.execute(
+                        _capability_session_lock_statement(
+                            authenticated_worker.worker_identity_id,
+                            worker_session_id,
+                        )
+                    )
+                ).one_or_none()
+                if worker_session is None:
+                    raise WorkerCapabilitySessionUnavailable
+                if worker_session.ended_at is not None:
+                    raise WorkerCapabilitySessionInactive
+
+                current = tuple(
+                    (
+                        await session.execute(
+                            select(worker_session_capabilities.c.capability)
+                            .where(
+                                worker_session_capabilities.c.worker_session_id
+                                == worker_session_id
+                            )
+                            .order_by(worker_session_capabilities.c.capability)
+                        )
+                    ).scalars()
+                )
+                if current == replacement.capabilities:
+                    return ReplacedWorkerCapabilities(worker_session_id, current)
+
+                current_set = set(current)
+                replacement_set = set(replacement.capabilities)
+                removed = tuple(sorted(current_set - replacement_set))
+                added = tuple(sorted(replacement_set - current_set))
+                if removed:
+                    await session.execute(
+                        delete(worker_session_capabilities).where(
+                            worker_session_capabilities.c.worker_session_id
+                            == worker_session_id,
+                            worker_session_capabilities.c.capability.in_(removed),
+                        )
+                    )
+                if added:
+                    await session.execute(
+                        insert(worker_session_capabilities),
+                        [
+                            {
+                                "worker_session_id": worker_session_id,
+                                "capability": capability,
+                            }
+                            for capability in added
+                        ],
+                    )
+                return ReplacedWorkerCapabilities(
+                    worker_session_id, replacement.capabilities
+                )
+        except (
+            WorkerCapabilityAuthorityRejected,
+            WorkerCapabilityInvariantViolation,
+            WorkerCapabilitySessionInactive,
+            WorkerCapabilitySessionUnavailable,
+        ):
+            raise
+        except IntegrityError as error:
+            raise WorkerCapabilityInvariantViolation from error
+        except DBAPIError as error:
+            raise WorkerCapabilityPersistenceUnavailable from error
+
+
+async def _lock_capability_authority(
+    session: AsyncSession,
+    authenticated_worker: AuthenticatedWorker,
+) -> None:
+    identity = (
+        await session.execute(
+            select(worker_identities.c.id, worker_identities.c.disabled_at)
+            .where(worker_identities.c.id == authenticated_worker.worker_identity_id)
+            .with_for_update(read=True)
+        )
+    ).one_or_none()
+    if identity is None or identity.disabled_at is not None:
+        raise WorkerCapabilityAuthorityRejected
+
+    credential = (
+        await session.execute(
+            select(worker_credentials.c.id)
+            .where(
+                worker_credentials.c.id == authenticated_worker.credential_id,
+                worker_credentials.c.worker_identity_id
+                == authenticated_worker.worker_identity_id,
+                worker_credentials.c.revoked_at.is_(None),
+                or_(
+                    worker_credentials.c.expires_at.is_(None),
+                    worker_credentials.c.expires_at > func.statement_timestamp(),
+                ),
+            )
+            .with_for_update(read=True)
+        )
+    ).one_or_none()
+    if credential is None:
+        raise WorkerCapabilityAuthorityRejected
+
+
+def _capability_session_lock_statement(
+    worker_identity_id: UUID,
+    worker_session_id: UUID,
+) -> Select[Any]:
+    return (
+        select(worker_sessions.c.id, worker_sessions.c.ended_at)
+        .where(
+            worker_sessions.c.id == worker_session_id,
+            worker_sessions.c.worker_identity_id == worker_identity_id,
+        )
+        .with_for_update(key_share=True)
     )
 
 

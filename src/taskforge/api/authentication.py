@@ -32,6 +32,7 @@ from taskforge.persistence.database import build_async_engine, build_session_fac
 from taskforge.persistence.principals import SQLAlchemyPrincipalProfileRepository
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.persistence.workers import (
+    SQLAlchemyWorkerCapabilityRepository,
     SQLAlchemyWorkerHeartbeatRepository,
     SQLAlchemyWorkerInspectionRepository,
     SQLAlchemyWorkerRegistrationRepository,
@@ -41,6 +42,7 @@ from taskforge.runs.service import WorkflowRunService
 from taskforge.settings import Settings
 from taskforge.worker.domain import WorkerHealthThresholds
 from taskforge.worker.service import (
+    WorkerCapabilityService,
     WorkerHeartbeatService,
     WorkerInspectionService,
     WorkerRegistrationService,
@@ -77,6 +79,7 @@ class AuthenticationRuntime:
         worker_registration_service: WorkerRegistrationService,
         worker_heartbeat_service: WorkerHeartbeatService,
         worker_inspection_service: WorkerInspectionService,
+        worker_capability_service: WorkerCapabilityService,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
@@ -89,6 +92,7 @@ class AuthenticationRuntime:
         self.worker_registration_service = worker_registration_service
         self.worker_heartbeat_service = worker_heartbeat_service
         self.worker_inspection_service = worker_inspection_service
+        self.worker_capability_service = worker_capability_service
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -140,6 +144,10 @@ def build_authentication_runtime(
                 settings.worker_stale_after_seconds,
                 settings.worker_offline_after_seconds,
             ),
+        ),
+        worker_capability_service=WorkerCapabilityService(
+            SQLAlchemyWorkerCapabilityRepository(sessions),
+            task_type_registry,
         ),
     )
 

@@ -11,14 +11,23 @@ from taskforge.worker.domain import (
     InspectedWorkerSessionPage,
     InspectedWorkerSessionResource,
     RegisteredWorkerSession,
+    ReplacedWorkerCapabilities,
+    WorkerCapabilityReplacement,
     WorkerHealthProjection,
     WorkerHealthThresholds,
     WorkerHeartbeat,
     WorkerSessionHealthStatus,
     WorkerSessionPageCursor,
+    validate_worker_capabilities,
     validate_worker_registration,
 )
 from taskforge.worker.persistence_ports import (
+    WorkerCapabilityAuthorityRejected,
+    WorkerCapabilityInvariantViolation,
+    WorkerCapabilityPersistenceUnavailable,
+    WorkerCapabilityRepository,
+    WorkerCapabilitySessionInactive,
+    WorkerCapabilitySessionUnavailable,
     WorkerHeartbeatAuthorityRejected,
     WorkerHeartbeatPersistenceUnavailable,
     WorkerHeartbeatReplayConflict,
@@ -89,6 +98,26 @@ class WorkerInspectionInvariantError(Exception):
 
 class WorkerInspectionServiceUnavailable(Exception):
     """Worker inspection persistence was unavailable."""
+
+
+class WorkerCapabilityRejected(Exception):
+    """Worker authority was invalid at the capability write boundary."""
+
+
+class WorkerCapabilitySessionUnavailableError(Exception):
+    """The session is absent from the authenticated worker's scope."""
+
+
+class WorkerCapabilitySessionInactiveError(Exception):
+    """The authenticated worker session has ended."""
+
+
+class WorkerCapabilityInvariantError(Exception):
+    """Capability persistence returned an inconsistent result."""
+
+
+class WorkerCapabilityServiceUnavailable(Exception):
+    """Capability replacement persistence was unavailable."""
 
 
 class WorkerRegistrationService:
@@ -229,3 +258,42 @@ class WorkerInspectionService:
             raise WorkerInspectionNotFoundError from error
         except WorkerInspectionPersistenceUnavailable as error:
             raise WorkerInspectionServiceUnavailable from error
+
+
+class WorkerCapabilityService:
+    def __init__(
+        self,
+        repository: WorkerCapabilityRepository,
+        task_types: TaskTypeRegistry,
+    ) -> None:
+        self._repository = repository
+        self._task_types = task_types
+
+    async def replace(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        capabilities: tuple[str, ...],
+    ) -> ReplacedWorkerCapabilities:
+        replacement = WorkerCapabilityReplacement(
+            validate_worker_capabilities(
+                capabilities,
+                known_capabilities=self._task_types.required_capabilities,
+            )
+        )
+        try:
+            return await self._repository.replace_capabilities(
+                authenticated_worker,
+                worker_session_id,
+                replacement,
+            )
+        except WorkerCapabilityAuthorityRejected as error:
+            raise WorkerCapabilityRejected from error
+        except WorkerCapabilitySessionUnavailable as error:
+            raise WorkerCapabilitySessionUnavailableError from error
+        except WorkerCapabilitySessionInactive as error:
+            raise WorkerCapabilitySessionInactiveError from error
+        except WorkerCapabilityInvariantViolation as error:
+            raise WorkerCapabilityInvariantError from error
+        except WorkerCapabilityPersistenceUnavailable as error:
+            raise WorkerCapabilityServiceUnavailable from error
