@@ -166,6 +166,37 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
                 f"/api/v1/task-runs/{tasks.json()['items'][0]['id']}",
                 headers=owner_headers,
             )
+            assert run.json()["failure_reason"] is None
+            assert all(item["failure_reason"] is None for item in tasks.json()["items"])
+
+            status_engine = build_async_engine(settings)
+            try:
+                async with status_engine.begin() as connection:
+                    await connection.execute(
+                        update(workflow_runs)
+                        .where(workflow_runs.c.id == keyed.json()["id"])
+                        .values(status="failed")
+                    )
+                    task_rows = tasks.json()["items"]
+                    await connection.execute(
+                        update(task_runs)
+                        .where(task_runs.c.id == task_rows[0]["id"])
+                        .values(status="skipped")
+                    )
+                    await connection.execute(
+                        update(task_runs)
+                        .where(task_runs.c.id == task_rows[1]["id"])
+                        .values(status="failed")
+                    )
+            finally:
+                await status_engine.dispose()
+
+            failed_run = await client.get(
+                keyed.headers["Location"], headers=owner_headers
+            )
+            failed_tasks = await client.get(
+                f"{keyed.headers['Location']}/tasks", headers=owner_headers
+            )
             hidden_run = await client.get(
                 keyed.headers["Location"], headers=other_headers
             )
@@ -180,6 +211,10 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
     assert conflict.status_code == 409
     assert conflict.json()["error"]["code"] == "idempotency_conflict"
     assert run.status_code == tasks.status_code == task.status_code == 200
+    assert failed_run.json()["failure_reason"] == "task_failed"
+    assert {
+        item["status"]: item["failure_reason"] for item in failed_tasks.json()["items"]
+    } == {"failed": "task_failed", "skipped": "dependency_failed"}
     assert "task_count" not in run.json()
     assert "secret" not in keyless.text
     assert [item["step_identifier"] for item in tasks.json()["items"]] == [

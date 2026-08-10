@@ -32,6 +32,7 @@ from taskforge.runs.domain import (
     InspectedWorkflowRun,
     NewTaskRun,
     NewWorkflowRun,
+    RunFailureReason,
     RunnableTransitionResult,
     TaskRunStatus,
     WorkflowRunEvaluationResult,
@@ -618,6 +619,13 @@ def _run_inspection_statement(
             workflow_runs.c.status,
             workflow_runs.c.created_at,
             workflow_runs.c.updated_at,
+            case(
+                (
+                    workflow_runs.c.status == WorkflowRunStatus.FAILED.value,
+                    RunFailureReason.TASK_FAILED.value,
+                ),
+                else_=None,
+            ).label("failure_reason"),
         )
         .select_from(
             workflow_runs.join(
@@ -663,6 +671,17 @@ def _task_run_columns() -> tuple[Any, ...]:
         task_runs.c.status,
         task_runs.c.created_at,
         task_runs.c.updated_at,
+        case(
+            (
+                task_runs.c.status == TaskRunStatus.FAILED.value,
+                RunFailureReason.TASK_FAILED.value,
+            ),
+            (
+                task_runs.c.status == TaskRunStatus.SKIPPED.value,
+                RunFailureReason.DEPENDENCY_FAILED.value,
+            ),
+            else_=None,
+        ).label("failure_reason"),
     )
 
 
@@ -1004,6 +1023,11 @@ def _inspected_run(row: Row[Any]) -> InspectedWorkflowRun:
         status=WorkflowRunStatus(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        failure_reason=(
+            RunFailureReason(row.failure_reason)
+            if row.failure_reason is not None
+            else None
+        ),
     )
 
 
@@ -1016,6 +1040,11 @@ def _inspected_task_run(row: Row[Any]) -> InspectedTaskRun:
         status=TaskRunStatus(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        failure_reason=(
+            RunFailureReason(row.failure_reason)
+            if row.failure_reason is not None
+            else None
+        ),
     )
 
 

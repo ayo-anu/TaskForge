@@ -17,6 +17,7 @@ from taskforge.runs.domain import (
     InvalidWorkflowVersionSelection,
     LatestWorkflowVersion,
     ResolvedWorkflowVersion,
+    RunFailureReason,
     RunnableTransitionResult,
     TaskRunStatus,
     WorkflowRunEvaluationResult,
@@ -96,6 +97,40 @@ def test_inspection_records_require_aware_timestamps() -> None:
             now,
             datetime.now(),
         )
+
+
+def test_inspection_failure_reasons_are_small_typed_and_immutable() -> None:
+    now = datetime.now(UTC)
+    run = InspectedWorkflowRun(
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        1,
+        uuid4(),
+        WorkflowRunStatus.FAILED,
+        now,
+        now,
+        RunFailureReason.TASK_FAILED,
+    )
+    task = InspectedTaskRun(
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        "leaf",
+        TaskRunStatus.SKIPPED,
+        now,
+        now,
+        RunFailureReason.DEPENDENCY_FAILED,
+    )
+
+    assert tuple(RunFailureReason) == (
+        RunFailureReason.TASK_FAILED,
+        RunFailureReason.DEPENDENCY_FAILED,
+    )
+    assert run.failure_reason is RunFailureReason.TASK_FAILED
+    assert task.failure_reason is RunFailureReason.DEPENDENCY_FAILED
+    with pytest.raises(AttributeError):
+        task.failure_reason = None  # type: ignore[misc]
 
 
 def test_runnable_transition_result_is_immutable_and_counts_transitions() -> None:

@@ -76,6 +76,13 @@ class TaskRunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class RunFailureReason(StrEnum):
+    """Stable failure categories exposed by run inspection responses."""
+
+    TASK_FAILED = "task_failed"
+    DEPENDENCY_FAILED = "dependency_failed"
+
+
 @dataclass(frozen=True)
 class ExplicitWorkflowVersion:
     version_number: int
@@ -187,6 +194,7 @@ class InspectedWorkflowRun:
     status: WorkflowRunStatus
     created_at: datetime
     updated_at: datetime
+    failure_reason: RunFailureReason | None = None
 
     def __post_init__(self) -> None:
         if self.created_at.tzinfo is None or self.updated_at.tzinfo is None:
@@ -204,6 +212,7 @@ class InspectedTaskRun:
     status: TaskRunStatus
     created_at: datetime
     updated_at: datetime
+    failure_reason: RunFailureReason | None = None
 
     def __post_init__(self) -> None:
         if self.created_at.tzinfo is None or self.updated_at.tzinfo is None:

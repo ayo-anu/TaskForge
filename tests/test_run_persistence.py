@@ -126,6 +126,12 @@ def test_run_and_task_inspection_sql_is_owner_scoped_read_only_and_ordered() -> 
     assert "workflow_run_inputs" not in run
     assert "workflow_run_idempotency" not in run
     assert "ORDER BY task_runs.step_identifier" in tasks
+    assert "CASE WHEN (workflow_runs.status =" in run
+    assert "AS failure_reason" in run
+    for sql in (tasks, task):
+        assert "CASE WHEN (task_runs.status =" in sql
+        assert "AS failure_reason" in sql
+        assert "workflow_version_dependencies" not in sql
 
 
 def test_runnable_transition_sql_owns_immutable_dependency_evaluation() -> None:

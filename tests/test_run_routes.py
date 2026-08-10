@@ -409,6 +409,9 @@ def test_run_and_task_inspection_are_owner_scoped_and_minimal() -> None:
 
     assert run.status_code == tasks.status_code == task.status_code == 200
     assert "task_count" not in run.json()
+    assert run.json()["failure_reason"] is None
+    assert tasks.json()["items"][0]["failure_reason"] is None
+    assert task.json()["failure_reason"] is None
     assert tasks.json()["items"][0]["step_identifier"] == "root"
     assert service.calls == [
         ("get_run", service.run_id, runtime.principal_id),

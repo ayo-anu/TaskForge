@@ -20,6 +20,7 @@ from taskforge.runs.domain import (
     InvalidWorkflowRunIdempotencyKey,
     InvalidWorkflowRunInput,
     LatestWorkflowVersion,
+    RunFailureReason,
     TaskRunStatus,
     WorkflowRunIdempotencyConflict,
     WorkflowRunStatus,
@@ -58,6 +59,7 @@ class StartedWorkflowRunResponse(BaseModel):
 
 class WorkflowRunResponse(StartedWorkflowRunResponse):
     updated_at: datetime
+    failure_reason: RunFailureReason | None
 
 
 class TaskRunResponse(BaseModel):
@@ -68,6 +70,7 @@ class TaskRunResponse(BaseModel):
     status: TaskRunStatus
     created_at: datetime
     updated_at: datetime
+    failure_reason: RunFailureReason | None
 
 
 class TaskRunListResponse(BaseModel):
@@ -262,6 +265,7 @@ def _workflow_run_response(run: InspectedWorkflowRun) -> WorkflowRunResponse:
         status=run.status,
         created_at=run.created_at,
         updated_at=run.updated_at,
+        failure_reason=run.failure_reason,
     )
 
 
@@ -274,6 +278,7 @@ def _task_run_response(task: InspectedTaskRun) -> TaskRunResponse:
         status=task.status,
         created_at=task.created_at,
         updated_at=task.updated_at,
+        failure_reason=task.failure_reason,
     )
 
 
