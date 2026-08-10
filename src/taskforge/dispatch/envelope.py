@@ -10,6 +10,7 @@ from dataclasses import InitVar, dataclass
 from types import MappingProxyType
 from uuid import UUID
 
+from taskforge.capabilities import is_valid_capability_name
 from taskforge.workflows.task_types import (
     MAX_COLLECTION_ITEMS,
     MAX_PARAMETER_DEPTH,
@@ -32,7 +33,7 @@ type FrozenJSONValue = (
 type FrozenJSONMapping = Mapping[str, FrozenJSONValue]
 type ValidationPath = tuple[str | int, ...]
 
-_TASK_OR_CAPABILITY = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
+_TASK_NAME = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
 _TRACE_PARENT = re.compile(r"\A00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})\Z")
 _ENVELOPE_FIELDS = frozenset(
     {
@@ -124,9 +125,8 @@ class DispatchEnvelope:
 
 def dispatch_route(required_capability: str) -> str:
     """Derive the sole broker-neutral logical route for a capability."""
-    if (
-        not isinstance(required_capability, str)
-        or _TASK_OR_CAPABILITY.fullmatch(required_capability) is None
+    if not isinstance(required_capability, str) or not is_valid_capability_name(
+        required_capability
     ):
         raise DispatchEnvelopeValidationError(
             (
@@ -290,9 +290,7 @@ def _create_from_mapping(
             )
         )
     task_type = _validate_name(value["task_type"], "task_type", issues)
-    required_capability = _validate_name(
-        value["required_capability"], "required_capability", issues
-    )
+    required_capability = _validate_capability(value["required_capability"], issues)
     frozen_payload = _validate_and_freeze_mapping(
         value["task_payload"],
         "task_payload",
@@ -370,12 +368,28 @@ def _validate_uuid(
 def _validate_name(
     value: object, field: str, issues: list[DispatchEnvelopeIssue]
 ) -> str | None:
-    if not isinstance(value, str) or _TASK_OR_CAPABILITY.fullmatch(value) is None:
+    if not isinstance(value, str) or _TASK_NAME.fullmatch(value) is None:
         issues.append(
             DispatchEnvelopeIssue(
                 f"invalid_{field}",
                 (field,),
                 f"{field.replace('_', ' ').title()} is invalid.",
+            )
+        )
+        return None
+    return value
+
+
+def _validate_capability(
+    value: object,
+    issues: list[DispatchEnvelopeIssue],
+) -> str | None:
+    if not isinstance(value, str) or not is_valid_capability_name(value):
+        issues.append(
+            DispatchEnvelopeIssue(
+                "invalid_required_capability",
+                ("required_capability",),
+                "Required capability is invalid.",
             )
         )
         return None

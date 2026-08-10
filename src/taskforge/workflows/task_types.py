@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
+from taskforge.capabilities import is_valid_capability_name
+
 if TYPE_CHECKING:
     from taskforge.workflows.dag_validation import DAGValidationResult
 
@@ -24,7 +26,6 @@ type JSONMapping = dict[str, JSONValue]
 type ValidationPath = tuple[str | int, ...]
 
 _TASK_TYPE_NAME = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
-_CAPABILITY_NAME = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,7 @@ class TaskTypeRegistry:
         for definition in definitions:
             if _TASK_TYPE_NAME.fullmatch(definition.name) is None:
                 raise ValueError("invalid registered task type")
-            if _CAPABILITY_NAME.fullmatch(definition.required_capability) is None:
+            if not is_valid_capability_name(definition.required_capability):
                 raise ValueError("invalid registered task capability")
             if definition.name in registered:
                 raise ValueError("duplicate registered task type")
