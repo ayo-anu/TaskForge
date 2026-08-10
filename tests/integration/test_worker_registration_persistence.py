@@ -18,9 +18,17 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.persistence.workers import (
     SQLAlchemyWorkerHeartbeatRepository,
+    SQLAlchemyWorkerInspectionRepository,
     SQLAlchemyWorkerRegistrationRepository,
+    _session_inspection_statement,
 )
-from taskforge.worker.domain import WorkerHeartbeat, WorkerRegistration
+from taskforge.worker.domain import (
+    WorkerHealthThresholds,
+    WorkerHeartbeat,
+    WorkerRegistration,
+    WorkerSessionHealthStatus,
+    WorkerSessionPageCursor,
+)
 from taskforge.worker.persistence_ports import (
     WorkerHeartbeatAuthorityRejected,
     WorkerHeartbeatInvariantViolation,
@@ -30,9 +38,11 @@ from taskforge.worker.persistence_ports import (
     WorkerHeartbeatSessionInactive,
     WorkerHeartbeatSessionUnavailable,
     WorkerHeartbeatStale,
+    WorkerInspectionInvariantViolation,
     WorkerRegistrationAuthorityRejected,
     WorkerRegistrationRecordConflict,
 )
+from taskforge.worker.schema import worker_sessions
 from tests.integration.postgresql import (
     asyncpg_dsn,
     migration_database_url,
@@ -771,6 +781,267 @@ async def assert_heartbeat_rollback_after_history(database_url: URL) -> None:
         await engine.dispose()  # type: ignore[attr-defined]
 
 
+async def assert_worker_inspection(database_url: URL) -> None:
+    thresholds = WorkerHealthThresholds(30, 120)
+    authority = await seed_authority(database_url)
+    registration, registration_engine = repository_for(database_url)
+    engine = create_async_engine(database_url.set(drivername="postgresql+asyncpg"))
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    inspection = SQLAlchemyWorkerInspectionRepository(sessions)
+    heartbeat = SQLAlchemyWorkerHeartbeatRepository(sessions)
+    session_ids = [uuid4() for _ in range(8)]
+    try:
+        for index, session_id in enumerate(session_ids):
+            capabilities = ("notifications.email", "documents") if index == 0 else ()
+            await registration.register_session(
+                authority,
+                session_id,
+                WorkerRegistration(capabilities),
+            )
+
+        first = await inspection.get_session(session_ids[0], thresholds)
+        assert first.session.health.status is WorkerSessionHealthStatus.HEALTHY
+        assert first.session.health.last_sequence == 0
+        assert first.session.health.accepting_work is False
+        assert first.session.capabilities == ("documents", "notifications.email")
+        assert first.session.identity.enabled is True
+
+        reference_connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            reference = await reference_connection.fetchval(
+                "SELECT statement_timestamp() + interval '1 hour'"
+            )
+        finally:
+            await reference_connection.close()
+        boundary_times = (
+            reference - timedelta(seconds=30) + timedelta(microseconds=1),
+            reference - timedelta(seconds=30),
+            reference - timedelta(seconds=30) - timedelta(microseconds=1),
+            reference - timedelta(seconds=120) + timedelta(microseconds=1),
+            reference - timedelta(seconds=120),
+            reference - timedelta(seconds=120) - timedelta(microseconds=1),
+        )
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            for session_id, last_seen in zip(
+                session_ids[1:7], boundary_times, strict=True
+            ):
+                await connection.execute(
+                    "UPDATE worker_session_health SET last_seen_at = $2, "
+                    "availability_changed_at = LEAST(availability_changed_at, $2) "
+                    "WHERE worker_session_id = $1",
+                    session_id,
+                    last_seen,
+                )
+            await connection.execute(
+                "UPDATE worker_sessions SET ended_at = $2 WHERE id = $1",
+                session_ids[7],
+                reference,
+            )
+        finally:
+            await connection.close()
+
+        async with sessions() as session:
+            statuses: dict[UUID, WorkerSessionHealthStatus] = {}
+            for session_id in session_ids[1:]:
+                row = (
+                    await session.execute(
+                        _session_inspection_statement(
+                            thresholds, reference_time=reference
+                        ).where(worker_sessions.c.id == session_id)
+                    )
+                ).one()
+                statuses[session_id] = WorkerSessionHealthStatus(row.health_status)
+        assert statuses == {
+            session_ids[1]: WorkerSessionHealthStatus.HEALTHY,
+            session_ids[2]: WorkerSessionHealthStatus.STALE,
+            session_ids[3]: WorkerSessionHealthStatus.STALE,
+            session_ids[4]: WorkerSessionHealthStatus.STALE,
+            session_ids[5]: WorkerSessionHealthStatus.OFFLINE,
+            session_ids[6]: WorkerSessionHealthStatus.OFFLINE,
+            session_ids[7]: WorkerSessionHealthStatus.ENDED,
+        }
+
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            await connection.execute(
+                "UPDATE worker_identities SET disabled_at = $2 WHERE id = $1",
+                authority.worker_identity_id,
+                reference,
+            )
+        finally:
+            await connection.close()
+        disabled = await inspection.get_session(session_ids[1], thresholds)
+        assert disabled.session.identity.enabled is False
+        assert disabled.session.health.status in {
+            WorkerSessionHealthStatus.HEALTHY,
+            WorkerSessionHealthStatus.OFFLINE,
+        }
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            await connection.execute(
+                "UPDATE worker_identities SET disabled_at = NULL WHERE id = $1",
+                authority.worker_identity_id,
+            )
+        finally:
+            await connection.close()
+
+        all_page = await inspection.list_sessions(
+            worker_identity_id=authority.worker_identity_id,
+            health_status=None,
+            thresholds=thresholds,
+            limit=100,
+            cursor=None,
+        )
+        assert len(all_page.items) == 8
+        assert [item.health.last_seen_at for item in all_page.items] == sorted(
+            item.health.last_seen_at for item in all_page.items
+        )
+        assert {item.identity.id for item in all_page.items} == {
+            authority.worker_identity_id
+        }
+        page_one = await inspection.list_sessions(
+            worker_identity_id=None,
+            health_status=None,
+            thresholds=thresholds,
+            limit=2,
+            cursor=None,
+        )
+        assert page_one.next_cursor is not None
+        page_two = await inspection.list_sessions(
+            worker_identity_id=None,
+            health_status=None,
+            thresholds=thresholds,
+            limit=2,
+            cursor=page_one.next_cursor,
+        )
+        assert page_two.observation.reference_time == (
+            page_one.observation.reference_time
+        )
+        assert {item.id for item in page_one.items}.isdisjoint(
+            item.id for item in page_two.items
+        )
+
+        fixed_cursor = WorkerSessionPageCursor(
+            reference,
+            datetime.min.replace(tzinfo=UTC),
+            UUID(int=0),
+            authority.worker_identity_id,
+            WorkerSessionHealthStatus.HEALTHY,
+            thresholds,
+        )
+        stable_page = await inspection.list_sessions(
+            worker_identity_id=authority.worker_identity_id,
+            health_status=WorkerSessionHealthStatus.HEALTHY,
+            thresholds=thresholds,
+            limit=100,
+            cursor=fixed_cursor,
+        )
+        assert stable_page.observation.reference_time == reference
+        assert {item.id for item in stable_page.items} == {session_ids[1]}
+        later_reference = reference + timedelta(microseconds=2)
+        later_cursor = WorkerSessionPageCursor(
+            later_reference,
+            datetime.min.replace(tzinfo=UTC),
+            UUID(int=0),
+            authority.worker_identity_id,
+            WorkerSessionHealthStatus.STALE,
+            thresholds,
+        )
+        later_page = await inspection.list_sessions(
+            worker_identity_id=authority.worker_identity_id,
+            health_status=WorkerSessionHealthStatus.STALE,
+            thresholds=thresholds,
+            limit=100,
+            cursor=later_cursor,
+        )
+        assert session_ids[1] in {item.id for item in later_page.items}
+
+        await heartbeat.apply_heartbeat(
+            authority, session_ids[0], WorkerHeartbeat(1, True)
+        )
+        await heartbeat.apply_heartbeat(
+            authority, session_ids[0], WorkerHeartbeat(2, False)
+        )
+        history_one = await inspection.list_heartbeats(
+            session_ids[0], before_sequence=None, limit=1
+        )
+        assert [item.sequence for item in history_one.items] == [2]
+        assert history_one.next_before_sequence == 2
+        history_two = await inspection.list_heartbeats(
+            session_ids[0], before_sequence=2, limit=1
+        )
+        assert [item.sequence for item in history_two.items] == [1]
+        assert history_two.next_before_sequence is None
+
+        visibility = await asyncpg.connect(asyncpg_dsn(database_url))
+        transaction = visibility.transaction()
+        await transaction.start()
+        try:
+            received_at = await visibility.fetchval("SELECT statement_timestamp()")
+            await visibility.execute(
+                "INSERT INTO worker_heartbeats "
+                "(worker_session_id, sequence, received_at, accepting_work) "
+                "VALUES ($1, 3, $2, true)",
+                session_ids[0],
+                received_at,
+            )
+            await visibility.execute(
+                "UPDATE worker_session_health SET last_sequence = 3, "
+                "last_seen_at = $2, accepting_work = true, "
+                "availability_changed_at = $2 WHERE worker_session_id = $1",
+                session_ids[0],
+                received_at,
+            )
+            before_commit = await inspection.get_session(session_ids[0], thresholds)
+            assert before_commit.session.health.last_sequence == 2
+            await transaction.commit()
+            after_commit = await inspection.get_session(session_ids[0], thresholds)
+            assert after_commit.session.health.last_sequence == 3
+            assert after_commit.session.health.accepting_work is True
+        finally:
+            if not visibility.is_closed():
+                await visibility.close()
+
+        before = await _inspection_counts(database_url)
+        await inspection.get_session(session_ids[0], thresholds)
+        await inspection.list_sessions(
+            worker_identity_id=None,
+            health_status=None,
+            thresholds=thresholds,
+            limit=2,
+            cursor=None,
+        )
+        await inspection.list_heartbeats(session_ids[0], before_sequence=None, limit=2)
+        assert await _inspection_counts(database_url) == before
+
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            await connection.execute(
+                "DELETE FROM worker_session_health WHERE worker_session_id = $1",
+                session_ids[7],
+            )
+        finally:
+            await connection.close()
+        with pytest.raises(WorkerInspectionInvariantViolation):
+            await inspection.get_session(session_ids[7], thresholds)
+    finally:
+        await registration_engine.dispose()  # type: ignore[attr-defined]
+        await engine.dispose()
+
+
+async def _inspection_counts(database_url: URL) -> tuple[int, int, int]:
+    connection = await asyncpg.connect(asyncpg_dsn(database_url))
+    try:
+        return (
+            await connection.fetchval("SELECT count(*) FROM worker_sessions"),
+            await connection.fetchval("SELECT count(*) FROM worker_session_health"),
+            await connection.fetchval("SELECT count(*) FROM worker_heartbeats"),
+        )
+    finally:
+        await connection.close()
+
+
 def test_worker_registration_postgresql_invariants() -> None:
     with temporary_database(
         "TASKFORGE_WORKER_REGISTRATION_TEST_DATABASE_URL",
@@ -794,3 +1065,4 @@ def test_worker_registration_postgresql_invariants() -> None:
         asyncio.run(assert_session_scope_and_lifecycle(database_url))
         asyncio.run(assert_heartbeat_authority_races(database_url))
         asyncio.run(assert_heartbeat_rollback_after_history(database_url))
+        asyncio.run(assert_worker_inspection(database_url))

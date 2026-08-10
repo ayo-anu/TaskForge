@@ -19,6 +19,7 @@ from taskforge.identity.authentication import (
     AuthenticatedWorker,
     WorkerAuthenticator,
 )
+from taskforge.identity.authorization import AuthorizationService
 from taskforge.identity.credentials import (
     DEFAULT_VERIFIER_ALGORITHM,
     DEFAULT_VERIFIERS,
@@ -27,10 +28,21 @@ from taskforge.identity.credentials import (
 from taskforge.identity.ports import CredentialRecord
 from taskforge.settings import Settings
 from taskforge.worker.domain import (
+    InspectedWorkerHealth,
+    InspectedWorkerHeartbeat,
+    InspectedWorkerHeartbeatPage,
+    InspectedWorkerIdentity,
+    InspectedWorkerSession,
+    InspectedWorkerSessionPage,
+    InspectedWorkerSessionResource,
     InvalidWorkerRegistration,
     RegisteredWorkerSession,
     WorkerHealthProjection,
+    WorkerHealthThresholds,
+    WorkerInspectionObservation,
     WorkerRegistrationIssue,
+    WorkerSessionHealthStatus,
+    WorkerSessionPageCursor,
 )
 from taskforge.worker.service import (
     ConflictingWorkerHeartbeatReplay,
@@ -58,20 +70,28 @@ class AlwaysReady:
 
 
 class CredentialRepository:
-    def __init__(self, record: CredentialRecord | None) -> None:
-        self.record = record
+    def __init__(self, *records: CredentialRecord) -> None:
+        self.records = records
 
     async def find_api_credential(self, credential_id: UUID) -> CredentialRecord | None:
-        if self.record is not None and self.record.credential_id == credential_id:
-            return self.record
+        for record in self.records:
+            if record.credential_id == credential_id:
+                return record
         return None
 
     async def find_worker_credential(
         self, credential_id: UUID
     ) -> CredentialRecord | None:
-        if self.record is not None and self.record.credential_id == credential_id:
-            return self.record
+        for record in self.records:
+            if record.credential_id == credential_id:
+                return record
         return None
+
+
+class RoleRepository:
+    async def find_role_names(self, principal_id: UUID) -> frozenset[str]:
+        del principal_id
+        return frozenset({"viewer"})
 
 
 class RegistrationServiceStub:
@@ -127,6 +147,10 @@ class Runtime:
         )
         self.worker_registration_service: Any = service
         self.worker_heartbeat_service: Any = HeartbeatServiceStub()
+        self.authorization_service = AuthorizationService(
+            RoleRepository(), timeout_seconds=0.05
+        )
+        self.worker_inspection_service: Any = None
 
     async def close(self) -> None:
         pass
@@ -158,7 +182,7 @@ def make_app() -> tuple[Any, str, str, RegistrationServiceStub, AuthenticatedWor
     worker_value, worker_record = make_credential(
         CredentialScope.WORKER, worker_identity_id
     )
-    api_value, _ = make_credential(CredentialScope.API, uuid4())
+    api_value, api_record = make_credential(CredentialScope.API, uuid4())
     registered = RegisteredWorkerSession(
         uuid4(), datetime(2026, 8, 10, tzinfo=UTC), ("documents", "email")
     )
@@ -173,6 +197,9 @@ def make_app() -> tuple[Any, str, str, RegistrationServiceStub, AuthenticatedWor
         authentication=runtime,
     )
     app.state.test_heartbeat_service = runtime.worker_heartbeat_service
+    app.state.test_runtime = runtime
+    app.state.test_worker_record = worker_record
+    app.state.test_api_record = api_record
     return (
         app,
         worker_value,
@@ -365,6 +392,132 @@ def test_heartbeat_maps_safe_failures_without_enumerating_foreign_sessions() -> 
         assert response.json()["error"]["code"] == code
 
 
+def test_worker_inspection_requires_api_principal_and_reports_approved_fields() -> None:
+    app, worker_value, api_value, _, _ = make_app()
+    worker_record = app.state.test_worker_record
+    api_record = app.state.test_api_record
+    repository = CredentialRepository(worker_record, api_record)
+    runtime = app.state.test_runtime
+    runtime.api_authenticator = APIAuthenticator(repository, timeout_seconds=0.05)
+    runtime.worker_authenticator = WorkerAuthenticator(repository, timeout_seconds=0.05)
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    session_id = uuid4()
+    session = InspectedWorkerSession(
+        session_id,
+        InspectedWorkerIdentity(worker_record.identity_id, "worker-one", True),
+        now,
+        None,
+        ("documents",),
+        InspectedWorkerHealth(WorkerSessionHealthStatus.HEALTHY, 0, now, False, now),
+    )
+
+    class InspectionStub:
+        thresholds = WorkerHealthThresholds(30, 120)
+
+        async def get_session(self, requested: UUID) -> InspectedWorkerSessionResource:
+            assert requested == session_id
+            return InspectedWorkerSessionResource(
+                session, WorkerInspectionObservation(now, self.thresholds)
+            )
+
+        async def list_sessions(
+            self,
+            *,
+            worker_identity_id: UUID | None,
+            health_status: WorkerSessionHealthStatus | None,
+            limit: int,
+            cursor: WorkerSessionPageCursor | None,
+        ) -> InspectedWorkerSessionPage:
+            assert worker_identity_id is None
+            assert health_status is None
+            assert limit == 1
+            assert cursor is None
+            return InspectedWorkerSessionPage(
+                (session,),
+                WorkerInspectionObservation(now, self.thresholds),
+                WorkerSessionPageCursor(
+                    now,
+                    now,
+                    session_id,
+                    None,
+                    None,
+                    self.thresholds,
+                ),
+            )
+
+        async def list_heartbeats(
+            self,
+            requested: UUID,
+            *,
+            before_sequence: int | None,
+            limit: int,
+        ) -> InspectedWorkerHeartbeatPage:
+            assert requested == session_id
+            assert before_sequence is None
+            assert limit == 1
+            return InspectedWorkerHeartbeatPage(
+                (InspectedWorkerHeartbeat(1, now, False),), 1
+            )
+
+    runtime.worker_inspection_service = InspectionStub()
+
+    worker_response = get_session(app, session_id, worker_value)
+    api_response = get_session(app, session_id, api_value)
+    list_response = get_path(app, "/api/v1/worker-sessions?limit=1", api_value)
+    history_response = get_path(
+        app,
+        f"/api/v1/worker-sessions/{session_id}/heartbeats?limit=1",
+        api_value,
+    )
+
+    assert worker_response.status_code == 401
+    assert api_response.status_code == 200
+    assert api_response.json() == {
+        "id": str(session_id),
+        "worker_identity": {
+            "id": str(worker_record.identity_id),
+            "name": "worker-one",
+            "enabled": True,
+        },
+        "registered_at": "2026-08-10T00:00:00Z",
+        "ended_at": None,
+        "capabilities": ["documents"],
+        "health": {
+            "status": "healthy",
+            "last_sequence": 0,
+            "last_seen_at": "2026-08-10T00:00:00Z",
+            "accepting_work": False,
+            "availability_changed_at": "2026-08-10T00:00:00Z",
+        },
+        "observation": {
+            "reference_time": "2026-08-10T00:00:00Z",
+            "stale_after_seconds": 30,
+            "offline_after_seconds": 120,
+        },
+    }
+    assert list_response.status_code == 200
+    assert list_response.json()["items"] == [
+        {
+            key: value
+            for key, value in api_response.json().items()
+            if key != "observation"
+        }
+    ]
+    assert list_response.json()["observation"] == api_response.json()["observation"]
+    assert list_response.json()["page"]["next_cursor"] is not None
+    assert history_response.status_code == 200
+    assert history_response.json() == {
+        "items": [
+            {
+                "sequence": 1,
+                "received_at": "2026-08-10T00:00:00Z",
+                "accepting_work": False,
+            }
+        ],
+        "page": {"limit": 1, "next_before_sequence": 1},
+    }
+
+
 def post_heartbeat(
     app: Any,
     session_id: UUID,
@@ -382,6 +535,25 @@ def post_heartbeat(
                     f"/api/v1/worker-sessions/{session_id}/heartbeats",
                     json=body,
                     headers=headers,
+                )
+
+    return asyncio.run(send())
+
+
+def get_session(app: Any, session_id: UUID, credential: str) -> httpx2.Response:
+    return get_path(app, f"/api/v1/worker-sessions/{session_id}", credential)
+
+
+def get_path(app: Any, path: str, credential: str) -> httpx2.Response:
+    async def send() -> httpx2.Response:
+        transport = httpx2.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx2.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                return await client.get(
+                    path,
+                    headers={"Authorization": f"Bearer {credential}"},
                 )
 
     return asyncio.run(send())

@@ -7,9 +7,15 @@ from uuid import UUID, uuid4
 
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.worker.domain import (
+    InspectedWorkerHeartbeatPage,
+    InspectedWorkerSessionPage,
+    InspectedWorkerSessionResource,
     RegisteredWorkerSession,
     WorkerHealthProjection,
+    WorkerHealthThresholds,
     WorkerHeartbeat,
+    WorkerSessionHealthStatus,
+    WorkerSessionPageCursor,
     validate_worker_registration,
 )
 from taskforge.worker.persistence_ports import (
@@ -21,6 +27,10 @@ from taskforge.worker.persistence_ports import (
     WorkerHeartbeatSessionInactive,
     WorkerHeartbeatSessionUnavailable,
     WorkerHeartbeatStale,
+    WorkerInspectionInvariantViolation,
+    WorkerInspectionNotFound,
+    WorkerInspectionPersistenceUnavailable,
+    WorkerInspectionRepository,
     WorkerRegistrationAuthorityRejected,
     WorkerRegistrationPersistenceUnavailable,
     WorkerRegistrationRecordConflict,
@@ -67,6 +77,18 @@ class ConflictingWorkerHeartbeatReplay(Exception):
 
 class WorkerHeartbeatServiceUnavailable(Exception):
     """Worker heartbeat persistence was unavailable."""
+
+
+class WorkerInspectionNotFoundError(Exception):
+    """The requested worker session does not exist."""
+
+
+class WorkerInspectionInvariantError(Exception):
+    """Required durable worker inspection facts are inconsistent."""
+
+
+class WorkerInspectionServiceUnavailable(Exception):
+    """Worker inspection persistence was unavailable."""
 
 
 class WorkerRegistrationService:
@@ -140,3 +162,70 @@ class WorkerHeartbeatService:
             raise ConflictingWorkerHeartbeatReplay from error
         except WorkerHeartbeatPersistenceUnavailable as error:
             raise WorkerHeartbeatServiceUnavailable from error
+
+
+class WorkerInspectionService:
+    def __init__(
+        self,
+        repository: WorkerInspectionRepository,
+        thresholds: WorkerHealthThresholds,
+    ) -> None:
+        self._repository = repository
+        self._thresholds = thresholds
+
+    @property
+    def thresholds(self) -> WorkerHealthThresholds:
+        return self._thresholds
+
+    async def get_session(
+        self, worker_session_id: UUID
+    ) -> InspectedWorkerSessionResource:
+        try:
+            return await self._repository.get_session(
+                worker_session_id, self._thresholds
+            )
+        except WorkerInspectionNotFound as error:
+            raise WorkerInspectionNotFoundError from error
+        except WorkerInspectionInvariantViolation as error:
+            raise WorkerInspectionInvariantError from error
+        except WorkerInspectionPersistenceUnavailable as error:
+            raise WorkerInspectionServiceUnavailable from error
+
+    async def list_sessions(
+        self,
+        *,
+        worker_identity_id: UUID | None,
+        health_status: WorkerSessionHealthStatus | None,
+        limit: int,
+        cursor: WorkerSessionPageCursor | None,
+    ) -> InspectedWorkerSessionPage:
+        try:
+            return await self._repository.list_sessions(
+                worker_identity_id=worker_identity_id,
+                health_status=health_status,
+                thresholds=self._thresholds,
+                limit=limit,
+                cursor=cursor,
+            )
+        except WorkerInspectionInvariantViolation as error:
+            raise WorkerInspectionInvariantError from error
+        except WorkerInspectionPersistenceUnavailable as error:
+            raise WorkerInspectionServiceUnavailable from error
+
+    async def list_heartbeats(
+        self,
+        worker_session_id: UUID,
+        *,
+        before_sequence: int | None,
+        limit: int,
+    ) -> InspectedWorkerHeartbeatPage:
+        try:
+            return await self._repository.list_heartbeats(
+                worker_session_id,
+                before_sequence=before_sequence,
+                limit=limit,
+            )
+        except WorkerInspectionNotFound as error:
+            raise WorkerInspectionNotFoundError from error
+        except WorkerInspectionPersistenceUnavailable as error:
+            raise WorkerInspectionServiceUnavailable from error

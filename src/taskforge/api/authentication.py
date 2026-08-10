@@ -33,12 +33,18 @@ from taskforge.persistence.principals import SQLAlchemyPrincipalProfileRepositor
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.persistence.workers import (
     SQLAlchemyWorkerHeartbeatRepository,
+    SQLAlchemyWorkerInspectionRepository,
     SQLAlchemyWorkerRegistrationRepository,
 )
 from taskforge.persistence.workflows import SQLAlchemyWorkflowRepository
 from taskforge.runs.service import WorkflowRunService
 from taskforge.settings import Settings
-from taskforge.worker.service import WorkerHeartbeatService, WorkerRegistrationService
+from taskforge.worker.domain import WorkerHealthThresholds
+from taskforge.worker.service import (
+    WorkerHeartbeatService,
+    WorkerInspectionService,
+    WorkerRegistrationService,
+)
 from taskforge.workflows.service import WorkflowService
 from taskforge.workflows.task_types import TaskTypeRegistry
 
@@ -70,6 +76,7 @@ class AuthenticationRuntime:
         task_type_registry: TaskTypeRegistry,
         worker_registration_service: WorkerRegistrationService,
         worker_heartbeat_service: WorkerHeartbeatService,
+        worker_inspection_service: WorkerInspectionService,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
@@ -81,6 +88,7 @@ class AuthenticationRuntime:
         self.task_type_registry = task_type_registry
         self.worker_registration_service = worker_registration_service
         self.worker_heartbeat_service = worker_heartbeat_service
+        self.worker_inspection_service = worker_inspection_service
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -125,6 +133,13 @@ def build_authentication_runtime(
         ),
         worker_heartbeat_service=WorkerHeartbeatService(
             SQLAlchemyWorkerHeartbeatRepository(sessions)
+        ),
+        worker_inspection_service=WorkerInspectionService(
+            SQLAlchemyWorkerInspectionRepository(sessions),
+            WorkerHealthThresholds(
+                settings.worker_stale_after_seconds,
+                settings.worker_offline_after_seconds,
+            ),
         ),
     )
 

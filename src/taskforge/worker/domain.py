@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from uuid import UUID
 
 from taskforge.capabilities import is_valid_capability_name
@@ -76,6 +77,95 @@ class WorkerHealthProjection:
             if value.tzinfo is None or value.utcoffset() is None:
                 raise ValueError("health timestamps must be timezone-aware")
             object.__setattr__(self, field, value.astimezone(UTC))
+
+
+class WorkerSessionHealthStatus(StrEnum):
+    HEALTHY = "healthy"
+    STALE = "stale"
+    OFFLINE = "offline"
+    ENDED = "ended"
+
+
+@dataclass(frozen=True)
+class WorkerHealthThresholds:
+    stale_after_seconds: int
+    offline_after_seconds: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.stale_after_seconds <= 3600:
+            raise ValueError("stale threshold is out of range")
+        if not 2 <= self.offline_after_seconds <= 86400:
+            raise ValueError("offline threshold is out of range")
+        if self.offline_after_seconds <= self.stale_after_seconds:
+            raise ValueError("offline threshold must exceed stale threshold")
+
+
+@dataclass(frozen=True)
+class InspectedWorkerIdentity:
+    id: UUID
+    name: str
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class InspectedWorkerHealth:
+    status: WorkerSessionHealthStatus
+    last_sequence: int
+    last_seen_at: datetime
+    accepting_work: bool
+    availability_changed_at: datetime
+
+
+@dataclass(frozen=True)
+class InspectedWorkerSession:
+    id: UUID
+    identity: InspectedWorkerIdentity
+    registered_at: datetime
+    ended_at: datetime | None
+    capabilities: tuple[str, ...]
+    health: InspectedWorkerHealth
+
+
+@dataclass(frozen=True)
+class WorkerInspectionObservation:
+    reference_time: datetime
+    thresholds: WorkerHealthThresholds
+
+
+@dataclass(frozen=True)
+class InspectedWorkerSessionResource:
+    session: InspectedWorkerSession
+    observation: WorkerInspectionObservation
+
+
+@dataclass(frozen=True)
+class WorkerSessionPageCursor:
+    reference_time: datetime
+    last_seen_at: datetime
+    worker_session_id: UUID
+    worker_identity_id: UUID | None
+    health_status: WorkerSessionHealthStatus | None
+    thresholds: WorkerHealthThresholds
+
+
+@dataclass(frozen=True)
+class InspectedWorkerSessionPage:
+    items: tuple[InspectedWorkerSession, ...]
+    observation: WorkerInspectionObservation
+    next_cursor: WorkerSessionPageCursor | None
+
+
+@dataclass(frozen=True)
+class InspectedWorkerHeartbeat:
+    sequence: int
+    received_at: datetime
+    accepting_work: bool
+
+
+@dataclass(frozen=True)
+class InspectedWorkerHeartbeatPage:
+    items: tuple[InspectedWorkerHeartbeat, ...]
+    next_before_sequence: int | None
 
 
 def validate_worker_registration(

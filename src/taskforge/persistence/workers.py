@@ -2,21 +2,35 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, insert, or_, select
+from sqlalchemy import DateTime, and_, case, cast, func, insert, literal, or_, select
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql import Select
 
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.schema import worker_credentials, worker_identities
 from taskforge.worker.domain import (
+    InspectedWorkerHealth,
+    InspectedWorkerHeartbeat,
+    InspectedWorkerHeartbeatPage,
+    InspectedWorkerIdentity,
+    InspectedWorkerSession,
+    InspectedWorkerSessionPage,
+    InspectedWorkerSessionResource,
     RegisteredWorkerSession,
     WorkerHealthProjection,
+    WorkerHealthThresholds,
     WorkerHeartbeat,
+    WorkerInspectionObservation,
     WorkerRegistration,
+    WorkerSessionHealthStatus,
+    WorkerSessionPageCursor,
 )
 from taskforge.worker.persistence_ports import (
     WorkerHeartbeatAuthorityRejected,
@@ -27,6 +41,9 @@ from taskforge.worker.persistence_ports import (
     WorkerHeartbeatSessionInactive,
     WorkerHeartbeatSessionUnavailable,
     WorkerHeartbeatStale,
+    WorkerInspectionInvariantViolation,
+    WorkerInspectionNotFound,
+    WorkerInspectionPersistenceUnavailable,
     WorkerRegistrationAuthorityRejected,
     WorkerRegistrationPersistenceUnavailable,
     WorkerRegistrationRecordConflict,
@@ -298,4 +315,256 @@ def _health_projection(row: Row[Any]) -> WorkerHealthProjection:
         row.last_seen_at,
         row.accepting_work,
         row.availability_changed_at,
+    )
+
+
+class SQLAlchemyWorkerInspectionRepository:
+    """Read worker inspection snapshots without acquiring write locks."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def get_session(
+        self, worker_session_id: UUID, thresholds: WorkerHealthThresholds
+    ) -> InspectedWorkerSessionResource:
+        try:
+            async with self._sessions() as session:
+                statement = _session_inspection_statement(
+                    thresholds, reference_time=None
+                ).where(worker_sessions.c.id == worker_session_id)
+                row = (await session.execute(statement)).one_or_none()
+                if row is None:
+                    exists = await session.scalar(
+                        select(worker_sessions.c.id).where(
+                            worker_sessions.c.id == worker_session_id
+                        )
+                    )
+                    if exists is not None:
+                        raise WorkerInspectionInvariantViolation
+                    raise WorkerInspectionNotFound
+                return InspectedWorkerSessionResource(
+                    _inspected_session(row),
+                    WorkerInspectionObservation(row.reference_time, thresholds),
+                )
+        except (WorkerInspectionInvariantViolation, WorkerInspectionNotFound):
+            raise
+        except DBAPIError as error:
+            raise WorkerInspectionPersistenceUnavailable from error
+
+    async def list_sessions(
+        self,
+        *,
+        worker_identity_id: UUID | None,
+        health_status: WorkerSessionHealthStatus | None,
+        thresholds: WorkerHealthThresholds,
+        limit: int,
+        cursor: WorkerSessionPageCursor | None,
+    ) -> InspectedWorkerSessionPage:
+        reference_time = cursor.reference_time if cursor is not None else None
+        try:
+            async with self._sessions() as session:
+                statement = _session_inspection_statement(
+                    thresholds, reference_time=reference_time
+                )
+                if worker_identity_id is not None:
+                    statement = statement.where(
+                        worker_sessions.c.worker_identity_id == worker_identity_id
+                    )
+                if health_status is not None:
+                    statement = statement.where(
+                        statement.selected_columns.health_status == health_status.value
+                    )
+                if cursor is not None:
+                    statement = statement.where(
+                        or_(
+                            worker_session_health.c.last_seen_at > cursor.last_seen_at,
+                            and_(
+                                worker_session_health.c.last_seen_at
+                                == cursor.last_seen_at,
+                                worker_sessions.c.id > cursor.worker_session_id,
+                            ),
+                        )
+                    )
+                rows = (
+                    await session.execute(
+                        statement.order_by(
+                            worker_session_health.c.last_seen_at,
+                            worker_sessions.c.id,
+                        ).limit(limit + 1)
+                    )
+                ).all()
+                page_rows = rows[:limit]
+                resolved_reference = (
+                    rows[0].reference_time
+                    if rows
+                    else await _resolve_reference_time(session, reference_time)
+                )
+                next_cursor = None
+                if len(rows) > limit:
+                    last = page_rows[-1]
+                    next_cursor = WorkerSessionPageCursor(
+                        resolved_reference,
+                        last.last_seen_at,
+                        last.worker_session_id,
+                        worker_identity_id,
+                        health_status,
+                        thresholds,
+                    )
+                return InspectedWorkerSessionPage(
+                    tuple(_inspected_session(row) for row in page_rows),
+                    WorkerInspectionObservation(resolved_reference, thresholds),
+                    next_cursor,
+                )
+        except WorkerInspectionInvariantViolation:
+            raise
+        except DBAPIError as error:
+            raise WorkerInspectionPersistenceUnavailable from error
+
+    async def list_heartbeats(
+        self,
+        worker_session_id: UUID,
+        *,
+        before_sequence: int | None,
+        limit: int,
+    ) -> InspectedWorkerHeartbeatPage:
+        try:
+            async with self._sessions() as session:
+                if not await session.scalar(
+                    select(worker_sessions.c.id).where(
+                        worker_sessions.c.id == worker_session_id
+                    )
+                ):
+                    raise WorkerInspectionNotFound
+                statement = select(worker_heartbeats).where(
+                    worker_heartbeats.c.worker_session_id == worker_session_id
+                )
+                if before_sequence is not None:
+                    statement = statement.where(
+                        worker_heartbeats.c.sequence < before_sequence
+                    )
+                rows = (
+                    await session.execute(
+                        statement.order_by(worker_heartbeats.c.sequence.desc()).limit(
+                            limit + 1
+                        )
+                    )
+                ).all()
+                page_rows = rows[:limit]
+                next_sequence = page_rows[-1].sequence if len(rows) > limit else None
+                return InspectedWorkerHeartbeatPage(
+                    tuple(
+                        InspectedWorkerHeartbeat(
+                            row.sequence, row.received_at, row.accepting_work
+                        )
+                        for row in page_rows
+                    ),
+                    next_sequence,
+                )
+        except WorkerInspectionNotFound:
+            raise
+        except DBAPIError as error:
+            raise WorkerInspectionPersistenceUnavailable from error
+
+
+def _session_inspection_statement(
+    thresholds: WorkerHealthThresholds,
+    *,
+    reference_time: datetime | None,
+) -> Select[Any]:
+    reference_expression = (
+        func.statement_timestamp()
+        if reference_time is None
+        else cast(literal(reference_time), DateTime(timezone=True))
+    )
+    context = select(reference_expression.label("reference_time")).cte(
+        "inspection_context"
+    )
+    status = case(
+        (
+            worker_sessions.c.ended_at.is_not(None),
+            WorkerSessionHealthStatus.ENDED.value,
+        ),
+        (
+            worker_session_health.c.last_seen_at
+            > context.c.reference_time
+            - func.make_interval(0, 0, 0, 0, 0, 0, thresholds.stale_after_seconds),
+            WorkerSessionHealthStatus.HEALTHY.value,
+        ),
+        (
+            worker_session_health.c.last_seen_at
+            > context.c.reference_time
+            - func.make_interval(0, 0, 0, 0, 0, 0, thresholds.offline_after_seconds),
+            WorkerSessionHealthStatus.STALE.value,
+        ),
+        else_=WorkerSessionHealthStatus.OFFLINE.value,
+    ).label("health_status")
+    capabilities = (
+        select(
+            func.array_agg(
+                aggregate_order_by(
+                    worker_session_capabilities.c.capability,
+                    worker_session_capabilities.c.capability,
+                )
+            )
+        )
+        .where(worker_session_capabilities.c.worker_session_id == worker_sessions.c.id)
+        .scalar_subquery()
+        .label("capabilities")
+    )
+    return select(
+        worker_sessions.c.id.label("worker_session_id"),
+        worker_sessions.c.registered_at,
+        worker_sessions.c.ended_at,
+        worker_identities.c.id.label("worker_identity_id"),
+        worker_identities.c.name.label("worker_identity_name"),
+        worker_identities.c.disabled_at,
+        worker_session_health.c.last_sequence,
+        worker_session_health.c.last_seen_at,
+        worker_session_health.c.accepting_work,
+        worker_session_health.c.availability_changed_at,
+        capabilities,
+        status,
+        context.c.reference_time,
+    ).select_from(
+        worker_sessions.join(
+            worker_identities,
+            worker_identities.c.id == worker_sessions.c.worker_identity_id,
+        )
+        .join(
+            worker_session_health,
+            worker_session_health.c.worker_session_id == worker_sessions.c.id,
+        )
+        .join(context, literal(True))
+    )
+
+
+async def _resolve_reference_time(
+    session: AsyncSession, reference_time: datetime | None
+) -> datetime:
+    if reference_time is not None:
+        return reference_time
+    resolved = (await session.execute(select(func.statement_timestamp()))).scalar_one()
+    if not isinstance(resolved, datetime):
+        raise WorkerInspectionInvariantViolation
+    return resolved
+
+
+def _inspected_session(row: Row[Any]) -> InspectedWorkerSession:
+    return InspectedWorkerSession(
+        row.worker_session_id,
+        InspectedWorkerIdentity(
+            row.worker_identity_id,
+            row.worker_identity_name,
+            row.disabled_at is None,
+        ),
+        row.registered_at,
+        row.ended_at,
+        tuple(row.capabilities or ()),
+        InspectedWorkerHealth(
+            WorkerSessionHealthStatus(row.health_status),
+            row.last_sequence,
+            row.last_seen_at,
+            row.accepting_work,
+            row.availability_changed_at,
+        ),
     )

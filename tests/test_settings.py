@@ -49,6 +49,8 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.authentication_timeout_seconds == 2.0
     assert settings.database_pool_size == 5
     assert settings.database_pool_timeout_seconds == 2.0
+    assert settings.worker_stale_after_seconds == 30
+    assert settings.worker_offline_after_seconds == 120
     assert settings.postgres_host == "127.0.0.1"
     assert settings.postgres_port == 5432
     assert settings.rabbitmq_host == "127.0.0.1"
@@ -190,6 +192,16 @@ def test_settings_require_distinct_topology_exchange_names(
 ) -> None:
     monkeypatch.setenv("TASKFORGE_RABBITMQ_DISPATCH_EXCHANGE_NAME", "same.exchange")
     monkeypatch.setenv("TASKFORGE_RABBITMQ_MALFORMED_EXCHANGE_NAME", "same.exchange")
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_settings_require_ordered_worker_health_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_WORKER_STALE_AFTER_SECONDS", "30")
+    monkeypatch.setenv("TASKFORGE_WORKER_OFFLINE_AFTER_SECONDS", "30")
 
     with pytest.raises(ValidationError):
         Settings()

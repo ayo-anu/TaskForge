@@ -7,10 +7,16 @@ from uuid import UUID
 
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.worker.domain import (
+    InspectedWorkerHeartbeatPage,
+    InspectedWorkerSessionPage,
+    InspectedWorkerSessionResource,
     RegisteredWorkerSession,
     WorkerHealthProjection,
+    WorkerHealthThresholds,
     WorkerHeartbeat,
     WorkerRegistration,
+    WorkerSessionHealthStatus,
+    WorkerSessionPageCursor,
 )
 
 
@@ -76,3 +82,39 @@ class WorkerHeartbeatRepository(Protocol):
         heartbeat: WorkerHeartbeat,
     ) -> WorkerHealthProjection:
         """Apply or replay one heartbeat in a repository-owned transaction."""
+
+
+class WorkerInspectionNotFound(Exception):
+    """The inspected worker session does not exist."""
+
+
+class WorkerInspectionInvariantViolation(Exception):
+    """Required durable session and health facts disagree."""
+
+
+class WorkerInspectionPersistenceUnavailable(Exception):
+    """Worker inspection persistence was operationally unavailable."""
+
+
+class WorkerInspectionRepository(Protocol):
+    async def get_session(
+        self, worker_session_id: UUID, thresholds: WorkerHealthThresholds
+    ) -> InspectedWorkerSessionResource: ...
+
+    async def list_sessions(
+        self,
+        *,
+        worker_identity_id: UUID | None,
+        health_status: WorkerSessionHealthStatus | None,
+        thresholds: WorkerHealthThresholds,
+        limit: int,
+        cursor: WorkerSessionPageCursor | None,
+    ) -> InspectedWorkerSessionPage: ...
+
+    async def list_heartbeats(
+        self,
+        worker_session_id: UUID,
+        *,
+        before_sequence: int | None,
+        limit: int,
+    ) -> InspectedWorkerHeartbeatPage: ...

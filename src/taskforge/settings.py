@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     authentication_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
     database_pool_size: int = Field(default=5, ge=1, le=20)
     database_pool_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    worker_stale_after_seconds: int = Field(default=30, ge=1, le=3600)
+    worker_offline_after_seconds: int = Field(default=120, ge=2, le=86400)
 
     postgres_host: str = Field(
         default="127.0.0.1",
@@ -110,4 +112,10 @@ class Settings(BaseSettings):
             raise ValueError("RabbitMQ topology names cannot use the reserved prefix")
         if names[0] == names[1]:
             raise ValueError("RabbitMQ topology exchange names must be distinct")
+        return self
+
+    @model_validator(mode="after")
+    def validate_worker_health_thresholds(self) -> Settings:
+        if self.worker_offline_after_seconds <= self.worker_stale_after_seconds:
+            raise ValueError("worker offline threshold must exceed stale threshold")
         return self
