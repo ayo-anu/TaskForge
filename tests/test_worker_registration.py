@@ -82,6 +82,13 @@ def test_registration_accepts_empty_and_canonicalizes_known_capabilities() -> No
     ).capabilities == ("documents", "notifications.email")
 
 
+def test_registration_domain_rejects_empty_issues_and_naive_timestamp() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        InvalidWorkerRegistration(())
+    with pytest.raises(ValueError, match="timezone-aware"):
+        RegisteredWorkerSession(uuid4(), datetime.now(), ())
+
+
 def test_registration_rejects_duplicates_malformed_unknown_and_over_limit() -> None:
     known = registry().required_capabilities
     cases = (

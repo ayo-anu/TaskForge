@@ -9,6 +9,7 @@ from uuid import UUID
 from taskforge.capabilities import is_valid_capability_name
 
 MAX_WORKER_CAPABILITIES = 128
+MAX_HEARTBEAT_SEQUENCE = 9_223_372_036_854_775_807
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,40 @@ class RegisteredWorkerSession:
         if self.registered_at.tzinfo is None or self.registered_at.utcoffset() is None:
             raise ValueError("registration timestamp must be timezone-aware")
         object.__setattr__(self, "registered_at", self.registered_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class WorkerHeartbeat:
+    sequence: int
+    accepting_work: bool
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.sequence, bool)
+            or self.sequence < 1
+            or self.sequence > MAX_HEARTBEAT_SEQUENCE
+        ):
+            raise ValueError("heartbeat sequence must be a positive BIGINT")
+        if not isinstance(self.accepting_work, bool):
+            raise ValueError("heartbeat availability must be boolean")
+
+
+@dataclass(frozen=True)
+class WorkerHealthProjection:
+    worker_session_id: UUID
+    last_sequence: int
+    last_seen_at: datetime
+    accepting_work: bool
+    availability_changed_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.last_sequence < 0:
+            raise ValueError("health sequence must be nonnegative")
+        for field in ("last_seen_at", "availability_changed_at"):
+            value = getattr(self, field)
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("health timestamps must be timezone-aware")
+            object.__setattr__(self, field, value.astimezone(UTC))
 
 
 def validate_worker_registration(
