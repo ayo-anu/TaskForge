@@ -51,6 +51,7 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.database_pool_timeout_seconds == 2.0
     assert settings.worker_stale_after_seconds == 30
     assert settings.worker_offline_after_seconds == 120
+    assert settings.task_claim_lease_seconds == 60
     assert settings.postgres_host == "127.0.0.1"
     assert settings.postgres_port == 5432
     assert settings.rabbitmq_host == "127.0.0.1"
@@ -174,6 +175,7 @@ def test_dependency_passwords_are_redacted() -> None:
         ("TASKFORGE_RABBITMQ_TOPOLOGY_TIMEOUT_SECONDS", "0"),
         ("TASKFORGE_RABBITMQ_DISPATCH_EXCHANGE_NAME", "amq.reserved"),
         ("TASKFORGE_RABBITMQ_MALFORMED_EXCHANGE_NAME", "Invalid Name"),
+        ("TASKFORGE_TASK_CLAIM_LEASE_SECONDS", "0"),
     ),
 )
 def test_settings_reject_invalid_runtime_values(

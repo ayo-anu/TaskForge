@@ -45,6 +45,7 @@ from taskforge.worker.domain import (
     WorkerSessionHealthStatus,
     WorkerSessionPageCursor,
 )
+from taskforge.worker.health import worker_session_is_healthy
 from taskforge.worker.persistence_ports import (
     WorkerCapabilityAuthorityRejected,
     WorkerCapabilityInvariantViolation,
@@ -633,9 +634,11 @@ def _session_inspection_statement(
             WorkerSessionHealthStatus.ENDED.value,
         ),
         (
-            worker_session_health.c.last_seen_at
-            > context.c.reference_time
-            - func.make_interval(0, 0, 0, 0, 0, 0, thresholds.stale_after_seconds),
+            worker_session_is_healthy(
+                worker_session_health.c.last_seen_at,
+                stale_after_seconds=thresholds.stale_after_seconds,
+                reference_time=context.c.reference_time,
+            ),
             WorkerSessionHealthStatus.HEALTHY.value,
         ),
         (

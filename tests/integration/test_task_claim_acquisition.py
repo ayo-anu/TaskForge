@@ -1,0 +1,773 @@
+"""Real PostgreSQL task claim acquisition and concurrency verification."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from contextlib import suppress
+from dataclasses import dataclass
+from uuid import UUID, uuid4
+
+import asyncpg
+import pytest
+from alembic import command
+from alembic.config import Config
+from sqlalchemy.engine import URL
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from taskforge.claims.domain import TaskClaimOutcome, TaskClaimResult
+from taskforge.claims.persistence_ports import (
+    TaskClaimAlreadyOwned,
+    TaskClaimAttemptStale,
+    TaskClaimAuthorityRejected,
+    TaskClaimCapabilityMismatch,
+    TaskClaimPersistenceUnavailable,
+    TaskClaimSessionInactive,
+    TaskClaimWorkerUnavailable,
+)
+from taskforge.dispatch.envelope import (
+    DispatchEnvelope,
+    create_dispatch_envelope,
+    dispatch_envelope_to_mapping,
+)
+from taskforge.dispatch.persistence_ports import NewTaskAttempt, NewTaskDispatchOutbox
+from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
+from taskforge.persistence.database import build_session_factory
+from taskforge.persistence.dispatch import SQLAlchemyTaskDispatchRepository
+from tests.integration.postgresql import (
+    asyncpg_dsn,
+    migration_database_url,
+    temporary_database,
+)
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        os.getenv("TASKFORGE_RUN_CLAIM_INTEGRATION") != "1",
+        reason="set TASKFORGE_RUN_CLAIM_INTEGRATION=1 explicitly",
+    ),
+]
+
+
+@dataclass(frozen=True)
+class WorkerFacts:
+    authenticated: AuthenticatedWorker
+    session_id: UUID
+
+
+async def add_worker(
+    connection: asyncpg.Connection[asyncpg.Record],
+    *,
+    capability: str = "test-capability",
+) -> WorkerFacts:
+    identity_id, credential_id, session_id = uuid4(), uuid4(), uuid4()
+    await connection.execute(
+        "INSERT INTO worker_identities (id, name) VALUES ($1, $2)",
+        identity_id,
+        f"claim-worker-{uuid4().hex}",
+    )
+    await connection.execute(
+        "INSERT INTO worker_credentials "
+        "(id, worker_identity_id, credential_verifier) VALUES ($1, $2, 'unused')",
+        credential_id,
+        identity_id,
+    )
+    registered_at = await connection.fetchval(
+        "INSERT INTO worker_sessions (id, worker_identity_id) VALUES ($1, $2) "
+        "RETURNING registered_at",
+        session_id,
+        identity_id,
+    )
+    await connection.execute(
+        "INSERT INTO worker_session_health "
+        "(worker_session_id, last_seen_at, accepting_work, availability_changed_at) "
+        "VALUES ($1, $2, true, $2)",
+        session_id,
+        registered_at,
+    )
+    await connection.execute(
+        "INSERT INTO worker_session_capabilities (worker_session_id, capability) "
+        "VALUES ($1, $2)",
+        session_id,
+        capability,
+    )
+    return WorkerFacts(AuthenticatedWorker(identity_id, credential_id), session_id)
+
+
+async def add_dispatched_task(
+    connection: asyncpg.Connection[asyncpg.Record],
+    *,
+    status: str = "dispatched",
+    attempt_number: int = 1,
+    persist_dispatch: bool = True,
+) -> DispatchEnvelope:
+    principal_id, workflow_id, version_id, run_id = (
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        uuid4(),
+    )
+    task_id, attempt_id, dispatch_id = uuid4(), uuid4(), uuid4()
+    await connection.execute(
+        "INSERT INTO api_principals (id, name) VALUES ($1, $2)",
+        principal_id,
+        f"claim-owner-{uuid4().hex}",
+    )
+    await connection.execute(
+        "INSERT INTO workflow_definitions (id, owner_principal_id, name) "
+        "VALUES ($1, $2, $3)",
+        workflow_id,
+        principal_id,
+        f"claim-workflow-{uuid4().hex}",
+    )
+    await connection.execute(
+        "INSERT INTO workflow_versions "
+        "(id, workflow_definition_id, version_number, name) VALUES ($1, $2, 1, 'v1')",
+        version_id,
+        workflow_id,
+    )
+    await connection.execute(
+        "INSERT INTO workflow_version_steps "
+        "(workflow_version_id, step_identifier, task_type, parameters) "
+        "VALUES ($1, 'step', 'test.task', '{}'::jsonb)",
+        version_id,
+    )
+    await connection.execute(
+        "INSERT INTO workflow_runs "
+        "(id, workflow_definition_id, workflow_version_id, "
+        "requested_by_principal_id, status) VALUES ($1, $2, $3, $4, 'running')",
+        run_id,
+        workflow_id,
+        version_id,
+        principal_id,
+    )
+    await connection.execute(
+        "INSERT INTO task_runs "
+        "(id, workflow_run_id, workflow_version_id, step_identifier, status) "
+        "VALUES ($1, $2, $3, 'step', $4)",
+        task_id,
+        run_id,
+        version_id,
+        status,
+    )
+    envelope = create_dispatch_envelope(
+        dispatch_id=dispatch_id,
+        task_attempt_id=attempt_id,
+        task_run_id=task_id,
+        workflow_run_id=run_id,
+        attempt_number=attempt_number,
+        task_type="test.task",
+        required_capability="test-capability",
+        task_payload={},
+        references={},
+    )
+    if persist_dispatch:
+        await connection.execute(
+            "INSERT INTO task_attempts (id, task_run_id, attempt_number) "
+            "VALUES ($1, $2, $3)",
+            attempt_id,
+            task_id,
+            attempt_number,
+        )
+        await connection.execute(
+            "INSERT INTO task_dispatch_outbox (id, task_attempt_id, route, payload) "
+            "VALUES ($1, $2, $3, $4::jsonb)",
+            dispatch_id,
+            attempt_id,
+            envelope.route,
+            json.dumps(dispatch_envelope_to_mapping(envelope)),
+        )
+    return envelope
+
+
+async def wait_for_lock_waiter(
+    observer: asyncpg.Connection[asyncpg.Record], *, minimum: int = 1
+) -> None:
+    for _ in range(200):
+        count = await observer.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+            "AND pid <> pg_backend_pid() AND wait_event_type = 'Lock'"
+        )
+        if count >= minimum:
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail("expected PostgreSQL lock waiter was not observed")
+
+
+async def run_serialized_claim_race(
+    database_url: URL,
+    repository: SQLAlchemyTaskClaimRepository,
+    dispatch: DispatchEnvelope,
+    contenders: tuple[WorkerFacts, WorkerFacts],
+) -> tuple[TaskClaimResult | BaseException, TaskClaimResult | BaseException]:
+    blocker = await asyncpg.connect(asyncpg_dsn(database_url))
+    observer = await asyncpg.connect(asyncpg_dsn(database_url))
+    transaction = blocker.transaction()
+    await transaction.start()
+    pending: (
+        tuple[asyncio.Task[TaskClaimResult], asyncio.Task[TaskClaimResult]] | None
+    ) = None
+    try:
+        await blocker.execute(
+            "SELECT id FROM task_runs WHERE id = $1 FOR UPDATE", dispatch.task_run_id
+        )
+        pending = (
+            asyncio.create_task(
+                repository.acquire_claim(
+                    contenders[0].authenticated,
+                    contenders[0].session_id,
+                    dispatch,
+                    lease_seconds=60,
+                )
+            ),
+            asyncio.create_task(
+                repository.acquire_claim(
+                    contenders[1].authenticated,
+                    contenders[1].session_id,
+                    dispatch,
+                    lease_seconds=60,
+                )
+            ),
+        )
+        await wait_for_lock_waiter(observer, minimum=2)
+        await transaction.commit()
+        first, second = await asyncio.gather(*pending, return_exceptions=True)
+        return first, second
+    finally:
+        if pending is not None:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+        if blocker.is_in_transaction():
+            await transaction.rollback()
+        await blocker.close()
+        await observer.close()
+
+
+async def exercise_claim_acquisition(database_url: URL) -> None:
+    dsn = asyncpg_dsn(database_url)
+    setup = await asyncpg.connect(dsn)
+    engine = create_async_engine(
+        database_url.set(drivername="postgresql+asyncpg").render_as_string(
+            hide_password=False
+        )
+    )
+    repository = SQLAlchemyTaskClaimRepository(
+        build_session_factory(engine), worker_stale_after_seconds=30
+    )
+    try:
+        first_worker = await add_worker(setup)
+        second_worker = await add_worker(setup)
+        dispatch = await add_dispatched_task(setup)
+
+        first, second = await run_serialized_claim_race(
+            database_url,
+            repository,
+            dispatch,
+            (first_worker, second_worker),
+        )
+        results = (first, second)
+        assert (
+            sum(
+                getattr(result, "outcome", None) is TaskClaimOutcome.ACQUIRED_ACTIVE
+                for result in results
+            )
+            == 1
+        )
+        assert sum(isinstance(result, TaskClaimAlreadyOwned) for result in results) == 1
+        winner = first_worker if not isinstance(first, Exception) else second_worker
+
+        await setup.execute(
+            "UPDATE worker_session_health SET accepting_work = false, "
+            "last_seen_at = statement_timestamp() - interval '1 hour', "
+            "availability_changed_at = statement_timestamp() - interval '1 hour' "
+            "WHERE worker_session_id = $1",
+            winner.session_id,
+        )
+        await setup.execute(
+            "DELETE FROM worker_session_capabilities WHERE worker_session_id = $1",
+            winner.session_id,
+        )
+        replay = await repository.acquire_claim(
+            winner.authenticated, winner.session_id, dispatch, lease_seconds=60
+        )
+        assert replay.outcome is TaskClaimOutcome.REPLAYED_ACTIVE
+        original = next(
+            result for result in results if not isinstance(result, Exception)
+        )
+        assert isinstance(original, TaskClaimResult)
+        assert replay.claim == original.claim
+
+        await setup.execute(
+            "UPDATE task_attempt_claims SET lease_expires_at = acquired_at + "
+            "interval '1 microsecond' WHERE task_attempt_id = $1",
+            dispatch.task_attempt_id,
+        )
+        expired = await repository.acquire_claim(
+            winner.authenticated, winner.session_id, dispatch, lease_seconds=60
+        )
+        assert expired.outcome is TaskClaimOutcome.REPLAYED_EXPIRED
+        assert expired.claim.generation == original.claim.generation
+
+        duplicate_dispatch = await add_dispatched_task(setup)
+        duplicate_worker = await add_worker(setup)
+        duplicate_results = await run_serialized_claim_race(
+            database_url,
+            repository,
+            duplicate_dispatch,
+            (duplicate_worker, duplicate_worker),
+        )
+        duplicate_first, duplicate_second = duplicate_results
+        assert isinstance(duplicate_first, TaskClaimResult)
+        assert isinstance(duplicate_second, TaskClaimResult)
+        assert {duplicate_first.outcome, duplicate_second.outcome} == {
+            TaskClaimOutcome.ACQUIRED_ACTIVE,
+            TaskClaimOutcome.REPLAYED_ACTIVE,
+        }
+        assert duplicate_first.claim == duplicate_second.claim
+
+        history_dispatch = await add_dispatched_task(setup)
+        history_worker = await add_worker(setup)
+        history_contender = await add_worker(setup)
+        await setup.execute(
+            "INSERT INTO task_attempt_claims "
+            "(task_attempt_id, generation, worker_session_id, lease_expires_at, "
+            "terminated_at) VALUES ($1, 7, $2, statement_timestamp() + "
+            "interval '1 minute', statement_timestamp())",
+            history_dispatch.task_attempt_id,
+            history_worker.session_id,
+        )
+        history_results = await run_serialized_claim_race(
+            database_url,
+            repository,
+            history_dispatch,
+            (history_worker, history_contender),
+        )
+        history_result = next(
+            result for result in history_results if isinstance(result, TaskClaimResult)
+        )
+        assert history_result.claim.generation == 8
+        assert (
+            sum(isinstance(result, TaskClaimAlreadyOwned) for result in history_results)
+            == 1
+        )
+
+        unavailable_dispatch = await add_dispatched_task(setup)
+        unavailable_worker = await add_worker(setup)
+        await setup.execute(
+            "UPDATE worker_session_health SET accepting_work = false "
+            "WHERE worker_session_id = $1",
+            unavailable_worker.session_id,
+        )
+        with pytest.raises(TaskClaimWorkerUnavailable):
+            await repository.acquire_claim(
+                unavailable_worker.authenticated,
+                unavailable_worker.session_id,
+                unavailable_dispatch,
+                lease_seconds=60,
+            )
+        assert not await setup.fetchval(
+            "SELECT EXISTS (SELECT FROM task_attempt_claims WHERE task_attempt_id = $1)",
+            unavailable_dispatch.task_attempt_id,
+        )
+
+        stale_dispatch = await add_dispatched_task(setup)
+        await setup.execute(
+            "INSERT INTO task_attempts (id, task_run_id, attempt_number) "
+            "VALUES ($1, $2, 2)",
+            uuid4(),
+            stale_dispatch.task_run_id,
+        )
+        with pytest.raises(TaskClaimAttemptStale):
+            await repository.acquire_claim(
+                history_worker.authenticated,
+                history_worker.session_id,
+                stale_dispatch,
+                lease_seconds=60,
+            )
+
+        await exercise_authority_lifecycle(setup, repository, database_url)
+        await exercise_health_mutation_race(setup, repository, database_url)
+
+        rollback_dispatch = await add_dispatched_task(setup)
+        rollback_worker = await add_worker(setup)
+        await setup.execute(
+            "CREATE FUNCTION reject_claimed_transition() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = '"
+            + str(rollback_dispatch.task_run_id)
+            + "'::uuid AND NEW.status = 'claimed' THEN RAISE EXCEPTION "
+            "'forced claim rollback'; END IF; RETURN NEW; END $$"
+        )
+        await setup.execute(
+            "CREATE TRIGGER reject_claimed_transition_trigger BEFORE UPDATE ON "
+            "task_runs FOR EACH ROW EXECUTE FUNCTION reject_claimed_transition()"
+        )
+        with pytest.raises(TaskClaimPersistenceUnavailable):
+            await repository.acquire_claim(
+                rollback_worker.authenticated,
+                rollback_worker.session_id,
+                rollback_dispatch,
+                lease_seconds=60,
+            )
+        assert not await setup.fetchval(
+            "SELECT EXISTS (SELECT FROM task_attempt_claims WHERE task_attempt_id = $1)",
+            rollback_dispatch.task_attempt_id,
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT status::text FROM task_runs WHERE id = $1",
+                rollback_dispatch.task_run_id,
+            )
+            == "dispatched"
+        )
+        await setup.execute(
+            "DROP TRIGGER reject_claimed_transition_trigger ON task_runs"
+        )
+        await setup.execute("DROP FUNCTION reject_claimed_transition()")
+
+        await exercise_session_and_capability_races(setup, repository, database_url)
+        await exercise_dispatch_and_independent_races(setup, repository, database_url)
+    finally:
+        await setup.close()
+        await engine.dispose()
+
+
+async def exercise_session_and_capability_races(
+    setup: asyncpg.Connection[asyncpg.Record],
+    repository: SQLAlchemyTaskClaimRepository,
+    database_url: URL,
+) -> None:
+    for terminate in (True, False):
+        worker = await add_worker(setup)
+        dispatch = await add_dispatched_task(setup)
+        blocker = await asyncpg.connect(asyncpg_dsn(database_url))
+        observer = await asyncpg.connect(asyncpg_dsn(database_url))
+        transaction = blocker.transaction()
+        await transaction.start()
+        pending: asyncio.Task[TaskClaimResult] | None = None
+        try:
+            await blocker.execute(
+                "SELECT id FROM worker_sessions WHERE id = $1 FOR NO KEY UPDATE",
+                worker.session_id,
+            )
+            pending = asyncio.create_task(
+                repository.acquire_claim(
+                    worker.authenticated,
+                    worker.session_id,
+                    dispatch,
+                    lease_seconds=60,
+                )
+            )
+            await wait_for_lock_waiter(observer)
+            if terminate:
+                await blocker.execute(
+                    "UPDATE worker_sessions SET ended_at = statement_timestamp() "
+                    "WHERE id = $1",
+                    worker.session_id,
+                )
+            else:
+                await blocker.execute(
+                    "DELETE FROM worker_session_capabilities "
+                    "WHERE worker_session_id = $1",
+                    worker.session_id,
+                )
+            await transaction.commit()
+            expected = (
+                TaskClaimSessionInactive if terminate else TaskClaimCapabilityMismatch
+            )
+            with pytest.raises(expected):
+                await pending
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pending
+            if blocker.is_in_transaction():
+                await transaction.rollback()
+            await blocker.close()
+            await observer.close()
+
+
+async def exercise_authority_lifecycle(
+    setup: asyncpg.Connection[asyncpg.Record],
+    repository: SQLAlchemyTaskClaimRepository,
+    database_url: URL,
+) -> None:
+    disabled_worker = await add_worker(setup)
+    disabled_dispatch = await add_dispatched_task(setup)
+    await setup.execute(
+        "UPDATE worker_identities SET disabled_at = statement_timestamp() WHERE id = $1",
+        disabled_worker.authenticated.worker_identity_id,
+    )
+    with pytest.raises(TaskClaimAuthorityRejected):
+        await repository.acquire_claim(
+            disabled_worker.authenticated,
+            disabled_worker.session_id,
+            disabled_dispatch,
+            lease_seconds=60,
+        )
+
+    revoked_worker = await add_worker(setup)
+    revoked_dispatch = await add_dispatched_task(setup)
+    await setup.execute(
+        "UPDATE worker_credentials SET revoked_at = statement_timestamp() WHERE id = $1",
+        revoked_worker.authenticated.credential_id,
+    )
+    with pytest.raises(TaskClaimAuthorityRejected):
+        await repository.acquire_claim(
+            revoked_worker.authenticated,
+            revoked_worker.session_id,
+            revoked_dispatch,
+            lease_seconds=60,
+        )
+
+    expired_worker = await add_worker(setup)
+    expired_dispatch = await add_dispatched_task(setup)
+    await setup.execute(
+        "UPDATE worker_credentials SET "
+        "created_at = statement_timestamp() - interval '2 seconds', "
+        "expires_at = statement_timestamp() - interval '1 second' WHERE id = $1",
+        expired_worker.authenticated.credential_id,
+    )
+    with pytest.raises(TaskClaimAuthorityRejected):
+        await repository.acquire_claim(
+            expired_worker.authenticated,
+            expired_worker.session_id,
+            expired_dispatch,
+            lease_seconds=60,
+        )
+
+    replay_worker = await add_worker(setup)
+    replay_dispatch = await add_dispatched_task(setup)
+    acquired = await repository.acquire_claim(
+        replay_worker.authenticated,
+        replay_worker.session_id,
+        replay_dispatch,
+        lease_seconds=60,
+    )
+    assert acquired.outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
+    await setup.execute(
+        "UPDATE worker_identities SET disabled_at = statement_timestamp() WHERE id = $1",
+        replay_worker.authenticated.worker_identity_id,
+    )
+    with pytest.raises(TaskClaimAuthorityRejected):
+        await repository.acquire_claim(
+            replay_worker.authenticated,
+            replay_worker.session_id,
+            replay_dispatch,
+            lease_seconds=60,
+        )
+
+    racing_worker = await add_worker(setup)
+    racing_dispatch = await add_dispatched_task(setup)
+    blocker = await asyncpg.connect(asyncpg_dsn(database_url))
+    observer = await asyncpg.connect(asyncpg_dsn(database_url))
+    transaction = blocker.transaction()
+    await transaction.start()
+    pending: asyncio.Task[TaskClaimResult] | None = None
+    try:
+        await blocker.execute(
+            "SELECT id FROM worker_identities WHERE id = $1 FOR UPDATE",
+            racing_worker.authenticated.worker_identity_id,
+        )
+        pending = asyncio.create_task(
+            repository.acquire_claim(
+                racing_worker.authenticated,
+                racing_worker.session_id,
+                racing_dispatch,
+                lease_seconds=60,
+            )
+        )
+        await wait_for_lock_waiter(observer)
+        await blocker.execute(
+            "UPDATE worker_identities SET disabled_at = statement_timestamp() "
+            "WHERE id = $1",
+            racing_worker.authenticated.worker_identity_id,
+        )
+        await transaction.commit()
+        with pytest.raises(TaskClaimAuthorityRejected):
+            await pending
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+        if blocker.is_in_transaction():
+            await transaction.rollback()
+        await blocker.close()
+        await observer.close()
+
+
+async def exercise_health_mutation_race(
+    setup: asyncpg.Connection[asyncpg.Record],
+    repository: SQLAlchemyTaskClaimRepository,
+    database_url: URL,
+) -> None:
+    worker = await add_worker(setup)
+    dispatch = await add_dispatched_task(setup)
+    blocker = await asyncpg.connect(asyncpg_dsn(database_url))
+    observer = await asyncpg.connect(asyncpg_dsn(database_url))
+    transaction = blocker.transaction()
+    await transaction.start()
+    pending: asyncio.Task[TaskClaimResult] | None = None
+    try:
+        await blocker.execute(
+            "SELECT worker_session_id FROM worker_session_health "
+            "WHERE worker_session_id = $1 FOR UPDATE",
+            worker.session_id,
+        )
+        pending = asyncio.create_task(
+            repository.acquire_claim(
+                worker.authenticated,
+                worker.session_id,
+                dispatch,
+                lease_seconds=60,
+            )
+        )
+        await wait_for_lock_waiter(observer)
+        await blocker.execute(
+            "UPDATE worker_session_health SET accepting_work = false, "
+            "last_seen_at = statement_timestamp(), "
+            "availability_changed_at = statement_timestamp() WHERE worker_session_id = $1",
+            worker.session_id,
+        )
+        await transaction.commit()
+        with pytest.raises(TaskClaimWorkerUnavailable):
+            await pending
+        assert not await setup.fetchval(
+            "SELECT EXISTS (SELECT FROM task_attempt_claims WHERE task_attempt_id = $1)",
+            dispatch.task_attempt_id,
+        )
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+        if blocker.is_in_transaction():
+            await transaction.rollback()
+        await blocker.close()
+        await observer.close()
+
+
+async def exercise_dispatch_and_independent_races(
+    setup: asyncpg.Connection[asyncpg.Record],
+    repository: SQLAlchemyTaskClaimRepository,
+    database_url: URL,
+) -> None:
+    worker = await add_worker(setup)
+    dispatch = await add_dispatched_task(
+        setup, status="runnable", persist_dispatch=False
+    )
+    engine = create_async_engine(
+        database_url.set(drivername="postgresql+asyncpg").render_as_string(
+            hide_password=False
+        )
+    )
+    dispatch_repository = SQLAlchemyTaskDispatchRepository(
+        build_session_factory(engine)
+    )
+    observer = await asyncpg.connect(asyncpg_dsn(database_url))
+    pending: asyncio.Task[TaskClaimResult] | None = None
+    try:
+        async with dispatch_repository.dispatch_transaction() as transaction:
+            prepared = await transaction.prepare_dispatch(
+                dispatch.workflow_run_id, dispatch.task_run_id
+            )
+            assert prepared is not None
+            await transaction.persist_dispatch(
+                prepared,
+                NewTaskAttempt(
+                    dispatch.task_attempt_id,
+                    dispatch.task_run_id,
+                    dispatch.attempt_number,
+                ),
+                NewTaskDispatchOutbox(
+                    dispatch.dispatch_id,
+                    dispatch.task_attempt_id,
+                    dispatch.route,
+                    dispatch_envelope_to_mapping(dispatch),
+                ),
+            )
+            pending = asyncio.create_task(
+                repository.acquire_claim(
+                    worker.authenticated,
+                    worker.session_id,
+                    dispatch,
+                    lease_seconds=60,
+                )
+            )
+            await wait_for_lock_waiter(observer)
+            assert not await setup.fetchval(
+                "SELECT EXISTS (SELECT FROM task_attempts WHERE id = $1)",
+                dispatch.task_attempt_id,
+            )
+            await transaction.commit()
+        assert pending is not None
+        assert (await pending).outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+        await observer.close()
+        await engine.dispose()
+
+    blocked_dispatch = await add_dispatched_task(setup)
+    free_dispatch = await add_dispatched_task(setup)
+    blocker = await asyncpg.connect(asyncpg_dsn(database_url))
+    observer = await asyncpg.connect(asyncpg_dsn(database_url))
+    transaction = blocker.transaction()
+    await transaction.start()
+    blocked: asyncio.Task[TaskClaimResult] | None = None
+    try:
+        await blocker.execute(
+            "SELECT id FROM task_runs WHERE id = $1 FOR UPDATE",
+            blocked_dispatch.task_run_id,
+        )
+        blocked = asyncio.create_task(
+            repository.acquire_claim(
+                worker.authenticated,
+                worker.session_id,
+                blocked_dispatch,
+                lease_seconds=60,
+            )
+        )
+        await wait_for_lock_waiter(observer)
+        independent = await asyncio.wait_for(
+            repository.acquire_claim(
+                worker.authenticated,
+                worker.session_id,
+                free_dispatch,
+                lease_seconds=60,
+            ),
+            timeout=2,
+        )
+        assert independent.outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
+        await transaction.commit()
+        assert (await blocked).outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
+    finally:
+        if blocked is not None and not blocked.done():
+            blocked.cancel()
+            with suppress(asyncio.CancelledError):
+                await blocked
+        if blocker.is_in_transaction():
+            await transaction.rollback()
+        await blocker.close()
+        await observer.close()
+
+
+def test_real_postgresql_claim_acquisition_and_concurrency() -> None:
+    with temporary_database(
+        "TASKFORGE_CLAIM_TEST_DATABASE_URL", "taskforge_claim_acquisition"
+    ) as database_url:
+        configuration = Config("alembic.ini")
+        alembic_url = database_url.set(
+            drivername="postgresql+asyncpg"
+        ).render_as_string(hide_password=False)
+        with migration_database_url(alembic_url):
+            command.upgrade(configuration, "head")
+        asyncio.run(exercise_claim_acquisition(database_url))
