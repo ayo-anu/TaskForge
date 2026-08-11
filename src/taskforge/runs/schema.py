@@ -1,6 +1,7 @@
 """Relational schema for workflow runs and accepted creation snapshots."""
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Column,
     DateTime,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Table,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
@@ -229,6 +231,68 @@ task_attempts = Table(
         "attempt_number > 0",
         name="attempt_number_positive",
     ),
+)
+
+task_attempt_claims = Table(
+    "task_attempt_claims",
+    metadata,
+    Column(
+        "task_attempt_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "task_attempts.id",
+            name="fk_task_attempt_claims_task_attempt_id_task_attempts",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        primary_key=True,
+    ),
+    Column("generation", BigInteger, primary_key=True),
+    Column(
+        "worker_session_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "worker_sessions.id",
+            name="fk_task_attempt_claims_worker_session_id_worker_sessions",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column(
+        "acquired_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("statement_timestamp()"),
+    ),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False),
+    Column("terminated_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint("generation > 0", name="generation_positive"),
+    CheckConstraint(
+        "lease_expires_at > acquired_at",
+        name="lease_expires_after_acquisition",
+    ),
+    CheckConstraint(
+        "terminated_at IS NULL OR terminated_at >= acquired_at",
+        name="terminated_not_before_acquisition",
+    ),
+)
+
+Index(
+    "uq_task_attempt_claims_current_task_attempt_id",
+    task_attempt_claims.c.task_attempt_id,
+    unique=True,
+    postgresql_where=task_attempt_claims.c.terminated_at.is_(None),
+)
+Index(
+    "ix_task_attempt_claims_current_lease_expires_at",
+    task_attempt_claims.c.lease_expires_at,
+    postgresql_where=task_attempt_claims.c.terminated_at.is_(None),
+)
+Index(
+    "ix_task_attempt_claims_current_worker_session_id",
+    task_attempt_claims.c.worker_session_id,
+    postgresql_where=task_attempt_claims.c.terminated_at.is_(None),
 )
 
 task_dispatch_outbox = Table(
