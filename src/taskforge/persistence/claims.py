@@ -5,12 +5,19 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, insert, or_, select, update
+from sqlalchemy import exists, func, insert, or_, select, update
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from taskforge.claims.domain import TaskClaimLease, TaskClaimOutcome, TaskClaimResult
+from taskforge.claims.domain import (
+    TaskClaimLease,
+    TaskClaimOutcome,
+    TaskClaimRenewalOutcome,
+    TaskClaimRenewalRequest,
+    TaskClaimRenewalResult,
+    TaskClaimResult,
+)
 from taskforge.claims.persistence_ports import (
     TaskClaimAlreadyOwned,
     TaskClaimAttemptStale,
@@ -20,6 +27,9 @@ from taskforge.claims.persistence_ports import (
     TaskClaimInvariantViolation,
     TaskClaimNotEligible,
     TaskClaimPersistenceUnavailable,
+    TaskClaimRenewalExpired,
+    TaskClaimRenewalStale,
+    TaskClaimRenewalTaskInactive,
     TaskClaimSessionInactive,
     TaskClaimSessionUnavailable,
     TaskClaimWorkerUnavailable,
@@ -56,6 +66,9 @@ _CLAIM_REJECTIONS = (
     TaskClaimSessionInactive,
     TaskClaimSessionUnavailable,
     TaskClaimWorkerUnavailable,
+    TaskClaimRenewalExpired,
+    TaskClaimRenewalStale,
+    TaskClaimRenewalTaskInactive,
 )
 
 
@@ -274,6 +287,168 @@ class SQLAlchemyTaskClaimRepository:
         except DBAPIError as error:
             raise TaskClaimPersistenceUnavailable from error
 
+    async def renew_claim(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        request: TaskClaimRenewalRequest,
+        *,
+        lease_seconds: int,
+    ) -> TaskClaimRenewalResult:
+        if lease_seconds <= 0:
+            raise ValueError("claim lease duration must be positive")
+        try:
+            async with self._sessions.begin() as session:
+                await _lock_authority(session, authenticated_worker)
+                await _lock_active_session(
+                    session,
+                    authenticated_worker.worker_identity_id,
+                    request.worker_session_id,
+                )
+                task = (
+                    await session.execute(
+                        select(
+                            task_runs.c.id,
+                            task_runs.c.status,
+                            task_attempts.c.attempt_number,
+                        )
+                        .select_from(
+                            task_attempts.join(
+                                task_runs,
+                                task_runs.c.id == task_attempts.c.task_run_id,
+                            )
+                        )
+                        .where(task_attempts.c.id == request.task_attempt_id)
+                        .with_for_update(of=task_runs)
+                    )
+                ).one_or_none()
+                if task is None:
+                    raise TaskClaimRenewalStale
+                if task.status not in (
+                    TaskRunStatus.CLAIMED.value,
+                    TaskRunStatus.RUNNING.value,
+                ):
+                    raise TaskClaimRenewalTaskInactive
+
+                latest_attempt = await session.scalar(
+                    select(func.max(task_attempts.c.attempt_number)).where(
+                        task_attempts.c.task_run_id == task.id
+                    )
+                )
+                if latest_attempt != task.attempt_number:
+                    raise TaskClaimRenewalStale
+
+                current = (
+                    await session.execute(
+                        select(
+                            task_attempt_claims.c.task_attempt_id,
+                            task_attempt_claims.c.generation,
+                            task_attempt_claims.c.worker_session_id,
+                            task_attempt_claims.c.acquired_at,
+                            task_attempt_claims.c.lease_expires_at,
+                        )
+                        .where(
+                            task_attempt_claims.c.task_attempt_id
+                            == request.task_attempt_id,
+                            task_attempt_claims.c.terminated_at.is_(None),
+                        )
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if (
+                    current is None
+                    or current.generation != request.generation
+                    or current.worker_session_id != request.worker_session_id
+                ):
+                    raise TaskClaimRenewalStale
+
+                timing = (
+                    await session.execute(
+                        select(
+                            func.statement_timestamp().label("reference_time"),
+                            (
+                                func.statement_timestamp()
+                                + func.make_interval(0, 0, 0, 0, 0, 0, lease_seconds)
+                            ).label("candidate_expiry"),
+                        )
+                    )
+                ).one()
+                if current.lease_expires_at <= timing.reference_time:
+                    raise TaskClaimRenewalExpired
+
+                expected = request.expected_lease_expires_at
+                if expected < current.lease_expires_at:
+                    return _renewal_result(current, TaskClaimRenewalOutcome.REPLAYED)
+                if expected > current.lease_expires_at:
+                    raise TaskClaimRenewalStale
+                if current.lease_expires_at >= timing.candidate_expiry:
+                    return _renewal_result(
+                        current, TaskClaimRenewalOutcome.ACTIVE_UNCHANGED
+                    )
+
+                active_task_exists = exists(
+                    select(task_attempts.c.id)
+                    .select_from(
+                        task_attempts.join(
+                            task_runs,
+                            task_runs.c.id == task_attempts.c.task_run_id,
+                        )
+                    )
+                    .where(
+                        task_attempts.c.id == request.task_attempt_id,
+                        task_runs.c.status.in_(
+                            (
+                                TaskRunStatus.CLAIMED.value,
+                                TaskRunStatus.RUNNING.value,
+                            )
+                        ),
+                    )
+                )
+                renewed = (
+                    await session.execute(
+                        update(task_attempt_claims)
+                        .where(
+                            task_attempt_claims.c.task_attempt_id
+                            == request.task_attempt_id,
+                            task_attempt_claims.c.generation == request.generation,
+                            task_attempt_claims.c.worker_session_id
+                            == request.worker_session_id,
+                            task_attempt_claims.c.terminated_at.is_(None),
+                            task_attempt_claims.c.lease_expires_at == expected,
+                            task_attempt_claims.c.lease_expires_at
+                            > func.statement_timestamp(),
+                            active_task_exists,
+                        )
+                        .values(
+                            lease_expires_at=func.greatest(
+                                task_attempt_claims.c.lease_expires_at,
+                                func.statement_timestamp()
+                                + func.make_interval(0, 0, 0, 0, 0, 0, lease_seconds),
+                            )
+                        )
+                        .returning(
+                            task_attempt_claims.c.task_attempt_id,
+                            task_attempt_claims.c.generation,
+                            task_attempt_claims.c.worker_session_id,
+                            task_attempt_claims.c.acquired_at,
+                            task_attempt_claims.c.lease_expires_at,
+                        )
+                    )
+                ).one_or_none()
+                if renewed is None:
+                    expired = await session.scalar(
+                        select(current.lease_expires_at <= func.statement_timestamp())
+                    )
+                    if expired:
+                        raise TaskClaimRenewalExpired
+                    raise TaskClaimInvariantViolation
+                return _renewal_result(renewed, TaskClaimRenewalOutcome.RENEWED)
+        except _CLAIM_REJECTIONS:
+            raise
+        except IntegrityError as error:
+            raise TaskClaimInvariantViolation from error
+        except DBAPIError as error:
+            raise TaskClaimPersistenceUnavailable from error
+
 
 async def _lock_authority(
     session: AsyncSession, authenticated_worker: AuthenticatedWorker
@@ -340,6 +515,21 @@ def _dispatch_matches(dispatch: DispatchEnvelope, durable: Row[Any]) -> bool:
 
 def _claim_result(row: Row[Any], outcome: TaskClaimOutcome) -> TaskClaimResult:
     return TaskClaimResult(
+        outcome,
+        TaskClaimLease(
+            row.task_attempt_id,
+            row.generation,
+            row.worker_session_id,
+            row.acquired_at,
+            row.lease_expires_at,
+        ),
+    )
+
+
+def _renewal_result(
+    row: Row[Any], outcome: TaskClaimRenewalOutcome
+) -> TaskClaimRenewalResult:
+    return TaskClaimRenewalResult(
         outcome,
         TaskClaimLease(
             row.task_attempt_id,

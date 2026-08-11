@@ -30,6 +30,9 @@ def settings(environment: str = "development") -> Settings:
         environment=environment,
         postgres_password=SecretStr("postgres-test-secret"),
         rabbitmq_password=SecretStr("rabbitmq-test-secret"),
+        task_claim_result_authority_secret=SecretStr(
+            "test-claim-result-authority-secret"
+        ),
     )
 
 

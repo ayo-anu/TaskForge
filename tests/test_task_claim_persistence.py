@@ -10,8 +10,13 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.dml import Update
 
-from taskforge.claims.domain import TaskClaimOutcome
+from taskforge.claims.domain import (
+    TaskClaimOutcome,
+    TaskClaimRenewalOutcome,
+    TaskClaimRenewalRequest,
+)
 from taskforge.claims.persistence_ports import (
     TaskClaimAuthorityRejected,
     TaskClaimSessionInactive,
@@ -221,3 +226,122 @@ def test_repository_rejects_ended_authenticated_session() -> None:
         asyncio.run(
             repository.acquire_claim(worker, session_id, envelope, lease_seconds=60)
         )
+
+
+def renewal_rows(
+    worker: AuthenticatedWorker,
+    request: TaskClaimRenewalRequest,
+    *,
+    current_expiry: datetime,
+    candidate_expiry: datetime,
+    renewed_expiry: datetime | None,
+) -> tuple[list[object], list[object]]:
+    acquired_at = current_expiry - timedelta(seconds=30)
+    claim = SimpleNamespace(
+        task_attempt_id=request.task_attempt_id,
+        generation=request.generation,
+        worker_session_id=request.worker_session_id,
+        acquired_at=acquired_at,
+        lease_expires_at=current_expiry,
+    )
+    rows: list[object] = [
+        SimpleNamespace(id=worker.worker_identity_id),
+        SimpleNamespace(id=worker.credential_id),
+        SimpleNamespace(ended_at=None),
+        SimpleNamespace(id=uuid4(), status="claimed", attempt_number=1),
+        claim,
+        SimpleNamespace(
+            reference_time=current_expiry - timedelta(seconds=10),
+            candidate_expiry=candidate_expiry,
+        ),
+    ]
+    if renewed_expiry is not None:
+        rows.append(
+            SimpleNamespace(
+                task_attempt_id=request.task_attempt_id,
+                generation=request.generation,
+                worker_session_id=request.worker_session_id,
+                acquired_at=acquired_at,
+                lease_expires_at=renewed_expiry,
+            )
+        )
+    return rows, [1]
+
+
+def test_repository_renews_with_guarded_update_after_locking() -> None:
+    worker = AuthenticatedWorker(uuid4(), uuid4())
+    session_id, attempt_id = uuid4(), uuid4()
+    current_expiry = datetime.now(UTC) + timedelta(seconds=10)
+    request = TaskClaimRenewalRequest(attempt_id, 2, session_id, current_expiry)
+    rows, scalars = renewal_rows(
+        worker,
+        request,
+        current_expiry=current_expiry,
+        candidate_expiry=current_expiry + timedelta(seconds=50),
+        renewed_expiry=current_expiry + timedelta(seconds=51),
+    )
+    session = FakeSession(rows, scalars)
+    repository = SQLAlchemyTaskClaimRepository(
+        cast(async_sessionmaker[AsyncSession], FakeSessions(session)),
+        worker_stale_after_seconds=30,
+    )
+
+    result = asyncio.run(repository.renew_claim(worker, request, lease_seconds=60))
+
+    assert result.outcome is TaskClaimRenewalOutcome.RENEWED
+    updates = [
+        statement for statement in session.statements if isinstance(statement, Update)
+    ]
+    assert len(updates) == 1
+    sql = str(updates[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "lease_expires_at=greatest" in sql
+    assert "terminated_at IS NULL" in sql
+    assert "lease_expires_at > statement_timestamp()" in sql
+    assert "task_runs.status IN ('claimed', 'running')" in sql
+    assert "worker_session_health" not in sql
+    assert "worker_session_capabilities" not in sql
+
+
+def test_repository_active_unchanged_and_replay_are_genuine_no_write_paths() -> None:
+    worker = AuthenticatedWorker(uuid4(), uuid4())
+    session_id, attempt_id = uuid4(), uuid4()
+    current_expiry = datetime.now(UTC) + timedelta(seconds=120)
+    request = TaskClaimRenewalRequest(attempt_id, 2, session_id, current_expiry)
+    rows, scalars = renewal_rows(
+        worker,
+        request,
+        current_expiry=current_expiry,
+        candidate_expiry=current_expiry - timedelta(seconds=30),
+        renewed_expiry=None,
+    )
+    session = FakeSession(rows, scalars)
+    repository = SQLAlchemyTaskClaimRepository(
+        cast(async_sessionmaker[AsyncSession], FakeSessions(session)),
+        worker_stale_after_seconds=30,
+    )
+    unchanged = asyncio.run(repository.renew_claim(worker, request, lease_seconds=60))
+    assert unchanged.outcome is TaskClaimRenewalOutcome.ACTIVE_UNCHANGED
+    assert not any(isinstance(statement, Update) for statement in session.statements)
+
+    replay_request = TaskClaimRenewalRequest(
+        attempt_id, 2, session_id, current_expiry - timedelta(seconds=1)
+    )
+    rows, scalars = renewal_rows(
+        worker,
+        replay_request,
+        current_expiry=current_expiry,
+        candidate_expiry=current_expiry + timedelta(seconds=30),
+        renewed_expiry=None,
+    )
+    replay_session = FakeSession(rows, scalars)
+    replay_repository = SQLAlchemyTaskClaimRepository(
+        cast(async_sessionmaker[AsyncSession], FakeSessions(replay_session)),
+        worker_stale_after_seconds=30,
+    )
+    replayed = asyncio.run(
+        replay_repository.renew_claim(worker, replay_request, lease_seconds=60)
+    )
+    assert replayed.outcome is TaskClaimRenewalOutcome.REPLAYED
+    assert not any(
+        isinstance(statement, Update) for statement in replay_session.statements
+    )

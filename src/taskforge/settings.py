@@ -9,6 +9,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["development", "test", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+DEVELOPMENT_CLAIM_RESULT_AUTHORITY_SECRET = (
+    "taskforge-development-claim-result-authority-secret"
+)
 
 
 class Settings(BaseSettings):
@@ -34,6 +37,9 @@ class Settings(BaseSettings):
     worker_stale_after_seconds: int = Field(default=30, ge=1, le=3600)
     worker_offline_after_seconds: int = Field(default=120, ge=2, le=86400)
     task_claim_lease_seconds: int = Field(default=60, ge=1)
+    task_claim_result_authority_secret: SecretStr = Field(
+        default=SecretStr(DEVELOPMENT_CLAIM_RESULT_AUTHORITY_SECRET), min_length=32
+    )
 
     postgres_host: str = Field(
         default="127.0.0.1",
@@ -119,4 +125,16 @@ class Settings(BaseSettings):
     def validate_worker_health_thresholds(self) -> Settings:
         if self.worker_offline_after_seconds <= self.worker_stale_after_seconds:
             raise ValueError("worker offline threshold must exceed stale threshold")
+        return self
+
+    @model_validator(mode="after")
+    def validate_production_claim_authority_secret(self) -> Settings:
+        if (
+            self.environment == "production"
+            and self.task_claim_result_authority_secret.get_secret_value()
+            == DEVELOPMENT_CLAIM_RESULT_AUTHORITY_SECRET
+        ):
+            raise ValueError(
+                "production requires an explicit claim result authority secret"
+            )
         return self

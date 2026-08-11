@@ -35,6 +35,10 @@ def isolate_taskforge_environment(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(variable_name)
     monkeypatch.setenv("POSTGRES_PASSWORD", "test-postgres-password")
     monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "test-rabbitmq-password")
+    monkeypatch.setenv(
+        "TASKFORGE_TASK_CLAIM_RESULT_AUTHORITY_SECRET",
+        "test-claim-result-authority-secret",
+    )
 
 
 def test_settings_have_safe_local_defaults() -> None:
@@ -52,6 +56,9 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.worker_stale_after_seconds == 30
     assert settings.worker_offline_after_seconds == 120
     assert settings.task_claim_lease_seconds == 60
+    assert settings.task_claim_result_authority_secret.get_secret_value() == (
+        "test-claim-result-authority-secret"
+    )
     assert settings.postgres_host == "127.0.0.1"
     assert settings.postgres_port == 5432
     assert settings.rabbitmq_host == "127.0.0.1"
@@ -158,7 +165,8 @@ def test_dependency_passwords_are_redacted() -> None:
 
     assert "test-postgres-password" not in rendered
     assert "test-rabbitmq-password" not in rendered
-    assert rendered.count("**********") == 2
+    assert "test-claim-result-authority-secret" not in rendered
+    assert rendered.count("**********") == 3
 
 
 @pytest.mark.parametrize(
@@ -176,6 +184,7 @@ def test_dependency_passwords_are_redacted() -> None:
         ("TASKFORGE_RABBITMQ_DISPATCH_EXCHANGE_NAME", "amq.reserved"),
         ("TASKFORGE_RABBITMQ_MALFORMED_EXCHANGE_NAME", "Invalid Name"),
         ("TASKFORGE_TASK_CLAIM_LEASE_SECONDS", "0"),
+        ("TASKFORGE_TASK_CLAIM_RESULT_AUTHORITY_SECRET", "too-short"),
     ),
 )
 def test_settings_reject_invalid_runtime_values(
@@ -206,4 +215,14 @@ def test_settings_require_ordered_worker_health_thresholds(
     monkeypatch.setenv("TASKFORGE_WORKER_OFFLINE_AFTER_SECONDS", "30")
 
     with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_production_requires_explicit_claim_result_authority_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_ENVIRONMENT", "production")
+    monkeypatch.delenv("TASKFORGE_TASK_CLAIM_RESULT_AUTHORITY_SECRET")
+
+    with pytest.raises(ValidationError, match="claim result authority secret"):
         Settings()

@@ -1,4 +1,4 @@
-.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test claim-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test check clean
+.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test claim-test renewal-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test check clean
 
 install:
 	uv sync --locked --dev
@@ -33,6 +33,11 @@ claim-test:
 	@test "$${TASKFORGE_RUN_CLAIM_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_CLAIM_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_CLAIM_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_CLAIM_TEST_DATABASE_URL is required" >&2; exit 2)
 	uv run pytest tests/integration/test_task_claim_acquisition.py
+
+renewal-test:
+	@test "$${TASKFORGE_RUN_CLAIM_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_CLAIM_INTEGRATION=1 is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_CLAIM_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_CLAIM_TEST_DATABASE_URL is required" >&2; exit 2)
+	uv run pytest tests/integration/test_task_claim_renewal.py
 
 authentication-test:
 	@test "$${TASKFORGE_RUN_AUTHENTICATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_AUTHENTICATION_INTEGRATION=1 is required" >&2; exit 2)
