@@ -13,10 +13,25 @@ from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import (
     TaskClaimLease,
     TaskClaimOutcome,
+    TaskClaimRejected,
+    TaskClaimRejectionReason,
     TaskClaimRenewalOutcome,
     TaskClaimRenewalRequest,
     TaskClaimRenewalResult,
     TaskClaimResult,
+)
+from taskforge.claims.persistence_ports import (
+    TaskClaimAlreadyOwned,
+    TaskClaimAttemptStale,
+    TaskClaimAuthorityRejected,
+    TaskClaimCapabilityMismatch,
+    TaskClaimDispatchRejected,
+    TaskClaimInvariantViolation,
+    TaskClaimNotEligible,
+    TaskClaimPersistenceUnavailable,
+    TaskClaimSessionInactive,
+    TaskClaimSessionUnavailable,
+    TaskClaimWorkerUnavailable,
 )
 from taskforge.claims.service import TaskClaimService
 from taskforge.dispatch.envelope import create_dispatch_envelope
@@ -28,13 +43,17 @@ class FakeRepository:
         self,
         result: TaskClaimResult,
         renewal_result: TaskClaimRenewalResult | None = None,
+        acquisition_error: Exception | None = None,
     ) -> None:
         self.result = result
         self.renewal_result = renewal_result
+        self.acquisition_error = acquisition_error
         self.call: tuple[Any, ...] | None = None
 
     async def acquire_claim(self, *args: Any, **kwargs: Any) -> TaskClaimResult:
         self.call = (*args, kwargs)
+        if self.acquisition_error is not None:
+            raise self.acquisition_error
         return self.result
 
     async def renew_claim(self, *args: Any, **kwargs: Any) -> TaskClaimRenewalResult:
@@ -143,3 +162,119 @@ def test_service_forwards_renewal_without_result_authority() -> None:
     )
     assert asyncio.run(service.renew_claim(worker, request)) is renewal
     assert repository.call == (worker, request, {"lease_seconds": 60})
+
+
+@pytest.mark.parametrize(
+    ("repository_error", "expected_reason"),
+    (
+        (
+            TaskClaimDispatchRejected(),
+            TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+        ),
+        (
+            TaskClaimAttemptStale(),
+            TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+        ),
+        (TaskClaimNotEligible(), TaskClaimRejectionReason.TASK_NOT_CLAIMABLE),
+        (
+            TaskClaimAuthorityRejected(),
+            TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
+        ),
+        (
+            TaskClaimSessionUnavailable(),
+            TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
+        ),
+        (
+            TaskClaimSessionInactive(),
+            TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
+        ),
+        (
+            TaskClaimWorkerUnavailable(),
+            TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
+        ),
+        (
+            TaskClaimCapabilityMismatch(),
+            TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
+        ),
+        (
+            TaskClaimAlreadyOwned(),
+            TaskClaimRejectionReason.ALREADY_AUTHORITATIVE,
+        ),
+    ),
+)
+def test_service_maps_expected_acquisition_denials_to_safe_rejections(
+    repository_error: Exception,
+    expected_reason: TaskClaimRejectionReason,
+) -> None:
+    acquired = datetime.now(UTC)
+    result = TaskClaimResult(
+        TaskClaimOutcome.ACQUIRED_ACTIVE,
+        TaskClaimLease(uuid4(), 1, uuid4(), acquired, acquired + timedelta(seconds=60)),
+    )
+    repository = FakeRepository(result, acquisition_error=repository_error)
+    service = TaskClaimService(
+        repository, TaskClaimResultAuthorityIssuer(b"a" * 32), lease_seconds=60
+    )
+    worker = AuthenticatedWorker(uuid4(), uuid4())
+    envelope = create_dispatch_envelope(
+        dispatch_id=uuid4(),
+        task_attempt_id=result.claim.task_attempt_id,
+        task_run_id=uuid4(),
+        workflow_run_id=uuid4(),
+        attempt_number=1,
+        task_type="test.task",
+        required_capability="secret-capability",
+        task_payload={},
+        references={},
+    )
+
+    with pytest.raises(TaskClaimRejected) as raised:
+        asyncio.run(
+            service.claim_task(worker, result.claim.worker_session_id, envelope)
+        )
+
+    assert raised.value.reason is expected_reason
+    assert str(raised.value) == "task claim acquisition rejected"
+    assert raised.value.__cause__ is repository_error
+    rendered = str(raised.value)
+    assert str(worker.worker_identity_id) not in rendered
+    assert str(result.claim.task_attempt_id) not in rendered
+    assert "secret-capability" not in rendered
+
+
+@pytest.mark.parametrize(
+    "repository_error",
+    (TaskClaimInvariantViolation(), TaskClaimPersistenceUnavailable()),
+)
+def test_service_does_not_convert_internal_acquisition_failures(
+    repository_error: Exception,
+) -> None:
+    acquired = datetime.now(UTC)
+    result = TaskClaimResult(
+        TaskClaimOutcome.ACQUIRED_ACTIVE,
+        TaskClaimLease(uuid4(), 1, uuid4(), acquired, acquired + timedelta(seconds=60)),
+    )
+    repository = FakeRepository(result, acquisition_error=repository_error)
+    service = TaskClaimService(
+        repository, TaskClaimResultAuthorityIssuer(b"a" * 32), lease_seconds=60
+    )
+    worker = AuthenticatedWorker(uuid4(), uuid4())
+    envelope = create_dispatch_envelope(
+        dispatch_id=uuid4(),
+        task_attempt_id=result.claim.task_attempt_id,
+        task_run_id=uuid4(),
+        workflow_run_id=uuid4(),
+        attempt_number=1,
+        task_type="test.task",
+        required_capability="test-capability",
+        task_payload={},
+        references={},
+    )
+
+    with pytest.raises(type(repository_error)) as raised:
+        asyncio.run(
+            service.claim_task(worker, result.claim.worker_session_id, envelope)
+        )
+
+    assert raised.value is repository_error
+    assert not isinstance(raised.value, TaskClaimRejected)

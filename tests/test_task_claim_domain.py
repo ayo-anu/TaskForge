@@ -9,6 +9,8 @@ from taskforge.claims.domain import (
     IssuedTaskClaim,
     TaskClaimLease,
     TaskClaimOutcome,
+    TaskClaimRejected,
+    TaskClaimRejectionReason,
     TaskClaimRenewalOutcome,
     TaskClaimRenewalRequest,
     TaskClaimRenewalResult,
@@ -116,3 +118,13 @@ def test_result_authority_accepts_canonical_bearer_format() -> None:
     assert authority.presented_value == (
         "tf_claim_result_v1.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq"
     )
+
+
+def test_claim_rejection_has_stable_reason_and_safe_fixed_message() -> None:
+    rejection = TaskClaimRejected(TaskClaimRejectionReason.ALREADY_AUTHORITATIVE)
+
+    assert rejection.reason is TaskClaimRejectionReason.ALREADY_AUTHORITATIVE
+    assert str(rejection) == "task claim acquisition rejected"
+    rendered = repr(rejection)
+    assert "worker-session-secret" not in rendered
+    assert "already_authoritative" not in rendered

@@ -16,16 +16,19 @@ from alembic.config import Config
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from taskforge.claims.domain import TaskClaimOutcome, TaskClaimResult
+from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
+from taskforge.claims.domain import (
+    IssuedTaskClaim,
+    TaskClaimOutcome,
+    TaskClaimRejected,
+    TaskClaimRejectionReason,
+)
 from taskforge.claims.persistence_ports import (
-    TaskClaimAlreadyOwned,
     TaskClaimAttemptStale,
-    TaskClaimAuthorityRejected,
-    TaskClaimCapabilityMismatch,
     TaskClaimPersistenceUnavailable,
-    TaskClaimSessionInactive,
     TaskClaimWorkerUnavailable,
 )
+from taskforge.claims.service import TaskClaimService
 from taskforge.dispatch.envelope import (
     DispatchEnvelope,
     create_dispatch_envelope,
@@ -198,16 +201,16 @@ async def wait_for_lock_waiter(
 
 async def run_serialized_claim_race(
     database_url: URL,
-    repository: SQLAlchemyTaskClaimRepository,
+    service: TaskClaimService,
     dispatch: DispatchEnvelope,
     contenders: tuple[WorkerFacts, WorkerFacts],
-) -> tuple[TaskClaimResult | BaseException, TaskClaimResult | BaseException]:
+) -> tuple[IssuedTaskClaim | BaseException, IssuedTaskClaim | BaseException]:
     blocker = await asyncpg.connect(asyncpg_dsn(database_url))
     observer = await asyncpg.connect(asyncpg_dsn(database_url))
     transaction = blocker.transaction()
     await transaction.start()
     pending: (
-        tuple[asyncio.Task[TaskClaimResult], asyncio.Task[TaskClaimResult]] | None
+        tuple[asyncio.Task[IssuedTaskClaim], asyncio.Task[IssuedTaskClaim]] | None
     ) = None
     try:
         await blocker.execute(
@@ -215,19 +218,17 @@ async def run_serialized_claim_race(
         )
         pending = (
             asyncio.create_task(
-                repository.acquire_claim(
+                service.claim_task(
                     contenders[0].authenticated,
                     contenders[0].session_id,
                     dispatch,
-                    lease_seconds=60,
                 )
             ),
             asyncio.create_task(
-                repository.acquire_claim(
+                service.claim_task(
                     contenders[1].authenticated,
                     contenders[1].session_id,
                     dispatch,
-                    lease_seconds=60,
                 )
             ),
         )
@@ -259,6 +260,11 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
     repository = SQLAlchemyTaskClaimRepository(
         build_session_factory(engine), worker_stale_after_seconds=30
     )
+    service = TaskClaimService(
+        repository,
+        TaskClaimResultAuthorityIssuer(b"claim-acquisition-integration-secret"),
+        lease_seconds=60,
+    )
     try:
         first_worker = await add_worker(setup)
         second_worker = await add_worker(setup)
@@ -266,7 +272,7 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
 
         first, second = await run_serialized_claim_race(
             database_url,
-            repository,
+            service,
             dispatch,
             (first_worker, second_worker),
         )
@@ -278,7 +284,9 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
             )
             == 1
         )
-        assert sum(isinstance(result, TaskClaimAlreadyOwned) for result in results) == 1
+        rejection = next(result for result in results if isinstance(result, Exception))
+        assert isinstance(rejection, TaskClaimRejected)
+        assert rejection.reason is TaskClaimRejectionReason.ALREADY_AUTHORITATIVE
         winner = first_worker if not isinstance(first, Exception) else second_worker
 
         await setup.execute(
@@ -292,14 +300,15 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
             "DELETE FROM worker_session_capabilities WHERE worker_session_id = $1",
             winner.session_id,
         )
-        replay = await repository.acquire_claim(
-            winner.authenticated, winner.session_id, dispatch, lease_seconds=60
+        replay = await service.claim_task(
+            winner.authenticated, winner.session_id, dispatch
         )
         assert replay.outcome is TaskClaimOutcome.REPLAYED_ACTIVE
+        assert replay.result_authority is not None
         original = next(
             result for result in results if not isinstance(result, Exception)
         )
-        assert isinstance(original, TaskClaimResult)
+        assert isinstance(original, IssuedTaskClaim)
         assert replay.claim == original.claim
 
         await setup.execute(
@@ -307,23 +316,26 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
             "interval '1 microsecond' WHERE task_attempt_id = $1",
             dispatch.task_attempt_id,
         )
-        expired = await repository.acquire_claim(
-            winner.authenticated, winner.session_id, dispatch, lease_seconds=60
+        expired = await service.claim_task(
+            winner.authenticated, winner.session_id, dispatch
         )
         assert expired.outcome is TaskClaimOutcome.REPLAYED_EXPIRED
         assert expired.claim.generation == original.claim.generation
+        assert expired.result_authority is None
+
+        await exercise_service_rejections(setup, service)
 
         duplicate_dispatch = await add_dispatched_task(setup)
         duplicate_worker = await add_worker(setup)
         duplicate_results = await run_serialized_claim_race(
             database_url,
-            repository,
+            service,
             duplicate_dispatch,
             (duplicate_worker, duplicate_worker),
         )
         duplicate_first, duplicate_second = duplicate_results
-        assert isinstance(duplicate_first, TaskClaimResult)
-        assert isinstance(duplicate_second, TaskClaimResult)
+        assert isinstance(duplicate_first, IssuedTaskClaim)
+        assert isinstance(duplicate_second, IssuedTaskClaim)
         assert {duplicate_first.outcome, duplicate_second.outcome} == {
             TaskClaimOutcome.ACQUIRED_ACTIVE,
             TaskClaimOutcome.REPLAYED_ACTIVE,
@@ -343,16 +355,20 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
         )
         history_results = await run_serialized_claim_race(
             database_url,
-            repository,
+            service,
             history_dispatch,
             (history_worker, history_contender),
         )
         history_result = next(
-            result for result in history_results if isinstance(result, TaskClaimResult)
+            result for result in history_results if isinstance(result, IssuedTaskClaim)
         )
         assert history_result.claim.generation == 8
         assert (
-            sum(isinstance(result, TaskClaimAlreadyOwned) for result in history_results)
+            sum(
+                isinstance(result, TaskClaimRejected)
+                and result.reason is TaskClaimRejectionReason.ALREADY_AUTHORITATIVE
+                for result in history_results
+            )
             == 1
         )
 
@@ -390,8 +406,8 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
                 lease_seconds=60,
             )
 
-        await exercise_authority_lifecycle(setup, repository, database_url)
-        await exercise_health_mutation_race(setup, repository, database_url)
+        await exercise_authority_lifecycle(setup, service, database_url)
+        await exercise_health_mutation_race(setup, service, database_url)
 
         rollback_dispatch = await add_dispatched_task(setup)
         rollback_worker = await add_worker(setup)
@@ -407,11 +423,10 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
             "task_runs FOR EACH ROW EXECUTE FUNCTION reject_claimed_transition()"
         )
         with pytest.raises(TaskClaimPersistenceUnavailable):
-            await repository.acquire_claim(
+            await service.claim_task(
                 rollback_worker.authenticated,
                 rollback_worker.session_id,
                 rollback_dispatch,
-                lease_seconds=60,
             )
         assert not await setup.fetchval(
             "SELECT EXISTS (SELECT FROM task_attempt_claims WHERE task_attempt_id = $1)",
@@ -429,16 +444,145 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
         )
         await setup.execute("DROP FUNCTION reject_claimed_transition()")
 
-        await exercise_session_and_capability_races(setup, repository, database_url)
-        await exercise_dispatch_and_independent_races(setup, repository, database_url)
+        await exercise_session_and_capability_races(setup, service, database_url)
+        await exercise_dispatch_and_independent_races(setup, service, database_url)
     finally:
         await setup.close()
         await engine.dispose()
 
 
+async def acquisition_state(
+    setup: asyncpg.Connection[asyncpg.Record], dispatch: DispatchEnvelope
+) -> asyncpg.Record:
+    state = await setup.fetchrow(
+        "SELECT task_runs.status::text AS status, task_runs.updated_at, "
+        "count(task_attempt_claims.generation) AS claim_count "
+        "FROM task_attempts JOIN task_runs "
+        "ON task_runs.id = task_attempts.task_run_id "
+        "LEFT JOIN task_attempt_claims ON task_attempt_claims.task_attempt_id = "
+        "task_attempts.id WHERE task_attempts.id = $1 "
+        "GROUP BY task_runs.id, task_runs.status, task_runs.updated_at",
+        dispatch.task_attempt_id,
+    )
+    assert state is not None
+    return state
+
+
+async def assert_service_rejection_does_not_mutate(
+    setup: asyncpg.Connection[asyncpg.Record],
+    service: TaskClaimService,
+    worker: WorkerFacts,
+    dispatch: DispatchEnvelope,
+    expected_reason: TaskClaimRejectionReason,
+) -> None:
+    before = await acquisition_state(setup, dispatch)
+    with pytest.raises(TaskClaimRejected) as raised:
+        await service.claim_task(worker.authenticated, worker.session_id, dispatch)
+    after = await acquisition_state(setup, dispatch)
+
+    assert raised.value.reason is expected_reason
+    assert str(raised.value) == "task claim acquisition rejected"
+    assert before == after
+
+
+async def exercise_service_rejections(
+    setup: asyncpg.Connection[asyncpg.Record], service: TaskClaimService
+) -> None:
+    stale_worker = await add_worker(setup)
+    stale_dispatch = await add_dispatched_task(setup)
+    await setup.execute(
+        "INSERT INTO task_attempts (id, task_run_id, attempt_number) "
+        "VALUES ($1, $2, 2)",
+        uuid4(),
+        stale_dispatch.task_run_id,
+    )
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        stale_worker,
+        stale_dispatch,
+        TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+    )
+
+    mismatched_dispatch = await add_dispatched_task(setup)
+    mismatched_delivery = create_dispatch_envelope(
+        dispatch_id=uuid4(),
+        task_attempt_id=mismatched_dispatch.task_attempt_id,
+        task_run_id=mismatched_dispatch.task_run_id,
+        workflow_run_id=mismatched_dispatch.workflow_run_id,
+        attempt_number=mismatched_dispatch.attempt_number,
+        task_type=mismatched_dispatch.task_type,
+        required_capability=mismatched_dispatch.required_capability,
+        task_payload={},
+        references={},
+    )
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        stale_worker,
+        mismatched_delivery,
+        TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+    )
+
+    nonclaimable_worker = await add_worker(setup)
+    nonclaimable_dispatch = await add_dispatched_task(setup, status="running")
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        nonclaimable_worker,
+        nonclaimable_dispatch,
+        TaskClaimRejectionReason.TASK_NOT_CLAIMABLE,
+    )
+
+    disabled_worker = await add_worker(setup)
+    disabled_dispatch = await add_dispatched_task(setup)
+    await setup.execute(
+        "UPDATE worker_identities SET disabled_at = statement_timestamp() "
+        "WHERE id = $1",
+        disabled_worker.authenticated.worker_identity_id,
+    )
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        disabled_worker,
+        disabled_dispatch,
+        TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
+    )
+
+    unavailable_worker = await add_worker(setup)
+    unavailable_dispatch = await add_dispatched_task(setup)
+    await setup.execute(
+        "UPDATE worker_session_health SET accepting_work = false "
+        "WHERE worker_session_id = $1",
+        unavailable_worker.session_id,
+    )
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        unavailable_worker,
+        unavailable_dispatch,
+        TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
+    )
+
+    owner = await add_worker(setup)
+    contender = await add_worker(setup)
+    owned_dispatch = await add_dispatched_task(setup)
+    acquired = await service.claim_task(
+        owner.authenticated, owner.session_id, owned_dispatch
+    )
+    assert acquired.outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        contender,
+        owned_dispatch,
+        TaskClaimRejectionReason.ALREADY_AUTHORITATIVE,
+    )
+
+
 async def exercise_session_and_capability_races(
     setup: asyncpg.Connection[asyncpg.Record],
-    repository: SQLAlchemyTaskClaimRepository,
+    service: TaskClaimService,
     database_url: URL,
 ) -> None:
     for terminate in (True, False):
@@ -448,18 +592,17 @@ async def exercise_session_and_capability_races(
         observer = await asyncpg.connect(asyncpg_dsn(database_url))
         transaction = blocker.transaction()
         await transaction.start()
-        pending: asyncio.Task[TaskClaimResult] | None = None
+        pending: asyncio.Task[IssuedTaskClaim] | None = None
         try:
             await blocker.execute(
                 "SELECT id FROM worker_sessions WHERE id = $1 FOR NO KEY UPDATE",
                 worker.session_id,
             )
             pending = asyncio.create_task(
-                repository.acquire_claim(
+                service.claim_task(
                     worker.authenticated,
                     worker.session_id,
                     dispatch,
-                    lease_seconds=60,
                 )
             )
             await wait_for_lock_waiter(observer)
@@ -476,11 +619,14 @@ async def exercise_session_and_capability_races(
                     worker.session_id,
                 )
             await transaction.commit()
-            expected = (
-                TaskClaimSessionInactive if terminate else TaskClaimCapabilityMismatch
-            )
-            with pytest.raises(expected):
+            with pytest.raises(TaskClaimRejected) as raised:
                 await pending
+            expected_reason = (
+                TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED
+                if terminate
+                else TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE
+            )
+            assert raised.value.reason is expected_reason
         finally:
             if pending is not None and not pending.done():
                 pending.cancel()
@@ -494,7 +640,7 @@ async def exercise_session_and_capability_races(
 
 async def exercise_authority_lifecycle(
     setup: asyncpg.Connection[asyncpg.Record],
-    repository: SQLAlchemyTaskClaimRepository,
+    service: TaskClaimService,
     database_url: URL,
 ) -> None:
     disabled_worker = await add_worker(setup)
@@ -503,13 +649,13 @@ async def exercise_authority_lifecycle(
         "UPDATE worker_identities SET disabled_at = statement_timestamp() WHERE id = $1",
         disabled_worker.authenticated.worker_identity_id,
     )
-    with pytest.raises(TaskClaimAuthorityRejected):
-        await repository.acquire_claim(
+    with pytest.raises(TaskClaimRejected) as disabled:
+        await service.claim_task(
             disabled_worker.authenticated,
             disabled_worker.session_id,
             disabled_dispatch,
-            lease_seconds=60,
         )
+    assert disabled.value.reason is TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED
 
     revoked_worker = await add_worker(setup)
     revoked_dispatch = await add_dispatched_task(setup)
@@ -517,13 +663,13 @@ async def exercise_authority_lifecycle(
         "UPDATE worker_credentials SET revoked_at = statement_timestamp() WHERE id = $1",
         revoked_worker.authenticated.credential_id,
     )
-    with pytest.raises(TaskClaimAuthorityRejected):
-        await repository.acquire_claim(
+    with pytest.raises(TaskClaimRejected) as revoked:
+        await service.claim_task(
             revoked_worker.authenticated,
             revoked_worker.session_id,
             revoked_dispatch,
-            lease_seconds=60,
         )
+    assert revoked.value.reason is TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED
 
     expired_worker = await add_worker(setup)
     expired_dispatch = await add_dispatched_task(setup)
@@ -533,34 +679,36 @@ async def exercise_authority_lifecycle(
         "expires_at = statement_timestamp() - interval '1 second' WHERE id = $1",
         expired_worker.authenticated.credential_id,
     )
-    with pytest.raises(TaskClaimAuthorityRejected):
-        await repository.acquire_claim(
+    with pytest.raises(TaskClaimRejected) as expired:
+        await service.claim_task(
             expired_worker.authenticated,
             expired_worker.session_id,
             expired_dispatch,
-            lease_seconds=60,
         )
+    assert expired.value.reason is TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED
 
     replay_worker = await add_worker(setup)
     replay_dispatch = await add_dispatched_task(setup)
-    acquired = await repository.acquire_claim(
+    acquired = await service.claim_task(
         replay_worker.authenticated,
         replay_worker.session_id,
         replay_dispatch,
-        lease_seconds=60,
     )
     assert acquired.outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
     await setup.execute(
         "UPDATE worker_identities SET disabled_at = statement_timestamp() WHERE id = $1",
         replay_worker.authenticated.worker_identity_id,
     )
-    with pytest.raises(TaskClaimAuthorityRejected):
-        await repository.acquire_claim(
+    with pytest.raises(TaskClaimRejected) as disabled_replay:
+        await service.claim_task(
             replay_worker.authenticated,
             replay_worker.session_id,
             replay_dispatch,
-            lease_seconds=60,
         )
+    assert (
+        disabled_replay.value.reason
+        is TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED
+    )
 
     racing_worker = await add_worker(setup)
     racing_dispatch = await add_dispatched_task(setup)
@@ -568,18 +716,17 @@ async def exercise_authority_lifecycle(
     observer = await asyncpg.connect(asyncpg_dsn(database_url))
     transaction = blocker.transaction()
     await transaction.start()
-    pending: asyncio.Task[TaskClaimResult] | None = None
+    pending: asyncio.Task[IssuedTaskClaim] | None = None
     try:
         await blocker.execute(
             "SELECT id FROM worker_identities WHERE id = $1 FOR UPDATE",
             racing_worker.authenticated.worker_identity_id,
         )
         pending = asyncio.create_task(
-            repository.acquire_claim(
+            service.claim_task(
                 racing_worker.authenticated,
                 racing_worker.session_id,
                 racing_dispatch,
-                lease_seconds=60,
             )
         )
         await wait_for_lock_waiter(observer)
@@ -589,8 +736,11 @@ async def exercise_authority_lifecycle(
             racing_worker.authenticated.worker_identity_id,
         )
         await transaction.commit()
-        with pytest.raises(TaskClaimAuthorityRejected):
+        with pytest.raises(TaskClaimRejected) as rejected:
             await pending
+        assert (
+            rejected.value.reason is TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED
+        )
     finally:
         if pending is not None and not pending.done():
             pending.cancel()
@@ -604,7 +754,7 @@ async def exercise_authority_lifecycle(
 
 async def exercise_health_mutation_race(
     setup: asyncpg.Connection[asyncpg.Record],
-    repository: SQLAlchemyTaskClaimRepository,
+    service: TaskClaimService,
     database_url: URL,
 ) -> None:
     worker = await add_worker(setup)
@@ -613,7 +763,7 @@ async def exercise_health_mutation_race(
     observer = await asyncpg.connect(asyncpg_dsn(database_url))
     transaction = blocker.transaction()
     await transaction.start()
-    pending: asyncio.Task[TaskClaimResult] | None = None
+    pending: asyncio.Task[IssuedTaskClaim] | None = None
     try:
         await blocker.execute(
             "SELECT worker_session_id FROM worker_session_health "
@@ -621,11 +771,10 @@ async def exercise_health_mutation_race(
             worker.session_id,
         )
         pending = asyncio.create_task(
-            repository.acquire_claim(
+            service.claim_task(
                 worker.authenticated,
                 worker.session_id,
                 dispatch,
-                lease_seconds=60,
             )
         )
         await wait_for_lock_waiter(observer)
@@ -636,8 +785,9 @@ async def exercise_health_mutation_race(
             worker.session_id,
         )
         await transaction.commit()
-        with pytest.raises(TaskClaimWorkerUnavailable):
+        with pytest.raises(TaskClaimRejected) as rejected:
             await pending
+        assert rejected.value.reason is TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE
         assert not await setup.fetchval(
             "SELECT EXISTS (SELECT FROM task_attempt_claims WHERE task_attempt_id = $1)",
             dispatch.task_attempt_id,
@@ -655,7 +805,7 @@ async def exercise_health_mutation_race(
 
 async def exercise_dispatch_and_independent_races(
     setup: asyncpg.Connection[asyncpg.Record],
-    repository: SQLAlchemyTaskClaimRepository,
+    service: TaskClaimService,
     database_url: URL,
 ) -> None:
     worker = await add_worker(setup)
@@ -671,7 +821,7 @@ async def exercise_dispatch_and_independent_races(
         build_session_factory(engine)
     )
     observer = await asyncpg.connect(asyncpg_dsn(database_url))
-    pending: asyncio.Task[TaskClaimResult] | None = None
+    pending: asyncio.Task[IssuedTaskClaim] | None = None
     try:
         async with dispatch_repository.dispatch_transaction() as transaction:
             prepared = await transaction.prepare_dispatch(
@@ -693,11 +843,10 @@ async def exercise_dispatch_and_independent_races(
                 ),
             )
             pending = asyncio.create_task(
-                repository.acquire_claim(
+                service.claim_task(
                     worker.authenticated,
                     worker.session_id,
                     dispatch,
-                    lease_seconds=60,
                 )
             )
             await wait_for_lock_waiter(observer)
@@ -722,27 +871,25 @@ async def exercise_dispatch_and_independent_races(
     observer = await asyncpg.connect(asyncpg_dsn(database_url))
     transaction = blocker.transaction()
     await transaction.start()
-    blocked: asyncio.Task[TaskClaimResult] | None = None
+    blocked: asyncio.Task[IssuedTaskClaim] | None = None
     try:
         await blocker.execute(
             "SELECT id FROM task_runs WHERE id = $1 FOR UPDATE",
             blocked_dispatch.task_run_id,
         )
         blocked = asyncio.create_task(
-            repository.acquire_claim(
+            service.claim_task(
                 worker.authenticated,
                 worker.session_id,
                 blocked_dispatch,
-                lease_seconds=60,
             )
         )
         await wait_for_lock_waiter(observer)
         independent = await asyncio.wait_for(
-            repository.acquire_claim(
+            service.claim_task(
                 worker.authenticated,
                 worker.session_id,
                 free_dispatch,
-                lease_seconds=60,
             ),
             timeout=2,
         )

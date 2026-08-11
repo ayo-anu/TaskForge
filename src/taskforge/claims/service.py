@@ -6,12 +6,38 @@ from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import (
     IssuedTaskClaim,
     TaskClaimOutcome,
+    TaskClaimRejected,
+    TaskClaimRejectionReason,
     TaskClaimRenewalRequest,
     TaskClaimRenewalResult,
 )
-from taskforge.claims.persistence_ports import TaskClaimRepository
+from taskforge.claims.persistence_ports import (
+    TaskClaimAlreadyOwned,
+    TaskClaimAttemptStale,
+    TaskClaimAuthorityRejected,
+    TaskClaimCapabilityMismatch,
+    TaskClaimDispatchRejected,
+    TaskClaimNotEligible,
+    TaskClaimRepository,
+    TaskClaimSessionInactive,
+    TaskClaimSessionUnavailable,
+    TaskClaimWorkerUnavailable,
+)
 from taskforge.dispatch.envelope import DispatchEnvelope
 from taskforge.identity.authentication import AuthenticatedWorker
+
+_ACQUISITION_REJECTION_REASONS: dict[type[Exception], TaskClaimRejectionReason] = {
+    TaskClaimDispatchRejected: TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+    TaskClaimAttemptStale: TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+    TaskClaimNotEligible: TaskClaimRejectionReason.TASK_NOT_CLAIMABLE,
+    TaskClaimAuthorityRejected: TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
+    TaskClaimSessionUnavailable: TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
+    TaskClaimSessionInactive: TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
+    TaskClaimWorkerUnavailable: TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
+    TaskClaimCapabilityMismatch: TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
+    TaskClaimAlreadyOwned: TaskClaimRejectionReason.ALREADY_AUTHORITATIVE,
+}
+_EXPECTED_ACQUISITION_REJECTIONS = tuple(_ACQUISITION_REJECTION_REASONS)
 
 
 class TaskClaimService:
@@ -34,12 +60,17 @@ class TaskClaimService:
         worker_session_id: UUID,
         dispatch: DispatchEnvelope,
     ) -> IssuedTaskClaim:
-        result = await self._repository.acquire_claim(
-            authenticated_worker,
-            worker_session_id,
-            dispatch,
-            lease_seconds=self._lease_seconds,
-        )
+        try:
+            result = await self._repository.acquire_claim(
+                authenticated_worker,
+                worker_session_id,
+                dispatch,
+                lease_seconds=self._lease_seconds,
+            )
+        except _EXPECTED_ACQUISITION_REJECTIONS as error:
+            raise TaskClaimRejected(
+                _ACQUISITION_REJECTION_REASONS[type(error)]
+            ) from error
         authority = None
         if result.outcome is not TaskClaimOutcome.REPLAYED_EXPIRED:
             authority = self._authority_issuer.issue(

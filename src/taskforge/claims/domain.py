@@ -19,6 +19,22 @@ class TaskClaimOutcome(StrEnum):
     REPLAYED_EXPIRED = "replayed_expired"
 
 
+class TaskClaimRejectionReason(StrEnum):
+    INVALID_OR_STALE_DISPATCH = "invalid_or_stale_dispatch"
+    TASK_NOT_CLAIMABLE = "task_not_claimable"
+    WORKER_AUTHORITY_REJECTED = "worker_authority_rejected"
+    WORKER_NOT_ELIGIBLE = "worker_not_eligible"
+    ALREADY_AUTHORITATIVE = "already_authoritative"
+
+
+class TaskClaimRejected(Exception):
+    """An expected, identifier-free task acquisition denial."""
+
+    def __init__(self, reason: TaskClaimRejectionReason) -> None:
+        self.reason = reason
+        super().__init__("task claim acquisition rejected")
+
+
 class TaskClaimRenewalOutcome(StrEnum):
     RENEWED = "renewed"
     ACTIVE_UNCHANGED = "active_unchanged"
