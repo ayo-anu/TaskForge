@@ -4,6 +4,7 @@ from uuid import UUID
 
 from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import (
+    InspectedTaskClaim,
     IssuedTaskClaim,
     TaskClaimOutcome,
     TaskClaimRejected,
@@ -17,6 +18,10 @@ from taskforge.claims.persistence_ports import (
     TaskClaimAuthorityRejected,
     TaskClaimCapabilityMismatch,
     TaskClaimDispatchRejected,
+    TaskClaimInspectionInvariantViolation,
+    TaskClaimInspectionNotFound,
+    TaskClaimInspectionPersistenceUnavailable,
+    TaskClaimInspectionRepository,
     TaskClaimNotEligible,
     TaskClaimRepository,
     TaskClaimSessionInactive,
@@ -25,6 +30,7 @@ from taskforge.claims.persistence_ports import (
 )
 from taskforge.dispatch.envelope import DispatchEnvelope
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.identity.authorization import OwnerFilter
 
 _ACQUISITION_REJECTION_REASONS: dict[type[Exception], TaskClaimRejectionReason] = {
     TaskClaimDispatchRejected: TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
@@ -91,3 +97,22 @@ class TaskClaimService:
             request,
             lease_seconds=self._lease_seconds,
         )
+
+
+class TaskClaimInspectionService:
+    def __init__(self, repository: TaskClaimInspectionRepository) -> None:
+        self._repository = repository
+
+    async def get_current_claim(
+        self, task_attempt_id: UUID, owner_filter: OwnerFilter
+    ) -> InspectedTaskClaim:
+        try:
+            return await self._repository.get_current_claim(
+                task_attempt_id, owner_filter
+            )
+        except (
+            TaskClaimInspectionNotFound,
+            TaskClaimInspectionInvariantViolation,
+            TaskClaimInspectionPersistenceUnavailable,
+        ):
+            raise

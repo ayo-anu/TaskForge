@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
+from taskforge.runs.domain import TaskRunStatus
+
 _RESULT_AUTHORITY_PATTERN = re.compile(
     r"tf_claim_result_v1\.[A-Za-z0-9_-]{43}", re.ASCII
 )
@@ -25,6 +27,16 @@ class TaskClaimRejectionReason(StrEnum):
     WORKER_AUTHORITY_REJECTED = "worker_authority_rejected"
     WORKER_NOT_ELIGIBLE = "worker_not_eligible"
     ALREADY_AUTHORITATIVE = "already_authoritative"
+
+
+class TaskClaimEventType(StrEnum):
+    CLAIM_ACQUIRED = "claim_acquired"
+    LEASE_RENEWED = "lease_renewed"
+
+
+class TaskClaimLeaseStatus(StrEnum):
+    UNEXPIRED = "unexpired"
+    EXPIRED = "expired"
 
 
 class TaskClaimRejected(Exception):
@@ -117,3 +129,35 @@ class TaskClaimRenewalRequest:
 class TaskClaimRenewalResult:
     outcome: TaskClaimRenewalOutcome
     claim: TaskClaimLease
+
+
+@dataclass(frozen=True)
+class InspectedTaskClaim:
+    task_attempt_id: UUID
+    task_run_id: UUID
+    workflow_run_id: UUID
+    attempt_number: int
+    generation: int
+    worker_identity_id: UUID
+    worker_session_id: UUID
+    acquired_at: datetime
+    lease_expires_at: datetime
+    observed_at: datetime
+    lease_status: TaskClaimLeaseStatus
+    task_status: TaskRunStatus
+
+    def __post_init__(self) -> None:
+        if self.attempt_number <= 0 or self.generation <= 0:
+            raise ValueError("claim inspection numbers must be positive")
+        for field in ("acquired_at", "lease_expires_at", "observed_at"):
+            value = getattr(self, field)
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("claim inspection timestamps must be timezone-aware")
+            object.__setattr__(self, field, value.astimezone(UTC))
+        expected = (
+            TaskClaimLeaseStatus.UNEXPIRED
+            if self.lease_expires_at > self.observed_at
+            else TaskClaimLeaseStatus.EXPIRED
+        )
+        if self.lease_status is not expected:
+            raise ValueError("claim lease status must match observed database time")

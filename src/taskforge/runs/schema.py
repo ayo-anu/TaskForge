@@ -278,6 +278,58 @@ task_attempt_claims = Table(
     ),
 )
 
+task_claim_events = Table(
+    "task_claim_events",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("task_attempt_id", UUID(as_uuid=True), nullable=False),
+    Column("generation", BigInteger, nullable=False),
+    Column("event_type", String(32), nullable=False),
+    Column("occurred_at", DateTime(timezone=True), nullable=False),
+    Column("previous_lease_expires_at", DateTime(timezone=True), nullable=True),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "event_type IN ('claim_acquired', 'lease_renewed')",
+        name="event_type_valid",
+    ),
+    CheckConstraint(
+        "(event_type = 'claim_acquired' "
+        "AND previous_lease_expires_at IS NULL "
+        "AND lease_expires_at > occurred_at) OR "
+        "(event_type = 'lease_renewed' "
+        "AND previous_lease_expires_at IS NOT NULL "
+        "AND lease_expires_at > previous_lease_expires_at)",
+        name="event_shape_valid",
+    ),
+    ForeignKeyConstraint(
+        ("task_attempt_id", "generation"),
+        (
+            "task_attempt_claims.task_attempt_id",
+            "task_attempt_claims.generation",
+        ),
+        name="fk_task_claim_events_claim_generation",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+)
+
+Index(
+    "uq_task_claim_events_acquired_generation",
+    task_claim_events.c.task_attempt_id,
+    task_claim_events.c.generation,
+    unique=True,
+    postgresql_where=task_claim_events.c.event_type == "claim_acquired",
+)
+Index(
+    "uq_task_claim_events_renewal_transition",
+    task_claim_events.c.task_attempt_id,
+    task_claim_events.c.generation,
+    task_claim_events.c.previous_lease_expires_at,
+    task_claim_events.c.lease_expires_at,
+    unique=True,
+    postgresql_where=task_claim_events.c.event_type == "lease_renewed",
+)
+
 Index(
     "uq_task_attempt_claims_current_task_attempt_id",
     task_attempt_claims.c.task_attempt_id,

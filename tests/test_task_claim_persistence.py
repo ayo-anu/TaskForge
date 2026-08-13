@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.sql.dml import Update
+from sqlalchemy.sql.dml import Insert, Update
 
 from taskforge.claims.domain import (
     TaskClaimOutcome,
@@ -126,6 +126,7 @@ def test_repository_orchestrates_new_acquisition_in_one_context() -> None:
             SimpleNamespace(accepting_work=True, healthy=True),
             inserted,
             SimpleNamespace(id=envelope.task_run_id),
+            None,
         ],
         [1, "test-capability", 1],
     )
@@ -142,6 +143,14 @@ def test_repository_orchestrates_new_acquisition_in_one_context() -> None:
     assert result.claim.generation == 1
     assert session.rows == []
     assert session.scalars == []
+    event_inserts = [
+        statement
+        for statement in session.statements
+        if isinstance(statement, Insert) and statement.table.name == "task_claim_events"
+    ]
+    assert len(event_inserts) == 1
+    assert event_inserts[0].compile().params["event_type"] == "claim_acquired"
+    assert event_inserts[0].compile().params["occurred_at"] == acquired_at
 
 
 def test_repository_replays_without_new_assignment_reads_or_mutations() -> None:
@@ -183,6 +192,10 @@ def test_repository_replays_without_new_assignment_reads_or_mutations() -> None:
     assert result.outcome is TaskClaimOutcome.REPLAYED_EXPIRED
     assert result.claim.generation == 4
     assert len(session.statements) == 8
+    assert not any(
+        isinstance(statement, Insert) and statement.table.name == "task_claim_events"
+        for statement in session.statements
+    )
 
 
 def test_repository_rejects_invalid_policy_and_disabled_authority() -> None:
@@ -265,6 +278,7 @@ def renewal_rows(
                 lease_expires_at=renewed_expiry,
             )
         )
+        rows.append(None)
     return rows, [1]
 
 
@@ -300,6 +314,15 @@ def test_repository_renews_with_guarded_update_after_locking() -> None:
     assert "task_runs.status IN ('claimed', 'running')" in sql
     assert "worker_session_health" not in sql
     assert "worker_session_capabilities" not in sql
+    event_inserts = [
+        statement
+        for statement in session.statements
+        if isinstance(statement, Insert) and statement.table.name == "task_claim_events"
+    ]
+    assert len(event_inserts) == 1
+    event_params = event_inserts[0].compile().params
+    assert event_params["event_type"] == "lease_renewed"
+    assert event_params["previous_lease_expires_at"] == current_expiry
 
 
 def test_repository_active_unchanged_and_replay_are_genuine_no_write_paths() -> None:

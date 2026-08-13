@@ -544,6 +544,14 @@ async def exercise_independent_renewal(
         assert (await asyncio.wait_for(pending, timeout=5)).outcome is (
             TaskClaimRenewalOutcome.RENEWED
         )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_claim_events WHERE task_attempt_id = "
+                "ANY($1::uuid[]) AND event_type = 'lease_renewed'",
+                [blocked_request.task_attempt_id, free_request.task_attempt_id],
+            )
+            == 2
+        )
     finally:
         await cancel_and_await(pending)
         if blocker.is_in_transaction():

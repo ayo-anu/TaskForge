@@ -6,8 +6,11 @@ from uuid import uuid4
 import pytest
 
 from taskforge.claims.domain import (
+    InspectedTaskClaim,
     IssuedTaskClaim,
+    TaskClaimEventType,
     TaskClaimLease,
+    TaskClaimLeaseStatus,
     TaskClaimOutcome,
     TaskClaimRejected,
     TaskClaimRejectionReason,
@@ -17,6 +20,7 @@ from taskforge.claims.domain import (
     TaskClaimResult,
     TaskClaimResultAuthority,
 )
+from taskforge.runs.domain import TaskRunStatus
 
 
 def test_claim_lease_normalizes_timestamps_and_preserves_explicit_outcome() -> None:
@@ -128,3 +132,49 @@ def test_claim_rejection_has_stable_reason_and_safe_fixed_message() -> None:
     rendered = repr(rejection)
     assert "worker-session-secret" not in rendered
     assert "already_authoritative" not in rendered
+
+
+def test_claim_event_vocabulary_is_exactly_the_two_lifecycle_mutations() -> None:
+    assert tuple(TaskClaimEventType) == (
+        TaskClaimEventType.CLAIM_ACQUIRED,
+        TaskClaimEventType.LEASE_RENEWED,
+    )
+    assert {event.value for event in TaskClaimEventType} == {
+        "claim_acquired",
+        "lease_renewed",
+    }
+
+
+def test_inspected_claim_requires_consistent_postgresql_time_classification() -> None:
+    observed = datetime.now(UTC)
+    claim = InspectedTaskClaim(
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        2,
+        3,
+        uuid4(),
+        uuid4(),
+        observed - timedelta(seconds=5),
+        observed + timedelta(seconds=5),
+        observed,
+        TaskClaimLeaseStatus.UNEXPIRED,
+        TaskRunStatus.CLAIMED,
+    )
+    assert claim.observed_at.tzinfo is UTC
+
+    with pytest.raises(ValueError, match="lease status"):
+        InspectedTaskClaim(
+            claim.task_attempt_id,
+            claim.task_run_id,
+            claim.workflow_run_id,
+            claim.attempt_number,
+            claim.generation,
+            claim.worker_identity_id,
+            claim.worker_session_id,
+            claim.acquired_at,
+            observed,
+            observed,
+            TaskClaimLeaseStatus.UNEXPIRED,
+            claim.task_status,
+        )

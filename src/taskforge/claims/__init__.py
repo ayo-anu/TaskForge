@@ -1,8 +1,11 @@
 """Focused task-attempt claim acquisition domain."""
 
 from taskforge.claims.domain import (
+    InspectedTaskClaim,
     IssuedTaskClaim,
+    TaskClaimEventType,
     TaskClaimLease,
+    TaskClaimLeaseStatus,
     TaskClaimOutcome,
     TaskClaimRejected,
     TaskClaimRejectionReason,
@@ -14,8 +17,11 @@ from taskforge.claims.domain import (
 )
 
 __all__ = [
+    "InspectedTaskClaim",
     "IssuedTaskClaim",
+    "TaskClaimEventType",
     "TaskClaimLease",
+    "TaskClaimLeaseStatus",
     "TaskClaimOutcome",
     "TaskClaimRejected",
     "TaskClaimRejectionReason",

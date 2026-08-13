@@ -12,7 +12,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 
 from taskforge.persistence.schema import metadata
-from taskforge.runs.schema import task_attempt_claims
+from taskforge.runs.schema import task_attempt_claims, task_claim_events
 
 
 def test_shared_metadata_registers_only_the_approved_claim_table_shape() -> None:
@@ -152,5 +152,101 @@ def _check_shapes() -> set[tuple[str | None, str]]:
     return {
         (str(constraint.name), str(constraint.sqltext))
         for constraint in task_attempt_claims.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+
+def test_claim_event_metadata_matches_the_immutable_event_migration() -> None:
+    assert metadata.tables["task_claim_events"] is task_claim_events
+    assert tuple(task_claim_events.c.keys()) == (
+        "id",
+        "task_attempt_id",
+        "generation",
+        "event_type",
+        "occurred_at",
+        "previous_lease_expires_at",
+        "lease_expires_at",
+    )
+    assert task_claim_events.primary_key.name == "pk_task_claim_events"
+    assert tuple(task_claim_events.primary_key.columns.keys()) == ("id",)
+    assert task_claim_events.c.occurred_at.server_default is None
+    assert task_claim_events.c.occurred_at.default is None
+    assert _event_foreign_key_shapes() == {
+        (
+            "fk_task_claim_events_claim_generation",
+            ("task_attempt_id", "generation"),
+            (
+                "task_attempt_claims.task_attempt_id",
+                "task_attempt_claims.generation",
+            ),
+            "RESTRICT",
+            "RESTRICT",
+        )
+    }
+    assert _event_check_shapes() == {
+        (
+            "ck_task_claim_events_event_type_valid",
+            "event_type IN ('claim_acquired', 'lease_renewed')",
+        ),
+        (
+            "ck_task_claim_events_event_shape_valid",
+            "(event_type = 'claim_acquired' AND previous_lease_expires_at IS NULL "
+            "AND lease_expires_at > occurred_at) OR (event_type = 'lease_renewed' "
+            "AND previous_lease_expires_at IS NOT NULL AND lease_expires_at > "
+            "previous_lease_expires_at)",
+        ),
+    }
+    assert {
+        (
+            index.name,
+            index.unique,
+            tuple(column.name for column in index.columns),
+            str(index.dialect_options["postgresql"]["where"]),
+        )
+        for index in task_claim_events.indexes
+    } == {
+        (
+            "uq_task_claim_events_acquired_generation",
+            True,
+            ("task_attempt_id", "generation"),
+            "task_claim_events.event_type = :event_type_1",
+        ),
+        (
+            "uq_task_claim_events_renewal_transition",
+            True,
+            (
+                "task_attempt_id",
+                "generation",
+                "previous_lease_expires_at",
+                "lease_expires_at",
+            ),
+            "task_claim_events.event_type = :event_type_1",
+        ),
+    }
+    assert not {"metadata", "payload", "result_authority", "credential"} & set(
+        task_claim_events.c.keys()
+    )
+
+
+def _event_foreign_key_shapes() -> set[
+    tuple[str | None, tuple[str, ...], tuple[str, ...], str | None, str | None]
+]:
+    return {
+        (
+            str(constraint.name),
+            tuple(constraint.columns.keys()),
+            tuple(element.target_fullname for element in constraint.elements),
+            constraint.onupdate,
+            constraint.ondelete,
+        )
+        for constraint in task_claim_events.foreign_key_constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+    }
+
+
+def _event_check_shapes() -> set[tuple[str | None, str]]:
+    return {
+        (str(constraint.name), str(constraint.sqltext))
+        for constraint in task_claim_events.constraints
         if isinstance(constraint, CheckConstraint)
     }

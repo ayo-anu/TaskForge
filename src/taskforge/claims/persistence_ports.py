@@ -6,12 +6,14 @@ from typing import Protocol
 from uuid import UUID
 
 from taskforge.claims.domain import (
+    InspectedTaskClaim,
     TaskClaimRenewalRequest,
     TaskClaimRenewalResult,
     TaskClaimResult,
 )
 from taskforge.dispatch.envelope import DispatchEnvelope
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.identity.authorization import OwnerFilter
 
 
 class TaskClaimDispatchRejected(Exception): ...
@@ -56,6 +58,15 @@ class TaskClaimRenewalStale(Exception): ...
 class TaskClaimRenewalTaskInactive(Exception): ...
 
 
+class TaskClaimInspectionNotFound(Exception): ...
+
+
+class TaskClaimInspectionInvariantViolation(Exception): ...
+
+
+class TaskClaimInspectionPersistenceUnavailable(Exception): ...
+
+
 class TaskClaimRepository(Protocol):
     async def acquire_claim(
         self,
@@ -73,3 +84,9 @@ class TaskClaimRepository(Protocol):
         *,
         lease_seconds: int,
     ) -> TaskClaimRenewalResult: ...
+
+
+class TaskClaimInspectionRepository(Protocol):
+    async def get_current_claim(
+        self, task_attempt_id: UUID, owner_filter: OwnerFilter
+    ) -> InspectedTaskClaim: ...

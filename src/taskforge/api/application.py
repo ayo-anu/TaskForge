@@ -14,6 +14,7 @@ from taskforge.api.authentication import (
     AuthenticationRuntimeProtocol,
     build_authentication_runtime,
 )
+from taskforge.api.claims import router as claims_router
 from taskforge.api.dependencies import build_readiness_coordinator
 from taskforge.api.errors import install_error_handling
 from taskforge.api.health import (
@@ -65,6 +66,7 @@ def create_app(
     app = FastAPI(title="Taskforge API", lifespan=lifespan)
     install_error_handling(app)
     app.include_router(principals_router)
+    app.include_router(claims_router)
     app.include_router(workflows_router)
     app.include_router(runs_router)
     app.include_router(workers_router)

@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy import exists, func, insert, or_, select, update
+from sqlalchemy import case, exists, func, insert, or_, select, true, update
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.claims.domain import (
+    InspectedTaskClaim,
+    TaskClaimEventType,
     TaskClaimLease,
+    TaskClaimLeaseStatus,
     TaskClaimOutcome,
     TaskClaimRenewalOutcome,
     TaskClaimRenewalRequest,
@@ -24,6 +27,9 @@ from taskforge.claims.persistence_ports import (
     TaskClaimAuthorityRejected,
     TaskClaimCapabilityMismatch,
     TaskClaimDispatchRejected,
+    TaskClaimInspectionInvariantViolation,
+    TaskClaimInspectionNotFound,
+    TaskClaimInspectionPersistenceUnavailable,
     TaskClaimInvariantViolation,
     TaskClaimNotEligible,
     TaskClaimPersistenceUnavailable,
@@ -39,13 +45,16 @@ from taskforge.dispatch.envelope import (
     dispatch_envelope_to_mapping,
 )
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.identity.schema import worker_credentials, worker_identities
 from taskforge.runs.domain import TaskRunStatus
 from taskforge.runs.schema import (
     task_attempt_claims,
     task_attempts,
+    task_claim_events,
     task_dispatch_outbox,
     task_runs,
+    workflow_runs,
 )
 from taskforge.worker.health import worker_session_is_healthy
 from taskforge.worker.schema import (
@@ -53,7 +62,7 @@ from taskforge.worker.schema import (
     worker_session_health,
     worker_sessions,
 )
-from taskforge.workflows.schema import workflow_version_steps
+from taskforge.workflows.schema import workflow_definitions, workflow_version_steps
 
 _CLAIM_REJECTIONS = (
     TaskClaimAlreadyOwned,
@@ -279,6 +288,17 @@ class SQLAlchemyTaskClaimRepository:
                 ).one_or_none()
                 if transitioned is None:
                     raise TaskClaimInvariantViolation
+                await session.execute(
+                    insert(task_claim_events).values(
+                        id=uuid4(),
+                        task_attempt_id=inserted.task_attempt_id,
+                        generation=inserted.generation,
+                        event_type=TaskClaimEventType.CLAIM_ACQUIRED.value,
+                        occurred_at=inserted.acquired_at,
+                        previous_lease_expires_at=None,
+                        lease_expires_at=inserted.lease_expires_at,
+                    )
+                )
                 return _claim_result(inserted, TaskClaimOutcome.ACQUIRED_ACTIVE)
         except _CLAIM_REJECTIONS:
             raise
@@ -441,6 +461,17 @@ class SQLAlchemyTaskClaimRepository:
                     if expired:
                         raise TaskClaimRenewalExpired
                     raise TaskClaimInvariantViolation
+                await session.execute(
+                    insert(task_claim_events).values(
+                        id=uuid4(),
+                        task_attempt_id=renewed.task_attempt_id,
+                        generation=renewed.generation,
+                        event_type=TaskClaimEventType.LEASE_RENEWED.value,
+                        occurred_at=func.statement_timestamp(),
+                        previous_lease_expires_at=current.lease_expires_at,
+                        lease_expires_at=renewed.lease_expires_at,
+                    )
+                )
                 return _renewal_result(renewed, TaskClaimRenewalOutcome.RENEWED)
         except _CLAIM_REJECTIONS:
             raise
@@ -448,6 +479,96 @@ class SQLAlchemyTaskClaimRepository:
             raise TaskClaimInvariantViolation from error
         except DBAPIError as error:
             raise TaskClaimPersistenceUnavailable from error
+
+
+class SQLAlchemyTaskClaimInspectionRepository:
+    """Read one ownership-filtered current recorded claim in one statement."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def get_current_claim(
+        self, task_attempt_id: UUID, owner_filter: OwnerFilter
+    ) -> InspectedTaskClaim:
+        reference = select(func.statement_timestamp().label("observed_at")).cte(
+            "claim_inspection_context"
+        )
+        statement = (
+            select(
+                task_attempt_claims.c.task_attempt_id,
+                task_attempts.c.task_run_id,
+                task_runs.c.workflow_run_id,
+                task_attempts.c.attempt_number,
+                task_attempt_claims.c.generation,
+                worker_sessions.c.worker_identity_id,
+                task_attempt_claims.c.worker_session_id,
+                task_attempt_claims.c.acquired_at,
+                task_attempt_claims.c.lease_expires_at,
+                reference.c.observed_at,
+                case(
+                    (
+                        task_attempt_claims.c.lease_expires_at
+                        > reference.c.observed_at,
+                        TaskClaimLeaseStatus.UNEXPIRED.value,
+                    ),
+                    else_=TaskClaimLeaseStatus.EXPIRED.value,
+                ).label("lease_status"),
+                task_runs.c.status.label("task_status"),
+            )
+            .select_from(
+                task_attempt_claims.join(
+                    task_attempts,
+                    task_attempts.c.id == task_attempt_claims.c.task_attempt_id,
+                )
+                .join(task_runs, task_runs.c.id == task_attempts.c.task_run_id)
+                .join(
+                    workflow_runs,
+                    workflow_runs.c.id == task_runs.c.workflow_run_id,
+                )
+                .join(
+                    workflow_definitions,
+                    workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
+                )
+                .join(
+                    worker_sessions,
+                    worker_sessions.c.id == task_attempt_claims.c.worker_session_id,
+                )
+                .join(reference, true())
+            )
+            .where(
+                task_attempt_claims.c.task_attempt_id == task_attempt_id,
+                task_attempt_claims.c.terminated_at.is_(None),
+            )
+        )
+        if not owner_filter.unrestricted:
+            statement = statement.where(
+                workflow_definitions.c.owner_principal_id == owner_filter.principal_id
+            )
+        try:
+            async with self._sessions() as session:
+                row = (await session.execute(statement)).one_or_none()
+            if row is None:
+                raise TaskClaimInspectionNotFound
+            return InspectedTaskClaim(
+                row.task_attempt_id,
+                row.task_run_id,
+                row.workflow_run_id,
+                row.attempt_number,
+                row.generation,
+                row.worker_identity_id,
+                row.worker_session_id,
+                row.acquired_at,
+                row.lease_expires_at,
+                row.observed_at,
+                TaskClaimLeaseStatus(row.lease_status),
+                TaskRunStatus(row.task_status),
+            )
+        except TaskClaimInspectionNotFound:
+            raise
+        except (ValueError, TypeError) as error:
+            raise TaskClaimInspectionInvariantViolation from error
+        except DBAPIError as error:
+            raise TaskClaimInspectionPersistenceUnavailable from error
 
 
 async def _lock_authority(

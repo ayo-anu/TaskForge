@@ -432,6 +432,10 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
             "SELECT EXISTS (SELECT FROM task_attempt_claims WHERE task_attempt_id = $1)",
             rollback_dispatch.task_attempt_id,
         )
+        assert not await setup.fetchval(
+            "SELECT EXISTS (SELECT FROM task_claim_events WHERE task_attempt_id = $1)",
+            rollback_dispatch.task_attempt_id,
+        )
         assert (
             await setup.fetchval(
                 "SELECT status::text FROM task_runs WHERE id = $1",
@@ -896,6 +900,14 @@ async def exercise_dispatch_and_independent_races(
         assert independent.outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
         await transaction.commit()
         assert (await blocked).outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_claim_events WHERE task_attempt_id = "
+                "ANY($1::uuid[])",
+                [blocked_dispatch.task_attempt_id, free_dispatch.task_attempt_id],
+            )
+            == 2
+        )
     finally:
         if blocked is not None and not blocked.done():
             blocked.cancel()

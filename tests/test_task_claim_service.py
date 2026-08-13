@@ -11,7 +11,9 @@ import pytest
 
 from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import (
+    InspectedTaskClaim,
     TaskClaimLease,
+    TaskClaimLeaseStatus,
     TaskClaimOutcome,
     TaskClaimRejected,
     TaskClaimRejectionReason,
@@ -33,9 +35,11 @@ from taskforge.claims.persistence_ports import (
     TaskClaimSessionUnavailable,
     TaskClaimWorkerUnavailable,
 )
-from taskforge.claims.service import TaskClaimService
+from taskforge.claims.service import TaskClaimInspectionService, TaskClaimService
 from taskforge.dispatch.envelope import create_dispatch_envelope
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.identity.authorization import OwnerFilter
+from taskforge.runs.domain import TaskRunStatus
 
 
 class FakeRepository:
@@ -278,3 +282,41 @@ def test_service_does_not_convert_internal_acquisition_failures(
 
     assert raised.value is repository_error
     assert not isinstance(raised.value, TaskClaimRejected)
+
+
+class FakeInspectionRepository:
+    def __init__(self, claim: InspectedTaskClaim) -> None:
+        self.claim = claim
+        self.call: tuple[object, ...] | None = None
+
+    async def get_current_claim(
+        self, task_attempt_id: object, owner_filter: OwnerFilter
+    ) -> InspectedTaskClaim:
+        self.call = (task_attempt_id, owner_filter)
+        return self.claim
+
+
+def test_inspection_service_passes_exact_attempt_and_owner_filter() -> None:
+    observed = datetime.now(UTC)
+    claim = InspectedTaskClaim(
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        1,
+        1,
+        uuid4(),
+        uuid4(),
+        observed - timedelta(seconds=1),
+        observed + timedelta(seconds=60),
+        observed,
+        TaskClaimLeaseStatus.UNEXPIRED,
+        TaskRunStatus.CLAIMED,
+    )
+    repository = FakeInspectionRepository(claim)
+    service = TaskClaimInspectionService(repository)
+    owner_filter = OwnerFilter.only(uuid4())
+
+    result = asyncio.run(service.get_current_claim(claim.task_attempt_id, owner_filter))
+
+    assert result is claim
+    assert repository.call == (claim.task_attempt_id, owner_filter)
