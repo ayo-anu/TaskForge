@@ -35,6 +35,10 @@ from taskforge.worker.handlers import (
     TaskHandlerDefinition,
     TaskHandlerRegistry,
 )
+from taskforge.worker.result_submission import (
+    TaskResultSubmissionOutcome,
+    TaskResultSubmissionReceipt,
+)
 from taskforge.worker.results import (
     TaskCancellation,
     TaskExecutionFailureKind,
@@ -106,6 +110,22 @@ class StartService:
         if self.error is not None:
             raise self.error
         return TaskStartReceipt(TaskStartOutcome.STARTED, self.cancellation_requested)
+
+
+class ResultService:
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.events = events
+        self.requests: list[Any] = []
+
+    async def submit_result(self, *args: Any) -> TaskResultSubmissionReceipt:
+        request = args[-1]
+        self.requests.append(request)
+        if self.events is not None:
+            self.events.append("result")
+        return TaskResultSubmissionReceipt(
+            TaskResultSubmissionOutcome.ACCEPTED,
+            request.task_attempt_id,
+        )
 
 
 def fixture(
@@ -181,17 +201,22 @@ def test_valid_delivery_starts_then_invokes_without_acknowledging() -> None:
         assert control.actions == []
         return None
 
+    result_service = ResultService(events)
     consumer = WorkerExecutionConsumer(
         ClaimService(issued),
         StartService(events),
+        result_service,
         registry(handler),
         worker,
         issued.claim.worker_session_id,
     )
     asyncio.run(consumer.consume(control))
 
-    assert events == ["start", "handler"]
+    assert events == ["start", "handler", "result"]
     assert control.actions == []
+    assert len(result_service.requests) == 1
+    assert result_service.requests[0].result.kind is TaskExecutionResultKind.SUCCESS
+    assert "result_authority=<redacted>" in repr(result_service.requests[0])
 
 
 def execute_and_capture_context(
@@ -219,6 +244,7 @@ def execute_and_capture_context(
     consumer = WorkerExecutionConsumer(
         ClaimService(issued),
         StartService([], cancellation_requested=cancellation_requested),
+        ResultService(),
         registry(handler),
         worker,
         issued.claim.worker_session_id,
@@ -315,6 +341,7 @@ def test_start_invariant_failure_never_invokes_handler_or_acknowledges() -> None
     consumer = WorkerExecutionConsumer(
         ClaimService(issued),
         StartService(events, error=TaskStartInvariantError()),
+        ResultService(),
         registry(handler),
         worker,
         issued.claim.worker_session_id,
@@ -339,6 +366,7 @@ def test_expired_claim_replay_preserves_delivery_without_start_or_handler() -> N
     consumer = WorkerExecutionConsumer(
         ClaimService(expired),
         StartService(events),
+        ResultService(),
         registry(handler),
         worker,
         issued.claim.worker_session_id,
@@ -357,6 +385,7 @@ def test_malformed_delivery_is_rejected_without_claiming() -> None:
     consumer = WorkerExecutionConsumer(
         ClaimService(issued),
         StartService([]),
+        ResultService(),
         registry(lambda value: value),
         worker,
         issued.claim.worker_session_id,
@@ -383,6 +412,7 @@ def test_claim_disposition_is_semantic(
     consumer = WorkerExecutionConsumer(
         ClaimService(TaskClaimRejected(reason)),
         StartService([]),
+        ResultService(),
         registry(lambda value: value),
         worker,
         issued.claim.worker_session_id,
@@ -567,13 +597,14 @@ def test_consumer_uses_durable_timeout_only_for_handler_and_never_acks() -> None
     consumer = WorkerExecutionConsumer(
         ClaimService(issued),
         StartService(events),
+        ResultService(events),
         registry(handler),
         worker,
         issued.claim.worker_session_id,
     )
     asyncio.run(consumer.consume(control))
 
-    assert events == ["start", "handler"]
+    assert events == ["start", "handler", "result"]
     assert control.actions == []
 
 
@@ -608,11 +639,18 @@ def test_timeout_boundary_begins_after_durable_start_and_wraps_only_handler(
     consumer = WorkerExecutionConsumer(
         ClaimService(issued),
         StartService(events),
+        ResultService(events),
         registry(handler),
         worker,
         issued.claim.worker_session_id,
     )
     asyncio.run(consumer.consume(control))
 
-    assert events == ["start", "timeout-enter", "handler", "timeout-exit"]
+    assert events == [
+        "start",
+        "timeout-enter",
+        "handler",
+        "timeout-exit",
+        "result",
+    ]
     assert control.actions == []

@@ -34,6 +34,7 @@ TASK_RUN_STATUSES = (
     "dispatched",
     "claimed",
     "running",
+    "retry_pending",
     "retry_scheduled",
     "succeeded",
     "failed",
@@ -240,6 +241,74 @@ task_attempts = Table(
     ),
 )
 
+task_attempt_results = Table(
+    "task_attempt_results",
+    metadata,
+    Column(
+        "task_attempt_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "task_attempts.id",
+            name="fk_task_attempt_results_task_attempt_id_task_attempts",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        primary_key=True,
+    ),
+    Column("claim_generation", BigInteger, nullable=False),
+    Column(
+        "dispatch_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "task_dispatch_outbox.id",
+            name="fk_task_attempt_results_dispatch_id_task_dispatch_outbox",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+        unique=True,
+    ),
+    Column("result_kind", String(32), nullable=False),
+    Column("failure_kind", String(32), nullable=True),
+    Column("output", JSONB, nullable=True),
+    Column("result_fingerprint", String(64), nullable=False),
+    Column(
+        "completed_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("statement_timestamp()"),
+    ),
+    ForeignKeyConstraint(
+        ("task_attempt_id", "claim_generation"),
+        (
+            "task_attempt_claims.task_attempt_id",
+            "task_attempt_claims.generation",
+        ),
+        name="fk_task_attempt_results_claim_generation",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    CheckConstraint("claim_generation > 0", name="claim_generation_positive"),
+    CheckConstraint(
+        "result_fingerprint ~ '^[0-9a-f]{64}$'",
+        name="result_fingerprint_valid",
+    ),
+    CheckConstraint(
+        "(result_kind = 'success' AND failure_kind IS NULL) OR "
+        "(result_kind = 'retryable_failure' AND failure_kind IN "
+        "('handler_reported', 'handler_exception', 'execution_timeout')) OR "
+        "(result_kind = 'permanent_failure' AND failure_kind = "
+        "'handler_reported') OR "
+        "(result_kind = 'cancellation' AND failure_kind IS NULL)",
+        name="result_shape_valid",
+    ),
+    CheckConstraint(
+        "(result_kind = 'success' AND output IS NOT NULL) OR "
+        "(result_kind <> 'success' AND output IS NULL)",
+        name="output_presence_valid",
+    ),
+)
+
 task_attempt_claims = Table(
     "task_attempt_claims",
     metadata,
@@ -318,6 +387,82 @@ task_claim_events = Table(
         onupdate="RESTRICT",
         ondelete="RESTRICT",
     ),
+)
+
+task_result_events = Table(
+    "task_result_events",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("task_attempt_id", UUID(as_uuid=True), nullable=False),
+    Column("claim_generation", BigInteger, nullable=False),
+    Column(
+        "worker_session_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "worker_sessions.id",
+            name="fk_task_result_events_worker_session_id_worker_sessions",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column(
+        "dispatch_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "task_dispatch_outbox.id",
+            name="fk_task_result_events_dispatch_id_task_dispatch_outbox",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column("event_type", String(32), nullable=False),
+    Column("result_kind", String(32), nullable=False),
+    Column("failure_kind", String(32), nullable=True),
+    Column("result_fingerprint", String(64), nullable=False),
+    Column(
+        "occurred_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("statement_timestamp()"),
+    ),
+    ForeignKeyConstraint(
+        ("task_attempt_id", "claim_generation"),
+        (
+            "task_attempt_claims.task_attempt_id",
+            "task_attempt_claims.generation",
+        ),
+        name="fk_task_result_events_claim_generation",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    CheckConstraint("claim_generation > 0", name="claim_generation_positive"),
+    CheckConstraint(
+        "event_type IN ('result_accepted', 'result_replayed', "
+        "'result_conflict_rejected', 'result_stale_rejected')",
+        name="event_type_valid",
+    ),
+    CheckConstraint(
+        "result_fingerprint ~ '^[0-9a-f]{64}$'",
+        name="result_fingerprint_valid",
+    ),
+    CheckConstraint(
+        "(result_kind = 'success' AND failure_kind IS NULL) OR "
+        "(result_kind = 'retryable_failure' AND failure_kind IN "
+        "('handler_reported', 'handler_exception', 'execution_timeout')) OR "
+        "(result_kind = 'permanent_failure' AND failure_kind = "
+        "'handler_reported') OR "
+        "(result_kind = 'cancellation' AND failure_kind IS NULL)",
+        name="result_shape_valid",
+    ),
+)
+
+Index(
+    "ix_task_result_events_task_attempt_id_occurred_at_id",
+    task_result_events.c.task_attempt_id,
+    task_result_events.c.occurred_at,
+    task_result_events.c.id,
 )
 
 Index(

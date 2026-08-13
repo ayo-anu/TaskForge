@@ -212,6 +212,7 @@ async def verify_failure_propagation(database_url: URL) -> None:
             TaskRunStatus.DISPATCHED,
             TaskRunStatus.CLAIMED,
             TaskRunStatus.RUNNING,
+            TaskRunStatus.RETRY_PENDING,
             TaskRunStatus.RETRY_SCHEDULED,
             TaskRunStatus.SUCCEEDED,
             TaskRunStatus.CANCELLED,

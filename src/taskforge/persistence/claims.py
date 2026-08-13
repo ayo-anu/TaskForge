@@ -220,6 +220,7 @@ class SQLAlchemyTaskClaimRepository:
                     raise TaskClaimInvariantViolation
                 if task.status != TaskRunStatus.DISPATCHED.value:
                     if task.status in (
+                        TaskRunStatus.RETRY_PENDING.value,
                         TaskRunStatus.SUCCEEDED.value,
                         TaskRunStatus.FAILED.value,
                         TaskRunStatus.SKIPPED.value,

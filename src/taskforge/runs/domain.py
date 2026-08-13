@@ -73,6 +73,7 @@ class TaskRunStatus(StrEnum):
     DISPATCHED = "dispatched"
     CLAIMED = "claimed"
     RUNNING = "running"
+    RETRY_PENDING = "retry_pending"
     RETRY_SCHEDULED = "retry_scheduled"
     SUCCEEDED = "succeeded"
     FAILED = "failed"

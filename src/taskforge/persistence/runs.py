@@ -858,6 +858,7 @@ def _pending_to_running_statement(workflow_run_id: UUID) -> Any:
                     TaskRunStatus.DISPATCHED.value,
                     TaskRunStatus.CLAIMED.value,
                     TaskRunStatus.RUNNING.value,
+                    TaskRunStatus.RETRY_PENDING.value,
                     TaskRunStatus.RETRY_SCHEDULED.value,
                     TaskRunStatus.SUCCEEDED.value,
                     TaskRunStatus.FAILED.value,

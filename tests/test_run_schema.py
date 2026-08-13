@@ -16,7 +16,9 @@ from taskforge.persistence.schema import metadata
 from taskforge.runs.schema import (
     TASK_RUN_STATUSES,
     WORKFLOW_RUN_STATUSES,
+    task_attempt_results,
     task_claim_events,
+    task_result_events,
     task_runs,
     workflow_run_idempotency,
     workflow_run_inputs,
@@ -62,6 +64,8 @@ def test_shared_metadata_registers_run_dispatch_and_claim_foundation_tables() ->
         "task_attempts",
         "task_attempt_claims",
         "task_claim_events",
+        "task_attempt_results",
+        "task_result_events",
         "task_dispatch_outbox",
         "workflow_run_idempotency",
     } <= set(metadata.tables)
@@ -186,6 +190,8 @@ def test_every_new_constraint_and_index_has_a_deterministic_name() -> None:
         workflow_run_inputs,
         task_runs,
         task_claim_events,
+        task_attempt_results,
+        task_result_events,
         workflow_run_idempotency,
     ):
         assert all(constraint.name for constraint in table.constraints)

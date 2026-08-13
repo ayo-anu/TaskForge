@@ -146,6 +146,7 @@ async def verify_workflow_state_evaluation(database_url: URL) -> None:
             TaskRunStatus.DISPATCHED,
             TaskRunStatus.CLAIMED,
             TaskRunStatus.RUNNING,
+            TaskRunStatus.RETRY_PENDING,
             TaskRunStatus.RETRY_SCHEDULED,
             TaskRunStatus.CANCELLED,
         ):

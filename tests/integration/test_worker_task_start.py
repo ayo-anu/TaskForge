@@ -28,6 +28,10 @@ from taskforge.worker.handlers import (
     TaskHandlerDefinition,
     TaskHandlerRegistry,
 )
+from taskforge.worker.result_submission import (
+    TaskResultSubmissionOutcome,
+    TaskResultSubmissionReceipt,
+)
 from taskforge.worker.start import TaskStartOutcome, TaskStartRequest, TaskStartService
 from taskforge.workflows.task_types import (
     JSONMapping,
@@ -154,9 +158,19 @@ async def exercise(database_url: URL) -> None:
                 "utf-8",
             ),
         )
+
+        class ResultService:
+            async def submit_result(self, *args: object) -> TaskResultSubmissionReceipt:
+                request = args[-1]
+                return TaskResultSubmissionReceipt(
+                    TaskResultSubmissionOutcome.ACCEPTED,
+                    request.task_attempt_id,  # type: ignore[attr-defined]
+                )
+
         consumer = WorkerExecutionConsumer(
             claim_service,
             start_service,
+            ResultService(),
             handlers,
             worker.authenticated,
             worker.session_id,

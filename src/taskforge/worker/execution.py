@@ -30,6 +30,18 @@ from taskforge.worker.handlers import (
     TaskHandlerRegistry,
     create_task_context,
 )
+from taskforge.worker.result_submission import (
+    TaskResultAuthorityRejected,
+    TaskResultConflict,
+    TaskResultInvalidOutput,
+    TaskResultInvalidState,
+    TaskResultInvariantError,
+    TaskResultNotFound,
+    TaskResultServiceUnavailable,
+    TaskResultStale,
+    TaskResultSubmissionReceipt,
+    TaskResultSubmissionRequest,
+)
 from taskforge.worker.results import (
     TaskCancellation,
     TaskExecutionResult,
@@ -67,6 +79,15 @@ class TaskStarter(Protocol):
     ) -> TaskStartReceipt: ...
 
 
+class TaskResultSubmitter(Protocol):
+    async def submit_result(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        request: TaskResultSubmissionRequest,
+    ) -> TaskResultSubmissionReceipt: ...
+
+
 _ACKNOWLEDGED_REJECTIONS = frozenset(
     {
         TaskClaimRejectionReason.STALE_ATTEMPT,
@@ -90,12 +111,14 @@ class WorkerExecutionConsumer:
         self,
         claim_service: TaskClaimAcquirer,
         start_service: TaskStarter,
+        result_service: TaskResultSubmitter,
         handlers: TaskHandlerRegistry,
         authenticated_worker: AuthenticatedWorker,
         worker_session_id: UUID,
     ) -> None:
         self._claim_service = claim_service
         self._start_service = start_service
+        self._result_service = result_service
         self._handlers = handlers
         self._authenticated_worker = authenticated_worker
         self._worker_session_id = worker_session_id
@@ -171,11 +194,39 @@ class WorkerExecutionConsumer:
                 else None
             ),
         )
-        await _execute_handler(
+        result = await _execute_handler(
             definition.handler,
             context,
             envelope.execution_timeout_seconds,
         )
+        if issued.result_authority is None:
+            raise WorkerConsumptionPaused("active claim lacks result authority")
+        try:
+            await self._result_service.submit_result(
+                self._authenticated_worker,
+                self._worker_session_id,
+                TaskResultSubmissionRequest(
+                    envelope.dispatch_id,
+                    envelope.task_run_id,
+                    envelope.task_attempt_id,
+                    issued.claim.generation,
+                    issued.result_authority,
+                    result,
+                ),
+            )
+        except (
+            TaskResultAuthorityRejected,
+            TaskResultConflict,
+            TaskResultInvalidOutput,
+            TaskResultInvalidState,
+            TaskResultInvariantError,
+            TaskResultNotFound,
+            TaskResultServiceUnavailable,
+            TaskResultStale,
+        ) as error:
+            raise WorkerConsumptionPaused(
+                "task result persistence failed closed"
+            ) from error
 
 
 async def _execute_handler(
