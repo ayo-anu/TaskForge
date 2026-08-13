@@ -39,6 +39,7 @@ from taskforge.worker.result_submission import (
     TaskResultNotFound,
     TaskResultServiceUnavailable,
     TaskResultStale,
+    TaskResultSubmissionOutcome,
     TaskResultSubmissionReceipt,
     TaskResultSubmissionRequest,
 )
@@ -202,7 +203,7 @@ class WorkerExecutionConsumer:
         if issued.result_authority is None:
             raise WorkerConsumptionPaused("active claim lacks result authority")
         try:
-            await self._result_service.submit_result(
+            receipt = await self._result_service.submit_result(
                 self._authenticated_worker,
                 self._worker_session_id,
                 TaskResultSubmissionRequest(
@@ -227,6 +228,16 @@ class WorkerExecutionConsumer:
             raise WorkerConsumptionPaused(
                 "task result persistence failed closed"
             ) from error
+        if (
+            receipt.task_attempt_id != envelope.task_attempt_id
+            or receipt.outcome
+            not in {
+                TaskResultSubmissionOutcome.ACCEPTED,
+                TaskResultSubmissionOutcome.REPLAYED_IDENTICAL,
+            }
+        ):
+            raise WorkerConsumptionPaused("task result receipt failed closed")
+        await control.acknowledge()
 
 
 async def _execute_handler(

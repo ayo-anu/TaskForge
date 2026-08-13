@@ -177,7 +177,7 @@ async def exercise(database_url: URL) -> None:
         )
         await consumer.consume(control)
         assert events == ["handler"]
-        assert not control.disposed
+        assert control.disposed
     finally:
         await setup.close()
         await engine.dispose()
