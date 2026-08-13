@@ -7,6 +7,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass
+from datetime import UTC, datetime
 from types import MappingProxyType
 from uuid import UUID
 
@@ -19,7 +20,8 @@ from taskforge.workflows.task_types import (
     MAX_PARAMETER_STRING_LENGTH,
 )
 
-DISPATCH_ENVELOPE_VERSION = 1
+LEGACY_DISPATCH_ENVELOPE_VERSION = 1
+DISPATCH_ENVELOPE_VERSION = 2
 MAX_TASK_PAYLOAD_BYTES = 16 * 1024
 MAX_REFERENCE_BYTES = 16 * 1024
 MAX_DISPATCH_ENVELOPE_BYTES = 32 * 1024
@@ -35,7 +37,7 @@ type ValidationPath = tuple[str | int, ...]
 
 _TASK_NAME = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
 _TRACE_PARENT = re.compile(r"\A00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})\Z")
-_ENVELOPE_FIELDS = frozenset(
+_V1_ENVELOPE_FIELDS = frozenset(
     {
         "schema_version",
         "dispatch_id",
@@ -51,7 +53,9 @@ _ENVELOPE_FIELDS = frozenset(
         "trace_context",
     }
 )
-_REQUIRED_FIELDS = _ENVELOPE_FIELDS - {"correlation_id", "trace_context"}
+_V1_REQUIRED_FIELDS = _V1_ENVELOPE_FIELDS - {"correlation_id", "trace_context"}
+_V2_ENVELOPE_FIELDS = _V1_ENVELOPE_FIELDS | {"deadline_at"}
+_V2_REQUIRED_FIELDS = _V1_REQUIRED_FIELDS | {"deadline_at"}
 _VALIDATED_CONSTRUCTION = object()
 
 
@@ -95,6 +99,7 @@ class DispatchEnvelope:
     required_capability: str
     task_payload: FrozenJSONMapping
     references: FrozenJSONMapping
+    deadline_at: datetime | None = None
     correlation_id: str | None = None
     trace_context: TraceContext | None = None
     _validated_construction: InitVar[object] = None
@@ -119,7 +124,8 @@ class DispatchEnvelope:
             f"task_type={self.task_type!r}, "
             f"required_capability={self.required_capability!r}, "
             "task_payload=<redacted>, references=<redacted>, "
-            f"correlation_id={self.correlation_id!r}, trace_context=<redacted>)"
+            f"deadline_at={self.deadline_at!r}, correlation_id={self.correlation_id!r}, "
+            "trace_context=<redacted>)"
         )
 
 
@@ -151,10 +157,11 @@ def create_dispatch_envelope(
     required_capability: object,
     task_payload: object,
     references: object,
+    deadline_at: object = None,
     correlation_id: object = None,
     trace_context: object = None,
 ) -> DispatchEnvelope:
-    """Validate and freeze one version 1 dispatch envelope."""
+    """Validate and freeze one current-version dispatch envelope."""
     return _create_from_mapping(
         {
             "schema_version": DISPATCH_ENVELOPE_VERSION,
@@ -167,6 +174,7 @@ def create_dispatch_envelope(
             "required_capability": required_capability,
             "task_payload": task_payload,
             "references": references,
+            "deadline_at": deadline_at,
             "correlation_id": correlation_id,
             "trace_context": trace_context,
         },
@@ -188,6 +196,12 @@ def dispatch_envelope_to_mapping(envelope: DispatchEnvelope) -> dict[str, object
         "task_payload": _thaw_json(envelope.task_payload),
         "references": _thaw_json(envelope.references),
     }
+    if envelope.schema_version == DISPATCH_ENVELOPE_VERSION:
+        mapping["deadline_at"] = (
+            format_canonical_deadline(envelope.deadline_at)
+            if envelope.deadline_at is not None
+            else None
+        )
     if envelope.correlation_id is not None:
         mapping["correlation_id"] = envelope.correlation_id
     if envelope.trace_context is not None:
@@ -245,21 +259,29 @@ def _create_from_mapping(
     value: Mapping[str, object], *, canonical_uuid_strings: bool
 ) -> DispatchEnvelope:
     version = value.get("schema_version")
-    if type(version) is not int or version != DISPATCH_ENVELOPE_VERSION:
+    if type(version) is not int or version not in (
+        LEGACY_DISPATCH_ENVELOPE_VERSION,
+        DISPATCH_ENVELOPE_VERSION,
+    ):
         raise _single_issue(
             "unsupported_schema_version",
             ("schema_version",),
             "Dispatch envelope schema version is unsupported.",
         )
 
+    fields, required_fields = (
+        (_V1_ENVELOPE_FIELDS, _V1_REQUIRED_FIELDS)
+        if version == LEGACY_DISPATCH_ENVELOPE_VERSION
+        else (_V2_ENVELOPE_FIELDS, _V2_REQUIRED_FIELDS)
+    )
     issues: list[DispatchEnvelopeIssue] = []
-    for field in sorted(_REQUIRED_FIELDS - value.keys()):
+    for field in sorted(required_fields - value.keys()):
         issues.append(
             DispatchEnvelopeIssue(
                 "missing_field", (field,), "Required envelope field is missing."
             )
         )
-    for field in sorted(value.keys() - _ENVELOPE_FIELDS):
+    for field in sorted(value.keys() - fields):
         issues.append(
             DispatchEnvelopeIssue(
                 "unknown_field", (field,), "Envelope field is not supported."
@@ -307,6 +329,11 @@ def _create_from_mapping(
     )
     correlation_id = _validate_correlation_id(value.get("correlation_id"), issues)
     trace_context = _validate_trace_context(value.get("trace_context"), issues)
+    deadline_at = (
+        None
+        if version == LEGACY_DISPATCH_ENVELOPE_VERSION
+        else _validate_deadline_at(value.get("deadline_at"), issues)
+    )
     if issues:
         raise DispatchEnvelopeValidationError(tuple(issues))
 
@@ -320,7 +347,7 @@ def _create_from_mapping(
     assert frozen_payload is not None
     assert frozen_references is not None
     envelope = DispatchEnvelope(
-        schema_version=DISPATCH_ENVELOPE_VERSION,
+        schema_version=version,
         dispatch_id=dispatch_id,
         task_attempt_id=task_attempt_id,
         task_run_id=task_run_id,
@@ -330,12 +357,59 @@ def _create_from_mapping(
         required_capability=required_capability,
         task_payload=frozen_payload,
         references=frozen_references,
+        deadline_at=deadline_at,
         correlation_id=correlation_id,
         trace_context=trace_context,
         _validated_construction=_VALIDATED_CONSTRUCTION,
     )
     serialize_dispatch_envelope(envelope)
     return envelope
+
+
+def format_canonical_deadline(value: datetime) -> str:
+    """Serialize one aware instant in the sole version-2 wire representation."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("deadline must be timezone-aware")
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def parse_canonical_deadline(value: str) -> datetime:
+    """Parse only the canonical UTC deadline representation."""
+    if not isinstance(value, str):
+        raise ValueError("deadline must be a string")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    except ValueError as error:
+        raise ValueError("deadline is not canonical") from error
+    if format_canonical_deadline(parsed) != value:
+        raise ValueError("deadline is not canonical")
+    return parsed
+
+
+def _validate_deadline_at(
+    value: object, issues: list[DispatchEnvelopeIssue]
+) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        try:
+            canonical = format_canonical_deadline(value)
+            return parse_canonical_deadline(canonical)
+        except ValueError:
+            pass
+    elif isinstance(value, str):
+        try:
+            return parse_canonical_deadline(value)
+        except ValueError:
+            pass
+    issues.append(
+        DispatchEnvelopeIssue(
+            "invalid_deadline_at",
+            ("deadline_at",),
+            "Deadline must be null or a canonical UTC timestamp.",
+        )
+    )
+    return None
 
 
 def _validate_uuid(

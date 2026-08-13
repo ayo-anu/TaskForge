@@ -71,12 +71,17 @@ def repository(session: FakeSession) -> SQLAlchemyTaskStartRepository:
 
 
 def facts(
-    status: str = "claimed",
+    status: str = "claimed", workflow_run_status: str = "running"
 ) -> tuple[AuthenticatedWorker, UUID, UUID, UUID, object, datetime]:
     worker = AuthenticatedWorker(uuid4(), uuid4())
     session_id, task_run_id, attempt_id = uuid4(), uuid4(), uuid4()
     expiry = datetime.now(UTC) + timedelta(seconds=60)
-    task = SimpleNamespace(id=task_run_id, status=status, attempt_number=1)
+    task = SimpleNamespace(
+        id=task_run_id,
+        status=status,
+        attempt_number=1,
+        workflow_run_status=workflow_run_status,
+    )
     return worker, session_id, task_run_id, attempt_id, task, expiry
 
 
@@ -132,7 +137,33 @@ def test_repository_replays_running_without_mutation() -> None:
         repository(session).start_task(worker, session_id, task_run_id, attempt_id, 2)
     )
 
-    assert not started
+    assert not started.started
+    assert not any(isinstance(value, Update) for value in session.statements)
+
+
+@pytest.mark.parametrize("workflow_status", ("succeeded", "failed", "cancelled"))
+def test_repository_fails_closed_for_terminal_workflow_at_start_boundary(
+    workflow_status: str,
+) -> None:
+    worker, session_id, task_run_id, attempt_id, task, _ = facts(
+        workflow_run_status=workflow_status
+    )
+    session = FakeSession(
+        [
+            SimpleNamespace(id=worker.worker_identity_id),
+            SimpleNamespace(id=worker.credential_id),
+            SimpleNamespace(ended_at=None),
+            task,
+        ],
+        [1],
+    )
+
+    with pytest.raises(TaskStartInvariantViolation):
+        asyncio.run(
+            repository(session).start_task(
+                worker, session_id, task_run_id, attempt_id, 2
+            )
+        )
     assert not any(isinstance(value, Update) for value in session.statements)
 
 

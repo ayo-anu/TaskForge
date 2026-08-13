@@ -409,7 +409,8 @@ async def _create_prepared_run(
             requested_by_principal_id=requested_by_principal_id,
         )
     task_values = tuple(
-        NewTaskRun(uuid4(), task.step_identifier, task.status) for task in initial_tasks
+        NewTaskRun(uuid4(), task.step_identifier, task.status, task.deadline_seconds)
+        for task in initial_tasks
     )
     timestamps = await transaction.insert_complete_run(
         prepared,

@@ -33,6 +33,7 @@ from taskforge.runs.domain import (
     WorkflowRunTargetUnavailable,
     WorkflowRunVersionDependency,
     WorkflowRunVersionSnapshot,
+    WorkflowRunVersionStep,
     WorkflowVersionSelection,
     create_workflow_run_idempotency,
 )
@@ -341,7 +342,9 @@ def test_service_delegates_runnable_transition_without_reinterpreting_result() -
     assert repository.calls == [("transition_runnable_tasks", run_id)]
 
 
-def test_empty_runnable_transition_is_successful_and_unavailability_is_normalized() -> None:
+def test_empty_runnable_transition_is_successful_and_unavailability_is_normalized() -> (
+    None
+):
     run_id = uuid4()
     empty = asyncio.run(
         WorkflowRunService(FakeRepository()).transition_runnable_tasks(run_id)
@@ -390,9 +393,9 @@ def test_dependency_failure_propagation_preserves_unexpected_failures(
 ) -> None:
     with pytest.raises(type(failure)):
         asyncio.run(
-            WorkflowRunService(FakeRepository(failure=failure)).propagate_dependency_failures(
-                uuid4()
-            )
+            WorkflowRunService(
+                FakeRepository(failure=failure)
+            ).propagate_dependency_failures(uuid4())
         )
 
 
@@ -598,7 +601,7 @@ def prepared_creation(
             workflow_definition_id=workflow_id,
             workflow_version_id=version_id,
             version_number=4,
-            step_identifiers=("leaf", "root"),
+            steps=(WorkflowRunVersionStep("leaf"), WorkflowRunVersionStep("root")),
             dependencies=(WorkflowRunVersionDependency("root", "leaf"),),
         )
         if with_snapshot
@@ -1048,7 +1051,9 @@ def reconciliation_service(
     return WorkflowRunService(repository)  # type: ignore[arg-type]
 
 
-def test_reconciler_calls_existing_operations_in_order_and_stops_at_quiescence() -> None:
+def test_reconciler_calls_existing_operations_in_order_and_stops_at_quiescence() -> (
+    None
+):
     run_id = uuid4()
     repository = ScriptedProgressionRepository(
         run_id,
@@ -1057,7 +1062,9 @@ def test_reconciler_calls_existing_operations_in_order_and_stops_at_quiescence()
         [workflow_result(run_id, WorkflowRunStatus.RUNNING)],
     )
 
-    result = asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
+    result = asyncio.run(
+        reconciliation_service(repository).reconcile_workflow_run(run_id)
+    )
 
     assert result == WorkflowRunReconciliationResult(
         run_id, True, 1, 0, 0, 0, WorkflowRunStatus.RUNNING, True, False
@@ -1065,7 +1072,9 @@ def test_reconciler_calls_existing_operations_in_order_and_stops_at_quiescence()
     assert repository.calls == ["runnable", "skipped", "workflow"]
 
 
-def test_reconciler_completes_late_pending_success_without_post_terminal_cycle() -> None:
+def test_reconciler_completes_late_pending_success_without_post_terminal_cycle() -> (
+    None
+):
     run_id = uuid4()
     repository = ScriptedProgressionRepository(
         run_id,
@@ -1081,7 +1090,9 @@ def test_reconciler_completes_late_pending_success_without_post_terminal_cycle()
         ],
     )
 
-    result = asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
+    result = asyncio.run(
+        reconciliation_service(repository).reconcile_workflow_run(run_id)
+    )
 
     assert result.iterations == 2
     assert result.workflow_transition_count == 2
@@ -1125,17 +1136,16 @@ def test_reconciler_enforces_behavioral_iteration_budget_without_ninth_cycle() -
             progressed_runnable(run_id, f"step-{iteration}")
             for iteration in range(MAX_WORKFLOW_RECONCILIATION_ITERATIONS)
         ],
-        [
-            empty_skipped(run_id)
-            for _ in range(MAX_WORKFLOW_RECONCILIATION_ITERATIONS)
-        ],
+        [empty_skipped(run_id) for _ in range(MAX_WORKFLOW_RECONCILIATION_ITERATIONS)],
         [
             workflow_result(run_id, WorkflowRunStatus.RUNNING)
             for _ in range(MAX_WORKFLOW_RECONCILIATION_ITERATIONS)
         ],
     )
 
-    result = asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
+    result = asyncio.run(
+        reconciliation_service(repository).reconcile_workflow_run(run_id)
+    )
 
     assert result.iterations == MAX_WORKFLOW_RECONCILIATION_ITERATIONS
     assert result.runnable_transition_count == MAX_WORKFLOW_RECONCILIATION_ITERATIONS
@@ -1162,7 +1172,9 @@ def test_reconciler_can_prove_quiescence_on_final_budgeted_iteration() -> None:
         ],
     )
 
-    result = asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
+    result = asyncio.run(
+        reconciliation_service(repository).reconcile_workflow_run(run_id)
+    )
 
     assert result.iterations == MAX_WORKFLOW_RECONCILIATION_ITERATIONS
     assert result.quiescent and not result.bound_reached

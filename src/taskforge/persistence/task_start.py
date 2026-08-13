@@ -10,10 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.schema import worker_credentials, worker_identities
-from taskforge.runs.domain import TaskRunStatus
-from taskforge.runs.schema import task_attempt_claims, task_attempts, task_runs
+from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
+from taskforge.runs.schema import (
+    task_attempt_claims,
+    task_attempts,
+    task_runs,
+    workflow_runs,
+)
 from taskforge.worker.schema import worker_sessions
 from taskforge.worker.start_persistence_ports import (
+    PersistedTaskStart,
     TaskStartAuthorityRejected,
     TaskStartClaimStale,
     TaskStartInvariantViolation,
@@ -40,7 +46,7 @@ class SQLAlchemyTaskStartRepository:
         task_run_id: UUID,
         task_attempt_id: UUID,
         claim_generation: int,
-    ) -> bool:
+    ) -> PersistedTaskStart:
         if claim_generation <= 0:
             raise ValueError("claim generation must be positive")
         try:
@@ -55,11 +61,15 @@ class SQLAlchemyTaskStartRepository:
                             task_runs.c.id,
                             task_runs.c.status,
                             task_attempts.c.attempt_number,
+                            workflow_runs.c.status.label("workflow_run_status"),
                         )
                         .select_from(
                             task_attempts.join(
                                 task_runs,
                                 task_runs.c.id == task_attempts.c.task_run_id,
+                            ).join(
+                                workflow_runs,
+                                workflow_runs.c.id == task_runs.c.workflow_run_id,
                             )
                         )
                         .where(
@@ -70,6 +80,13 @@ class SQLAlchemyTaskStartRepository:
                     )
                 ).one_or_none()
                 if task is None:
+                    raise TaskStartInvariantViolation
+                workflow_status = WorkflowRunStatus(task.workflow_run_status)
+                if workflow_status in (
+                    WorkflowRunStatus.SUCCEEDED,
+                    WorkflowRunStatus.FAILED,
+                    WorkflowRunStatus.CANCELLED,
+                ):
                     raise TaskStartInvariantViolation
 
                 latest_attempt = await session.scalar(
@@ -109,7 +126,7 @@ class SQLAlchemyTaskStartRepository:
                     raise TaskStartClaimStale
 
                 if task.status == TaskRunStatus.RUNNING.value:
-                    return False
+                    return PersistedTaskStart(False, workflow_status)
                 if task.status != TaskRunStatus.CLAIMED.value:
                     raise TaskStartInvariantViolation
                 transitioned = (
@@ -128,7 +145,7 @@ class SQLAlchemyTaskStartRepository:
                 ).one_or_none()
                 if transitioned is None:
                     raise TaskStartInvariantViolation
-                return True
+                return PersistedTaskStart(True, workflow_status)
         except _START_REJECTIONS:
             raise
         except IntegrityError as error:

@@ -24,8 +24,8 @@ from taskforge.persistence.task_start import SQLAlchemyTaskStartRepository
 from taskforge.worker.consumer_ports import BrokerDispatchDelivery
 from taskforge.worker.execution import WorkerExecutionConsumer
 from taskforge.worker.handlers import (
+    TaskContext,
     TaskHandlerDefinition,
-    TaskHandlerInvocation,
     TaskHandlerRegistry,
 )
 from taskforge.worker.start import TaskStartOutcome, TaskStartRequest, TaskStartService
@@ -106,7 +106,7 @@ async def exercise(database_url: URL) -> None:
             start_service.start_task(worker.authenticated, worker.session_id, request),
             start_service.start_task(worker.authenticated, worker.session_id, request),
         )
-        assert {first, second} == {
+        assert {first.outcome, second.outcome} == {
             TaskStartOutcome.STARTED,
             TaskStartOutcome.REPLAYED_RUNNING,
         }
@@ -125,7 +125,7 @@ async def exercise(database_url: URL) -> None:
 
         events: list[str] = []
 
-        async def handler(invocation: TaskHandlerInvocation) -> object:
+        async def handler(invocation: TaskContext) -> object:
             assert invocation.task_attempt_id == dispatch.task_attempt_id
             # This write would block if the start transaction retained the task row lock.
             await asyncio.wait_for(

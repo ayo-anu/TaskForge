@@ -109,7 +109,11 @@ async def verify_dependency_resolution(database_url: URL) -> None:
 
         async def set_join(left: str, right: str, candidate: str = "blocked") -> None:
             async with sessions.begin() as session:
-                for step, status in (("left", left), ("right", right), ("join", candidate)):
+                for step, status in (
+                    ("left", left),
+                    ("right", right),
+                    ("join", candidate),
+                ):
                     await session.execute(
                         update(task_runs)
                         .where(
@@ -144,7 +148,10 @@ async def verify_dependency_resolution(database_url: URL) -> None:
             await set_join("succeeded", "succeeded", candidate_status.value)
             result = await service.transition_runnable_tasks(join_run.id)
             assert result.transitioned_count == 0
-            assert await task_status(sessions, join_run.id, "join") == candidate_status.value
+            assert (
+                await task_status(sessions, join_run.id, "join")
+                == candidate_status.value
+            )
 
         # Cancelling and terminal runs suppress otherwise eligible transitions.
         for run_status in (

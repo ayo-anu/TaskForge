@@ -76,6 +76,7 @@ class CreateWorkflowStepRequest(BaseModel):
     identifier: str
     task_type: str
     parameters: dict[str, JSONValue]
+    execution_policy: dict[str, JSONValue] | None = None
 
 
 class CreateWorkflowDependencyRequest(BaseModel):
@@ -90,6 +91,7 @@ class CreateWorkflowRequest(BaseModel):
 
     name: str
     description: str | None = None
+    execution_policy: dict[str, JSONValue] | None = None
     steps: list[CreateWorkflowStepRequest]
     dependencies: list[CreateWorkflowDependencyRequest] = Field(default_factory=list)
 
@@ -99,6 +101,7 @@ class WorkflowStepResponse(BaseModel):
     identifier: str
     task_type: str
     parameters: JSONMapping
+    execution_policy: JSONMapping | None
 
 
 class WorkflowDependencyResponse(BaseModel):
@@ -113,6 +116,7 @@ class WorkflowResponse(BaseModel):
     name: str
     description: str | None
     status: WorkflowDefinitionStatus
+    execution_policy: JSONMapping | None
     created_at: datetime
     updated_at: datetime
     steps: list[WorkflowStepResponse]
@@ -301,6 +305,7 @@ async def create_workflow(
             status=WorkflowDefinitionStatus.DRAFT,
             steps=steps,
             dependencies=dependencies,
+            execution_policy=body.execution_policy,
         )
         stored = await runtime.workflow_service.create(workflow)
     except WorkflowValidationError as error:
@@ -343,6 +348,7 @@ async def validate_workflow(
             status=WorkflowDefinitionStatus.DRAFT,
             steps=steps,
             dependencies=dependencies,
+            execution_policy=body.execution_policy,
         )
     except WorkflowValidationError as error:
         if error.graph_result is not None:
@@ -529,6 +535,7 @@ def _create_steps(
                     identifier=step.identifier,
                     task_type=step.task_type,
                     parameters=step.parameters,
+                    execution_policy=step.execution_policy,
                     task_types=task_types,
                 )
             )
@@ -628,6 +635,7 @@ def _workflow_response(stored: StoredWorkflowDraft) -> WorkflowResponse:
         name=draft.name,
         description=draft.description,
         status=draft.status,
+        execution_policy=draft.execution_policy,
         created_at=stored.created_at,
         updated_at=stored.updated_at,
         steps=[
@@ -636,6 +644,7 @@ def _workflow_response(stored: StoredWorkflowDraft) -> WorkflowResponse:
                 identifier=step.identifier,
                 task_type=step.task_type,
                 parameters=step.parameters,
+                execution_policy=step.execution_policy,
             )
             for step in draft.steps
         ],

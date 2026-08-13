@@ -27,6 +27,7 @@ from taskforge.runs.domain import (
     WorkflowRunTargetUnavailable,
     WorkflowRunVersionDependency,
     WorkflowRunVersionSnapshot,
+    WorkflowRunVersionStep,
     WorkflowVersionSnapshotInvalid,
     create_workflow_run_idempotency,
     create_workflow_run_input,
@@ -357,7 +358,7 @@ def snapshot(
         workflow_definition_id=uuid4(),
         workflow_version_id=uuid4(),
         version_number=1,
-        step_identifiers=steps,
+        steps=tuple(WorkflowRunVersionStep(step) for step in steps),
         dependencies=tuple(
             WorkflowRunVersionDependency(predecessor, successor)
             for predecessor, successor in dependencies
@@ -513,3 +514,9 @@ def test_request_fingerprint_is_canonical_and_covers_request_semantics() -> None
         == 5
     )
     assert first.key_digest == explicit.key_digest
+
+
+@pytest.mark.parametrize("deadline", (True, 0, 31_536_001))
+def test_version_step_rejects_deadline_outside_policy_domain(deadline: object) -> None:
+    with pytest.raises(ValueError, match="supported range"):
+        WorkflowRunVersionStep("step", deadline)  # type: ignore[arg-type]

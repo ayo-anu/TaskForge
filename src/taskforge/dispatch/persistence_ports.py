@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Protocol
 from uuid import UUID
@@ -31,6 +32,13 @@ class PreparedTaskDispatch:
     task_type: str
     task_parameters: JSONMapping
     attempt_number: int
+    deadline_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.deadline_at is not None:
+            if self.deadline_at.tzinfo is None or self.deadline_at.utcoffset() is None:
+                raise ValueError("dispatch deadline must be timezone-aware")
+            object.__setattr__(self, "deadline_at", self.deadline_at.astimezone(UTC))
 
     def __repr__(self) -> str:
         return (
@@ -40,7 +48,8 @@ class PreparedTaskDispatch:
             f"workflow_version_id={self.workflow_version_id!r}, "
             f"step_identifier={self.step_identifier!r}, "
             f"task_type={self.task_type!r}, task_parameters=<redacted>, "
-            f"attempt_number={self.attempt_number!r})"
+            f"attempt_number={self.attempt_number!r}, "
+            f"deadline_at={self.deadline_at!r})"
         )
 
 

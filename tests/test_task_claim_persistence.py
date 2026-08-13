@@ -24,10 +24,85 @@ from taskforge.claims.persistence_ports import (
 from taskforge.dispatch.envelope import (
     DispatchEnvelope,
     create_dispatch_envelope,
+    deserialize_dispatch_envelope,
     dispatch_envelope_to_mapping,
 )
 from taskforge.identity.authentication import AuthenticatedWorker
-from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
+from taskforge.persistence.claims import (
+    SQLAlchemyTaskClaimRepository,
+    _dispatch_matches,
+)
+
+
+def legacy(envelope: DispatchEnvelope) -> DispatchEnvelope:
+    import json
+
+    mapping = dispatch_envelope_to_mapping(envelope)
+    mapping["schema_version"] = 1
+    del mapping["deadline_at"]
+    return deserialize_dispatch_envelope(
+        json.dumps(mapping, separators=(",", ":"), sort_keys=True).encode()
+    )
+
+
+def test_full_payload_match_fences_v2_deadline_and_version() -> None:
+    deadline = datetime(2026, 8, 13, 20, tzinfo=UTC)
+    envelope = create_dispatch_envelope(
+        dispatch_id=uuid4(),
+        task_attempt_id=uuid4(),
+        task_run_id=uuid4(),
+        workflow_run_id=uuid4(),
+        attempt_number=1,
+        task_type="test.task",
+        required_capability="test-capability",
+        task_payload={},
+        references={},
+        deadline_at=deadline,
+    )
+    durable = SimpleNamespace(
+        attempt_number=1,
+        task_type="test.task",
+        route=envelope.route,
+        payload=dispatch_envelope_to_mapping(envelope),
+    )
+    changed = create_dispatch_envelope(
+        dispatch_id=envelope.dispatch_id,
+        task_attempt_id=envelope.task_attempt_id,
+        task_run_id=envelope.task_run_id,
+        workflow_run_id=envelope.workflow_run_id,
+        attempt_number=1,
+        task_type="test.task",
+        required_capability="test-capability",
+        task_payload={},
+        references={},
+        deadline_at=deadline + timedelta(seconds=1),
+    )
+    assert _dispatch_matches(envelope, cast(Any, durable))
+    assert not _dispatch_matches(changed, cast(Any, durable))
+    assert not _dispatch_matches(legacy(envelope), cast(Any, durable))
+
+
+def test_full_payload_match_preserves_historical_v1() -> None:
+    current = create_dispatch_envelope(
+        dispatch_id=uuid4(),
+        task_attempt_id=uuid4(),
+        task_run_id=uuid4(),
+        workflow_run_id=uuid4(),
+        attempt_number=1,
+        task_type="test.task",
+        required_capability="test-capability",
+        task_payload={},
+        references={},
+    )
+    envelope = legacy(current)
+    durable = SimpleNamespace(
+        attempt_number=1,
+        task_type="test.task",
+        route=envelope.route,
+        payload=dispatch_envelope_to_mapping(envelope),
+    )
+    assert envelope.deadline_at is None
+    assert _dispatch_matches(envelope, cast(Any, durable))
 
 
 class FakeResult:

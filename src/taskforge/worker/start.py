@@ -7,7 +7,9 @@ from enum import StrEnum
 from uuid import UUID
 
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.runs.domain import WorkflowRunStatus
 from taskforge.worker.start_persistence_ports import (
+    PersistedTaskStart,
     TaskStartAuthorityRejected,
     TaskStartClaimStale,
     TaskStartInvariantViolation,
@@ -45,6 +47,12 @@ class TaskStartRequest:
             raise ValueError("claim generation must be positive")
 
 
+@dataclass(frozen=True)
+class TaskStartReceipt:
+    outcome: TaskStartOutcome
+    cancellation_requested_at_start: bool
+
+
 class TaskStartService:
     def __init__(self, repository: TaskStartRepository) -> None:
         self._repository = repository
@@ -54,9 +62,9 @@ class TaskStartService:
         authenticated_worker: AuthenticatedWorker,
         worker_session_id: UUID,
         request: TaskStartRequest,
-    ) -> TaskStartOutcome:
+    ) -> TaskStartReceipt:
         try:
-            started = await self._repository.start_task(
+            persisted = await self._repository.start_task(
                 authenticated_worker,
                 worker_session_id,
                 request.task_run_id,
@@ -73,6 +81,10 @@ class TaskStartService:
             raise TaskStartInvariantError from error
         except TaskStartPersistenceUnavailable as error:
             raise TaskStartServiceUnavailable from error
-        return (
-            TaskStartOutcome.STARTED if started else TaskStartOutcome.REPLAYED_RUNNING
+        assert isinstance(persisted, PersistedTaskStart)
+        return TaskStartReceipt(
+            TaskStartOutcome.STARTED
+            if persisted.started
+            else TaskStartOutcome.REPLAYED_RUNNING,
+            persisted.workflow_run_status is WorkflowRunStatus.CANCELLING,
         )

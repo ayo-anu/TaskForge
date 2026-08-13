@@ -8,7 +8,7 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, func, insert, null, or_, select, text, update
+from sqlalchemy import and_, func, insert, or_, select, text, update
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -393,6 +393,7 @@ class SQLAlchemyWorkflowUnitOfWork:
                         owner_principal_id=workflow.owner_principal_id,
                         name=workflow.name,
                         description=workflow.description,
+                        execution_policy=workflow.execution_policy,
                         status=workflow.status.value,
                     )
                     .returning(
@@ -424,6 +425,7 @@ class SQLAlchemyWorkflowUnitOfWork:
                         "step_identifier": step.identifier,
                         "task_type": step.task_type,
                         "parameters": step.parameters,
+                        "execution_policy": step.execution_policy,
                     }
                     for step in steps
                 ],
@@ -604,7 +606,7 @@ class SQLAlchemyWorkflowUnitOfWork:
                     version_number=version_number,
                     name=workflow.name,
                     description=workflow.description,
-                    execution_policy=null(),
+                    execution_policy=workflow.execution_policy,
                 )
                 .returning(workflow_versions.c.published_at)
             )
@@ -632,6 +634,7 @@ class SQLAlchemyWorkflowUnitOfWork:
                         "step_identifier": step.identifier,
                         "task_type": step.task_type,
                         "parameters": step.parameters,
+                        "execution_policy": step.execution_policy,
                     }
                     for step in sorted(steps, key=lambda item: item.identifier)
                 ],
@@ -713,6 +716,7 @@ def _stored_draft(
             identifier=row.step_identifier,
             task_type=row.task_type,
             parameters=row.parameters,
+            execution_policy=getattr(row, "execution_policy", None),
         )
         for row in step_rows
     )
@@ -733,6 +737,7 @@ def _stored_draft(
         status=WorkflowDefinitionStatus(definition_row.status),
         steps=steps,
         dependencies=dependencies,
+        execution_policy=getattr(definition_row, "execution_policy", None),
     )
     return StoredWorkflowDraft(
         draft=draft,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -87,12 +88,14 @@ async def seed_workflow(
                     "workflow_definition_id": workflow_id,
                     "version_number": 1,
                     "name": "one",
+                    "execution_policy": {"deadline_seconds": 100},
                 },
                 {
                     "id": version_two_id,
                     "workflow_definition_id": workflow_id,
                     "version_number": 2,
                     "name": "two",
+                    "execution_policy": None,
                 },
             ],
         )
@@ -104,6 +107,9 @@ async def seed_workflow(
                     "step_identifier": identifier,
                     "task_type": "test.task",
                     "parameters": {},
+                    "execution_policy": (
+                        {"deadline_seconds": 25} if identifier == "leaf" else None
+                    ),
                 }
                 for identifier in ("root", "leaf")
             ]
@@ -113,6 +119,7 @@ async def seed_workflow(
                     "step_identifier": identifier,
                     "task_type": "test.task",
                     "parameters": {},
+                    "execution_policy": None,
                 }
                 for identifier in ("left", "right", "join")
             ],
@@ -185,6 +192,19 @@ async def verify_creation(database_url: URL) -> None:
             ).one()
             assert explicit_input.payload == {"value": 1}
             assert explicit_input.input_references == {"artifact": {"kind": "object"}}
+            explicit_deadlines = (
+                await session.execute(
+                    select(task_runs.c.step_identifier, task_runs.c.deadline_at)
+                    .where(task_runs.c.workflow_run_id == explicit.id)
+                    .order_by(task_runs.c.step_identifier)
+                )
+            ).all()
+            assert [
+                (row.step_identifier, row.deadline_at) for row in explicit_deadlines
+            ] == [
+                ("leaf", explicit.created_at + timedelta(seconds=25)),
+                ("root", explicit.created_at + timedelta(seconds=100)),
+            ]
             rows = (
                 await session.execute(
                     select(task_runs.c.step_identifier, task_runs.c.status)

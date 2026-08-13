@@ -22,10 +22,14 @@ from taskforge.dispatch.transport import (
 )
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.worker.consumer_ports import DispatchDeliveryControl
-from taskforge.worker.handlers import TaskHandlerInvocation, TaskHandlerRegistry
+from taskforge.worker.handlers import (
+    TaskDeadline,
+    TaskHandlerRegistry,
+    create_task_context,
+)
 from taskforge.worker.start import (
     TaskStartInvariantError,
-    TaskStartOutcome,
+    TaskStartReceipt,
     TaskStartRejected,
     TaskStartRequest,
     TaskStartServiceUnavailable,
@@ -55,7 +59,7 @@ class TaskStarter(Protocol):
         authenticated_worker: AuthenticatedWorker,
         worker_session_id: UUID,
         request: TaskStartRequest,
-    ) -> TaskStartOutcome: ...
+    ) -> TaskStartReceipt: ...
 
 
 _ACKNOWLEDGED_REJECTIONS = frozenset(
@@ -128,7 +132,7 @@ class WorkerExecutionConsumer:
         if issued.outcome is TaskClaimOutcome.REPLAYED_EXPIRED:
             raise WorkerConsumptionPaused("expired claim requires recovery")
         try:
-            await self._start_service.start_task(
+            start = await self._start_service.start_task(
                 self._authenticated_worker,
                 self._worker_session_id,
                 TaskStartRequest(
@@ -144,20 +148,25 @@ class WorkerExecutionConsumer:
         ) as error:
             raise WorkerConsumptionPaused("task start failed closed") from error
 
-        invocation = TaskHandlerInvocation(
-            envelope.dispatch_id,
-            envelope.workflow_run_id,
-            envelope.task_run_id,
-            envelope.task_attempt_id,
-            envelope.attempt_number,
-            issued.claim.generation,
-            self._worker_session_id,
-            envelope.task_type,
-            envelope.task_payload,
-            envelope.references,
-            envelope.correlation_id,
+        context = create_task_context(
+            dispatch_id=envelope.dispatch_id,
+            workflow_run_id=envelope.workflow_run_id,
+            task_run_id=envelope.task_run_id,
+            task_attempt_id=envelope.task_attempt_id,
+            attempt_number=envelope.attempt_number,
+            task_type=envelope.task_type,
+            parameters=envelope.task_payload,
+            references=envelope.references,
+            correlation_id=envelope.correlation_id,
+            trace_context=envelope.trace_context,
+            cancellation_requested_at_start=start.cancellation_requested_at_start,
+            deadline=(
+                TaskDeadline(envelope.deadline_at)
+                if envelope.deadline_at is not None
+                else None
+            ),
         )
         try:
-            await definition.handler(invocation)
+            await definition.handler(context)
         except Exception as error:
             raise HandlerDispatchFailed from error

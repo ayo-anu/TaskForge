@@ -331,6 +331,7 @@ def _revalidate_for_publication(
                     identifier=step.identifier,
                     task_type=step.task_type,
                     parameters=step.parameters,
+                    execution_policy=step.execution_policy,
                     task_types=task_types,
                 )
             )
@@ -357,6 +358,7 @@ def _revalidate_for_publication(
         status=workflow.status,
         steps=tuple(steps),
         dependencies=tuple(dependencies),
+        execution_policy=workflow.execution_policy,
     )
 
 

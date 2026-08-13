@@ -11,7 +11,10 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
-from taskforge.workflows.domain import WorkflowDefinitionStatus
+from taskforge.workflows.domain import (
+    MAX_TASK_DEADLINE_SECONDS,
+    WorkflowDefinitionStatus,
+)
 from taskforge.workflows.task_types import (
     JSONMapping,
     WorkflowValidationIssue,
@@ -137,18 +140,36 @@ class WorkflowRunVersionDependency:
 
 
 @dataclass(frozen=True)
+class WorkflowRunVersionStep:
+    step_identifier: str
+    deadline_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.deadline_seconds is not None and (
+            type(self.deadline_seconds) is not int
+            or not 1 <= self.deadline_seconds <= MAX_TASK_DEADLINE_SECONDS
+        ):
+            raise ValueError("step deadline seconds must be within the supported range")
+
+
+@dataclass(frozen=True)
 class WorkflowRunVersionSnapshot:
     workflow_definition_id: UUID
     workflow_version_id: UUID
     version_number: int
-    step_identifiers: tuple[str, ...]
+    steps: tuple[WorkflowRunVersionStep, ...]
     dependencies: tuple[WorkflowRunVersionDependency, ...]
+
+    @property
+    def step_identifiers(self) -> tuple[str, ...]:
+        return tuple(step.step_identifier for step in self.steps)
 
 
 @dataclass(frozen=True)
 class InitialTaskRun:
     step_identifier: str
     status: TaskRunStatus
+    deadline_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +177,7 @@ class NewTaskRun:
     id: UUID
     step_identifier: str
     status: TaskRunStatus
+    deadline_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -230,9 +252,7 @@ class RunnableTransitionResult:
     transitioned_step_identifiers: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if len(self.transitioned_task_ids) != len(
-            self.transitioned_step_identifiers
-        ):
+        if len(self.transitioned_task_ids) != len(self.transitioned_step_identifiers):
             raise ValueError("runnable transition identities must remain paired")
         if len(set(self.transitioned_task_ids)) != len(self.transitioned_task_ids):
             raise ValueError("runnable transition task identifiers must be unique")
@@ -336,12 +356,17 @@ class WorkflowRunReconciliationResult:
         if any(count < 0 for count in counts):
             raise ValueError("reconciliation transition counts cannot be negative")
         if self.workflow_transition_count > self.iterations:
-            raise ValueError("workflow transitions cannot exceed reconciliation iterations")
+            raise ValueError(
+                "workflow transitions cannot exceed reconciliation iterations"
+            )
         if self.found is (self.final_status is None):
             raise ValueError("reconciliation presence and final status disagree")
         if self.quiescent and self.bound_reached:
             raise ValueError("quiescent reconciliation cannot exhaust its bound")
-        if self.bound_reached and self.iterations != MAX_WORKFLOW_RECONCILIATION_ITERATIONS:
+        if (
+            self.bound_reached
+            and self.iterations != MAX_WORKFLOW_RECONCILIATION_ITERATIONS
+        ):
             raise ValueError("reconciliation bound was not fully consumed")
         if not self.found and (self.quiescent or self.bound_reached):
             raise ValueError("missing workflow run cannot be reconciled")
@@ -486,6 +511,11 @@ def materialize_initial_tasks(
                 TaskRunStatus.BLOCKED
                 if identifier in successors
                 else TaskRunStatus.RUNNABLE
+            ),
+            deadline_seconds=next(
+                step.deadline_seconds
+                for step in snapshot.steps
+                if step.step_identifier == identifier
             ),
         )
         for identifier in ordered_steps

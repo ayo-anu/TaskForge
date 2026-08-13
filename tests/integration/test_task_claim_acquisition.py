@@ -7,6 +7,7 @@ import json
 import os
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -31,6 +32,7 @@ from taskforge.claims.service import TaskClaimService, TaskClaimServiceUnavailab
 from taskforge.dispatch.envelope import (
     DispatchEnvelope,
     create_dispatch_envelope,
+    deserialize_dispatch_envelope,
     dispatch_envelope_to_mapping,
 )
 from taskforge.dispatch.persistence_ports import NewTaskAttempt, NewTaskDispatchOutbox
@@ -526,6 +528,61 @@ async def exercise_service_rejections(
         mismatched_delivery,
         TaskClaimRejectionReason.INVALID_DISPATCH,
     )
+
+    deadline_dispatch = await add_dispatched_task(setup)
+    deadline_tampering = create_dispatch_envelope(
+        dispatch_id=deadline_dispatch.dispatch_id,
+        task_attempt_id=deadline_dispatch.task_attempt_id,
+        task_run_id=deadline_dispatch.task_run_id,
+        workflow_run_id=deadline_dispatch.workflow_run_id,
+        attempt_number=deadline_dispatch.attempt_number,
+        task_type=deadline_dispatch.task_type,
+        required_capability=deadline_dispatch.required_capability,
+        task_payload={},
+        references={},
+        deadline_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        stale_worker,
+        deadline_tampering,
+        TaskClaimRejectionReason.INVALID_DISPATCH,
+    )
+
+    downgraded_mapping = dispatch_envelope_to_mapping(deadline_dispatch)
+    downgraded_mapping["schema_version"] = 1
+    downgraded_mapping.pop("deadline_at")
+    downgraded = deserialize_dispatch_envelope(
+        json.dumps(downgraded_mapping).encode("utf-8")
+    )
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        stale_worker,
+        downgraded,
+        TaskClaimRejectionReason.INVALID_DISPATCH,
+    )
+
+    historical_dispatch = await add_dispatched_task(setup)
+    historical_mapping = dispatch_envelope_to_mapping(historical_dispatch)
+    historical_mapping["schema_version"] = 1
+    historical_mapping.pop("deadline_at")
+    historical_v1 = deserialize_dispatch_envelope(
+        json.dumps(historical_mapping).encode("utf-8")
+    )
+    await setup.execute(
+        "UPDATE task_dispatch_outbox SET payload = $2::jsonb WHERE id = $1",
+        historical_dispatch.dispatch_id,
+        json.dumps(historical_mapping),
+    )
+    historical_worker = await add_worker(setup)
+    historical_claim = await service.claim_task(
+        historical_worker.authenticated,
+        historical_worker.session_id,
+        historical_v1,
+    )
+    assert historical_claim.outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
 
     nonclaimable_worker = await add_worker(setup)
     nonclaimable_dispatch = await add_dispatched_task(setup, status="succeeded")

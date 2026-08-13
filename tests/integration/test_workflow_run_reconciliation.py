@@ -134,8 +134,7 @@ async def verify_reconciliation(database_url: URL) -> None:
         async with sessions.begin() as session:
             await session.execute(
                 text(
-                    "DROP TRIGGER reject_reconcile_run_update_trigger "
-                    "ON workflow_runs"
+                    "DROP TRIGGER reject_reconcile_run_update_trigger ON workflow_runs"
                 )
             )
             await session.execute(text("DROP FUNCTION reject_reconcile_run_update()"))

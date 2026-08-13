@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 from taskforge.workflows.domain import (
+    MAX_TASK_DEADLINE_SECONDS,
     MAX_WORKFLOW_DESCRIPTION_LENGTH,
     MAX_WORKFLOW_NAME_LENGTH,
     DraftWorkflowStep,
@@ -26,6 +27,8 @@ from taskforge.workflows.domain import (
     create_draft_step,
     create_workflow_draft,
     replace_workflow_draft,
+    resolve_deadline_seconds,
+    validate_execution_policy,
 )
 from taskforge.workflows.task_types import (
     JSONMapping,
@@ -34,6 +37,26 @@ from taskforge.workflows.task_types import (
     WorkflowValidationError,
     WorkflowValidationIssue,
 )
+
+
+@pytest.mark.parametrize("value", (True, False, 0, -1, 1.5, "1", None, 31_536_001))
+def test_deadline_seconds_is_positive_bounded_non_boolean(value: object) -> None:
+    _, issues = validate_execution_policy({"deadline_seconds": value})
+    assert [issue.code for issue in issues] == ["invalid_deadline_seconds"]
+
+
+def test_deadline_resolution_is_explicit_step_over_workflow() -> None:
+    assert MAX_TASK_DEADLINE_SECONDS == 31_536_000
+    assert resolve_deadline_seconds({"deadline_seconds": 100}, None) == 100
+    assert resolve_deadline_seconds(None, {"deadline_seconds": 50}) == 50
+    assert (
+        resolve_deadline_seconds(
+            {"deadline_seconds": 100, "future": "workflow"},
+            {"deadline_seconds": 50, "other": "step"},
+        )
+        == 50
+    )
+    assert resolve_deadline_seconds({"future": True}, {"other": True}) is None
 
 
 @dataclass(frozen=True)

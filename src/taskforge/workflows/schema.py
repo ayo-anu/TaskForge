@@ -39,6 +39,7 @@ workflow_definitions = Table(
     ),
     Column("name", String(128), nullable=False),
     Column("description", Text),
+    Column("execution_policy", JSONB(none_as_null=True)),
     Column(
         "status",
         workflow_definition_status,
@@ -58,6 +59,18 @@ workflow_definitions = Table(
         server_default=func.current_timestamp(),
     ),
     CheckConstraint("length(name) > 0", name="name_not_empty"),
+    CheckConstraint(
+        "execution_policy IS NULL OR jsonb_typeof(execution_policy) = 'object'",
+        name="execution_policy_object",
+    ),
+    CheckConstraint(
+        "execution_policy IS NULL OR NOT (execution_policy ? 'deadline_seconds') "
+        "OR (jsonb_typeof(execution_policy -> 'deadline_seconds') = 'number' "
+        "AND (execution_policy ->> 'deadline_seconds') ~ '^[0-9]+$' "
+        "AND (execution_policy ->> 'deadline_seconds')::numeric "
+        "BETWEEN 1 AND 31536000)",
+        name="deadline_seconds_valid",
+    ),
 )
 
 Index(
@@ -81,6 +94,7 @@ workflow_draft_steps = Table(
     Column("step_identifier", String(128), nullable=False),
     Column("task_type", String(128), nullable=False),
     Column("parameters", JSONB, nullable=False),
+    Column("execution_policy", JSONB(none_as_null=True)),
     Column(
         "created_at",
         DateTime(timezone=True),
@@ -98,6 +112,18 @@ workflow_draft_steps = Table(
     CheckConstraint("length(step_identifier) > 0", name="identifier_not_empty"),
     CheckConstraint("length(task_type) > 0", name="task_type_not_empty"),
     CheckConstraint("jsonb_typeof(parameters) = 'object'", name="parameters_object"),
+    CheckConstraint(
+        "execution_policy IS NULL OR jsonb_typeof(execution_policy) = 'object'",
+        name="execution_policy_object",
+    ),
+    CheckConstraint(
+        "execution_policy IS NULL OR NOT (execution_policy ? 'deadline_seconds') "
+        "OR (jsonb_typeof(execution_policy -> 'deadline_seconds') = 'number' "
+        "AND (execution_policy ->> 'deadline_seconds') ~ '^[0-9]+$' "
+        "AND (execution_policy ->> 'deadline_seconds')::numeric "
+        "BETWEEN 1 AND 31536000)",
+        name="deadline_seconds_valid",
+    ),
 )
 
 workflow_draft_dependencies = Table(
@@ -156,7 +182,7 @@ workflow_versions = Table(
     Column("version_number", BigInteger, nullable=False),
     Column("name", String(128), nullable=False),
     Column("description", Text),
-    Column("execution_policy", JSONB),
+    Column("execution_policy", JSONB(none_as_null=True)),
     Column(
         "published_at",
         DateTime(timezone=True),
@@ -174,6 +200,15 @@ workflow_versions = Table(
     CheckConstraint(
         "execution_policy IS NULL OR jsonb_typeof(execution_policy) = 'object'",
         name="execution_policy_object",
+    ),
+    CheckConstraint(
+        "execution_policy IS NULL OR NOT (execution_policy ? 'deadline_seconds') "
+        "OR (jsonb_typeof(execution_policy -> 'deadline_seconds') = 'number' "
+        "AND (execution_policy ->> 'deadline_seconds') ~ '^[0-9]+$' "
+        "AND (execution_policy ->> 'deadline_seconds')::numeric "
+        "BETWEEN 1 AND 31536000)",
+        name="deadline_seconds_valid",
+        postgresql_not_valid=True,
     ),
 )
 
@@ -193,13 +228,22 @@ workflow_version_steps = Table(
     Column("step_identifier", String(128), primary_key=True),
     Column("task_type", String(128), nullable=False),
     Column("parameters", JSONB, nullable=False),
-    Column("execution_policy", JSONB),
+    Column("execution_policy", JSONB(none_as_null=True)),
     CheckConstraint("length(step_identifier) > 0", name="identifier_not_empty"),
     CheckConstraint("length(task_type) > 0", name="task_type_not_empty"),
     CheckConstraint("jsonb_typeof(parameters) = 'object'", name="parameters_object"),
     CheckConstraint(
         "execution_policy IS NULL OR jsonb_typeof(execution_policy) = 'object'",
         name="execution_policy_object",
+    ),
+    CheckConstraint(
+        "execution_policy IS NULL OR NOT (execution_policy ? 'deadline_seconds') "
+        "OR (jsonb_typeof(execution_policy -> 'deadline_seconds') = 'number' "
+        "AND (execution_policy ->> 'deadline_seconds') ~ '^[0-9]+$' "
+        "AND (execution_policy ->> 'deadline_seconds')::numeric "
+        "BETWEEN 1 AND 31536000)",
+        name="deadline_seconds_valid",
+        postgresql_not_valid=True,
     ),
 )
 

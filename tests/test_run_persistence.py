@@ -41,6 +41,7 @@ from taskforge.runs.domain import (
     WorkflowRunInput,
     WorkflowRunStatus,
     WorkflowRunVersionSnapshot,
+    WorkflowRunVersionStep,
 )
 from taskforge.runs.persistence_ports import (
     PreparedWorkflowRunCreation,
@@ -332,7 +333,9 @@ class FakeRepositoryTransactionContext:
         traceback: object,
     ) -> None:
         del exception_type, exception, traceback
-        self.session.calls.append("rollback" if self.session.execute_failure else "commit")
+        self.session.calls.append(
+            "rollback" if self.session.execute_failure else "commit"
+        )
         self.session.calls.append("context_exit")
 
 
@@ -414,9 +417,7 @@ def test_repository_rolls_back_and_normalizes_evaluation_database_failure() -> N
     )
 
     with pytest.raises(WorkflowRunPersistenceUnavailable) as caught:
-        asyncio.run(
-            evaluation_repository(session).evaluate_workflow_run_state(uuid4())
-        )
+        asyncio.run(evaluation_repository(session).evaluate_workflow_run_state(uuid4()))
 
     assert caught.value.__cause__ is database_error
     assert session.calls[-2:] == ["rollback", "context_exit"]
@@ -546,7 +547,9 @@ def test_complete_insert_returns_database_timestamps_and_commits() -> None:
     prepared = PreparedWorkflowRunCreation(
         workflow_id,
         WorkflowDefinitionStatus.ENABLED,
-        WorkflowRunVersionSnapshot(workflow_id, version_id, 1, ("root",), ()),
+        WorkflowRunVersionSnapshot(
+            workflow_id, version_id, 1, (WorkflowRunVersionStep("root"),), ()
+        ),
     )
     run = NewWorkflowRun(uuid4(), uuid4(), WorkflowRunStatus.PENDING)
 
@@ -586,7 +589,9 @@ def test_failure_after_run_insert_rolls_back_without_attempting_commit() -> None
     prepared = PreparedWorkflowRunCreation(
         workflow_id,
         WorkflowDefinitionStatus.ENABLED,
-        WorkflowRunVersionSnapshot(workflow_id, version_id, 1, ("root",), ()),
+        WorkflowRunVersionSnapshot(
+            workflow_id, version_id, 1, (WorkflowRunVersionStep("root"),), ()
+        ),
     )
 
     async def exercise() -> None:

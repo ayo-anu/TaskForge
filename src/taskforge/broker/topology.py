@@ -14,7 +14,7 @@ from taskforge.dispatch.envelope import DISPATCH_ENVELOPE_VERSION, dispatch_rout
 from taskforge.workflows.task_types import TaskTypeRegistry
 
 DISPATCH_TOPOLOGY_GENERATION = 1
-SUPPORTED_DISPATCH_ENVELOPE_VERSION = 1
+SUPPORTED_DISPATCH_ENVELOPE_VERSION = 2
 MAX_RABBITMQ_NAME_BYTES = 255
 _TOPOLOGY_NAME = re.compile(r"\A[a-z][a-z0-9._-]{0,254}\Z")
 
@@ -53,7 +53,7 @@ async def declare_dispatch_topology(
     registry: TaskTypeRegistry,
     configuration: RabbitMQTopologyConfiguration,
 ) -> RabbitMQDispatchTopology:
-    """Idempotently declare generation 1 topology for envelope schema v1."""
+    """Idempotently declare generation 1 topology for envelope schemas v1-v2."""
     if DISPATCH_ENVELOPE_VERSION != SUPPORTED_DISPATCH_ENVELOPE_VERSION:
         raise RuntimeError("dispatch topology and envelope versions are incompatible")
     names = _topology_names(registry, configuration)

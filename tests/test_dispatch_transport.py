@@ -37,13 +37,13 @@ def valid_transport() -> tuple[bytes, DispatchTransportMetadata]:
     )
 
 
-def test_current_topology_accepts_current_v1_envelope() -> None:
+def test_current_topology_accepts_current_v2_envelope() -> None:
     body, metadata = valid_transport()
 
     result = validate_dispatch_transport(body, metadata)
 
     assert isinstance(result, ValidatedDispatchTransport)
-    assert result.envelope.schema_version == 1
+    assert result.envelope.schema_version == 2
     assert "source" not in repr(result)
     assert "document-workers" not in repr(metadata)
 
@@ -91,7 +91,7 @@ def test_transport_metadata_mismatches_are_permanently_malformed(
 def test_unsupported_envelope_version_is_permanently_malformed() -> None:
     body, metadata = valid_transport()
     value = json.loads(body)
-    value["schema_version"] = 2
+    value["schema_version"] = 3
 
     result = validate_dispatch_transport(
         json.dumps(value, separators=(",", ":")).encode(), metadata

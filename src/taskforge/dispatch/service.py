@@ -88,6 +88,7 @@ class TaskDispatchService:
                         required_capability=definition.required_capability,
                         task_payload=prepared.task_parameters,
                         references={},
+                        deadline_at=prepared.deadline_at,
                         correlation_id=correlation_id,
                         trace_context=trace_context,
                     )

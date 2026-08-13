@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -43,6 +44,58 @@ def envelope_arguments(**overrides: object) -> dict[str, object]:
 
 def create_envelope(**overrides: object) -> DispatchEnvelope:
     return create_dispatch_envelope(**envelope_arguments(**overrides))
+
+
+def legacy_envelope(**overrides: object) -> DispatchEnvelope:
+    mapping = dispatch_envelope_to_mapping(create_envelope(**overrides))
+    mapping["schema_version"] = 1
+    del mapping["deadline_at"]
+    return deserialize_dispatch_envelope(canonical_bytes(mapping))
+
+
+def test_exact_v1_contract_round_trips_without_deadline() -> None:
+    envelope = legacy_envelope()
+    encoded = serialize_dispatch_envelope(envelope)
+    assert deserialize_dispatch_envelope(encoded) == envelope
+    assert json.loads(encoded)["schema_version"] == 1
+    assert "deadline_at" not in json.loads(encoded)
+
+
+def test_v1_rejects_deadline_field() -> None:
+    mapping = dispatch_envelope_to_mapping(legacy_envelope())
+    mapping["deadline_at"] = None
+    with pytest.raises(DispatchEnvelopeValidationError) as caught:
+        deserialize_dispatch_envelope(canonical_bytes(mapping))
+    assert issue_codes(caught.value) == ("unknown_field",)
+
+
+def test_v2_requires_nullable_or_canonical_deadline() -> None:
+    without = dispatch_envelope_to_mapping(create_envelope())
+    del without["deadline_at"]
+    with pytest.raises(DispatchEnvelopeValidationError) as missing:
+        deserialize_dispatch_envelope(canonical_bytes(without))
+    assert issue_codes(missing.value) == ("missing_field",)
+
+    assert dispatch_envelope_to_mapping(create_envelope())["deadline_at"] is None
+    deadline = datetime(2026, 8, 13, 20, tzinfo=UTC)
+    present = create_envelope(deadline_at=deadline)
+    assert dispatch_envelope_to_mapping(present)["deadline_at"] == (
+        "2026-08-13T20:00:00.000000Z"
+    )
+
+
+def test_v2_rejects_noncanonical_deadline_and_unknown_field() -> None:
+    mapping = dispatch_envelope_to_mapping(create_envelope())
+    mapping["deadline_at"] = "2026-08-13T20:00:00Z"
+    with pytest.raises(DispatchEnvelopeValidationError) as deadline:
+        deserialize_dispatch_envelope(canonical_bytes(mapping))
+    assert issue_codes(deadline.value) == ("invalid_deadline_at",)
+
+    mapping = dispatch_envelope_to_mapping(create_envelope())
+    mapping["extra"] = True
+    with pytest.raises(DispatchEnvelopeValidationError) as unknown:
+        deserialize_dispatch_envelope(canonical_bytes(mapping))
+    assert issue_codes(unknown.value) == ("unknown_field",)
 
 
 def issue_codes(error: DispatchEnvelopeValidationError) -> tuple[str, ...]:
@@ -186,7 +239,7 @@ def test_deserialization_requires_canonical_uuid_strings() -> None:
         assert issue_codes(caught.value) == ("invalid_identifier",)
 
 
-@pytest.mark.parametrize("version", (None, True, 0, -1, 1.0, "1", 2))
+@pytest.mark.parametrize("version", (None, True, 0, -1, 1.0, "1", 3))
 def test_unknown_or_invalid_versions_fail_fast(version: object) -> None:
     mapping = dispatch_envelope_to_mapping(create_envelope())
     mapping["schema_version"] = version

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import timedelta
 from types import TracebackType
 from typing import Any
 from uuid import UUID
@@ -41,6 +42,7 @@ from taskforge.runs.domain import (
     WorkflowRunStatus,
     WorkflowRunVersionDependency,
     WorkflowRunVersionSnapshot,
+    WorkflowRunVersionStep,
     WorkflowVersionSelection,
 )
 from taskforge.runs.persistence_ports import (
@@ -59,7 +61,10 @@ from taskforge.runs.schema import (
     workflow_run_inputs,
     workflow_runs,
 )
-from taskforge.workflows.domain import WorkflowDefinitionStatus
+from taskforge.workflows.domain import (
+    WorkflowDefinitionStatus,
+    resolve_deadline_seconds,
+)
 from taskforge.workflows.schema import (
     workflow_definitions,
     workflow_version_dependencies,
@@ -165,9 +170,7 @@ class SQLAlchemyWorkflowRunRepository:
         return RunnableTransitionResult(
             workflow_run_id=workflow_run_id,
             transitioned_task_ids=tuple(row.id for row in ordered),
-            transitioned_step_identifiers=tuple(
-                row.step_identifier for row in ordered
-            ),
+            transitioned_step_identifiers=tuple(row.step_identifier for row in ordered),
         )
 
     async def propagate_dependency_failures(
@@ -228,9 +231,7 @@ class SQLAlchemyWorkflowRunRepository:
                 if previous_status is WorkflowRunStatus.PENDING:
                     statement = _pending_to_running_statement(workflow_run_id)
                 elif previous_status is WorkflowRunStatus.RUNNING:
-                    statement = _running_terminal_transition_statement(
-                        workflow_run_id
-                    )
+                    statement = _running_terminal_transition_statement(workflow_run_id)
 
                 resulting_status = previous_status
                 if statement is not None:
@@ -340,7 +341,10 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                 return PreparedWorkflowRunCreation(workflow_id, status, None)
             step_rows = (
                 await session.execute(
-                    select(workflow_version_steps.c.step_identifier)
+                    select(
+                        workflow_version_steps.c.step_identifier,
+                        workflow_version_steps.c.execution_policy,
+                    )
                     .where(workflow_version_steps.c.workflow_version_id == version.id)
                     .order_by(workflow_version_steps.c.step_identifier)
                 )
@@ -400,7 +404,10 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                 return PreparedWorkflowRunCreation(workflow_id, status, None)
             step_rows = (
                 await session.execute(
-                    select(workflow_version_steps.c.step_identifier)
+                    select(
+                        workflow_version_steps.c.step_identifier,
+                        workflow_version_steps.c.execution_policy,
+                    )
                     .where(workflow_version_steps.c.workflow_version_id == version.id)
                     .order_by(workflow_version_steps.c.step_identifier)
                 )
@@ -475,6 +482,12 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                             "workflow_version_id": snapshot.workflow_version_id,
                             "step_identifier": task.step_identifier,
                             "status": task.status.value,
+                            "deadline_at": (
+                                row.created_at
+                                + timedelta(seconds=task.deadline_seconds)
+                                if task.deadline_seconds is not None
+                                else None
+                            ),
                         }
                         for task in task_run_values
                     ],
@@ -520,6 +533,7 @@ def _locked_version_statement(
         workflow_versions.c.id,
         workflow_versions.c.workflow_definition_id,
         workflow_versions.c.version_number,
+        workflow_versions.c.execution_policy,
     ).where(workflow_versions.c.workflow_definition_id == workflow_id)
     if isinstance(selection, ExplicitWorkflowVersion):
         return statement.where(
@@ -1104,7 +1118,16 @@ def _creation_snapshot(
         workflow_definition_id=version.workflow_definition_id,
         workflow_version_id=version.id,
         version_number=version.version_number,
-        step_identifiers=tuple(row.step_identifier for row in step_rows),
+        steps=tuple(
+            WorkflowRunVersionStep(
+                row.step_identifier,
+                resolve_deadline_seconds(
+                    getattr(version, "execution_policy", None),
+                    getattr(row, "execution_policy", None),
+                ),
+            )
+            for row in step_rows
+        ),
         dependencies=tuple(
             WorkflowRunVersionDependency(
                 row.predecessor_step_identifier,

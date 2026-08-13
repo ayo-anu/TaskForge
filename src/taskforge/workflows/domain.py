@@ -19,11 +19,13 @@ from taskforge.workflows.task_types import (
     TaskTypeRegistry,
     WorkflowValidationError,
     WorkflowValidationIssue,
+    validate_parameters,
 )
 
 MAX_WORKFLOW_NAME_LENGTH = 128
 MAX_WORKFLOW_DESCRIPTION_LENGTH = 4096
 MAX_IDENTIFIER_LENGTH = 128
+MAX_TASK_DEADLINE_SECONDS = 31_536_000
 
 _STEP_IDENTIFIER = re.compile(r"\A[a-z][a-z0-9_-]{0,127}\Z")
 _TASK_TYPE_NAME = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
@@ -110,12 +112,14 @@ class DraftWorkflowStep:
     identifier: str
     task_type: str
     parameters: JSONValue
+    execution_policy: JSONMapping | None = None
 
     def __repr__(self) -> str:
         return (
             "DraftWorkflowStep("
             f"id={self.id!r}, identifier={self.identifier!r}, "
-            f"task_type={self.task_type!r}, parameters=<redacted>)"
+            f"task_type={self.task_type!r}, parameters=<redacted>, "
+            "execution_policy=<redacted>)"
         )
 
 
@@ -135,6 +139,7 @@ class WorkflowDraft:
     status: WorkflowDefinitionStatus
     steps: tuple[DraftWorkflowStep, ...]
     dependencies: tuple[DraftDependency, ...]
+    execution_policy: JSONMapping | None = None
 
     def __repr__(self) -> str:
         return (
@@ -142,7 +147,7 @@ class WorkflowDraft:
             f"id={self.id!r}, owner_principal_id={self.owner_principal_id!r}, "
             f"name={self.name!r}, description={self.description!r}, "
             f"status={self.status!r}, steps={len(self.steps)}, "
-            f"dependencies={len(self.dependencies)})"
+            f"dependencies={len(self.dependencies)}, execution_policy=<redacted>)"
         )
 
 
@@ -220,6 +225,7 @@ def create_draft_step(
     identifier: object,
     task_type: object,
     parameters: object,
+    execution_policy: object = None,
     task_types: TaskTypeRegistry,
 ) -> DraftWorkflowStep:
     """Validate one draft step and return it only when every invariant holds."""
@@ -258,6 +264,11 @@ def create_draft_step(
     )
     if parameter_issues:
         raise WorkflowValidationError(parameter_issues)
+    validated_policy, policy_issues = validate_execution_policy(
+        execution_policy, path=("execution_policy",)
+    )
+    if policy_issues:
+        raise WorkflowValidationError(policy_issues)
     assert isinstance(step_id, UUID)
     assert isinstance(identifier, str)
     assert isinstance(task_type, str)
@@ -267,6 +278,7 @@ def create_draft_step(
         identifier=identifier,
         task_type=task_type,
         parameters=validated_parameters,
+        execution_policy=validated_policy,
     )
 
 
@@ -317,6 +329,7 @@ def create_workflow_draft(
     status: object,
     steps: tuple[DraftWorkflowStep, ...],
     dependencies: tuple[DraftDependency, ...] = (),
+    execution_policy: object = None,
 ) -> WorkflowDraft:
     """Validate aggregate and graph invariants without persistence."""
     workflow, _ = _create_workflow_draft_with_validation(
@@ -327,6 +340,7 @@ def create_workflow_draft(
         status=status,
         steps=steps,
         dependencies=dependencies,
+        execution_policy=execution_policy,
     )
     return workflow
 
@@ -340,6 +354,7 @@ def _create_workflow_draft_with_validation(
     status: object,
     steps: tuple[DraftWorkflowStep, ...],
     dependencies: tuple[DraftDependency, ...] = (),
+    execution_policy: object = None,
 ) -> tuple[WorkflowDraft, DAGValidationResult]:
     """Construct a draft and return its authoritative graph validation result."""
     issues: list[WorkflowValidationIssue] = []
@@ -357,6 +372,10 @@ def _create_workflow_draft_with_validation(
         )
     issues.extend(_validate_name(name))
     issues.extend(_validate_description(description))
+    validated_policy, policy_issues = validate_execution_policy(
+        execution_policy, path=("execution_policy",)
+    )
+    issues.extend(policy_issues)
     if not isinstance(status, WorkflowDefinitionStatus):
         issues.append(
             WorkflowValidationIssue(
@@ -416,6 +435,7 @@ def _create_workflow_draft_with_validation(
             status=status,
             steps=tuple(steps),
             dependencies=tuple(dependencies),
+            execution_policy=validated_policy,
         ),
         graph_result,
     )
@@ -428,6 +448,7 @@ def replace_workflow_draft(
     description: object,
     steps: tuple[DraftWorkflowStep, ...],
     dependencies: tuple[DraftDependency, ...] = (),
+    execution_policy: object = None,
 ) -> WorkflowDraft:
     """Construct a validated draft replacement without defining persistence policy."""
     return create_workflow_draft(
@@ -438,7 +459,49 @@ def replace_workflow_draft(
         status=workflow.status,
         steps=steps,
         dependencies=dependencies,
+        execution_policy=execution_policy,
     )
+
+
+def validate_execution_policy(
+    value: object,
+    *,
+    path: tuple[str | int, ...] = (),
+) -> tuple[JSONMapping | None, tuple[WorkflowValidationIssue, ...]]:
+    """Validate bounded policy JSON and the deadline field owned by this task."""
+    if value is None:
+        return None, ()
+    structural_issues, validated = validate_parameters(value, path=path)
+    if structural_issues:
+        return None, structural_issues
+    assert validated is not None
+    if "deadline_seconds" in validated:
+        deadline = validated["deadline_seconds"]
+        if type(deadline) is not int or not 1 <= deadline <= MAX_TASK_DEADLINE_SECONDS:
+            return None, (
+                WorkflowValidationIssue(
+                    "invalid_deadline_seconds",
+                    (*path, "deadline_seconds"),
+                    "Deadline seconds must be a positive bounded integer.",
+                ),
+            )
+    return validated, ()
+
+
+def resolve_deadline_seconds(
+    workflow_policy: JSONMapping | None,
+    step_policy: JSONMapping | None,
+) -> int | None:
+    """Resolve only deadline_seconds with explicit step-over-workflow precedence."""
+    for policy in (step_policy, workflow_policy):
+        validated, issues = validate_execution_policy(policy)
+        if issues:
+            raise WorkflowValidationError(issues)
+        if validated is not None and "deadline_seconds" in validated:
+            value = validated["deadline_seconds"]
+            assert type(value) is int
+            return value
+    return None
 
 
 def _validate_name(value: object) -> tuple[WorkflowValidationIssue, ...]:

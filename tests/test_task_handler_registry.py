@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
 from taskforge.worker.handlers import (
+    TaskContext,
+    TaskDeadline,
     TaskHandlerDefinition,
-    TaskHandlerInvocation,
     TaskHandlerRegistry,
 )
 from taskforge.workflows.task_types import (
@@ -24,7 +26,7 @@ class AcceptParameters:
         return ()
 
 
-async def handler(invocation: TaskHandlerInvocation) -> object:
+async def handler(invocation: TaskContext) -> object:
     return invocation.task_attempt_id
 
 
@@ -42,6 +44,23 @@ def test_registry_resolves_only_explicit_trusted_handler() -> None:
     assert registry.definition("module.callable") is None
     assert registry.task_types == frozenset({"test.task"})
     assert registry.required_capabilities == frozenset({"test-capability"})
+
+
+def test_task_deadline_normalizes_to_utc_and_has_safe_repr() -> None:
+    deadline = TaskDeadline(
+        datetime(2030, 1, 1, tzinfo=UTC).astimezone(timezone(timedelta(hours=2)))
+    )
+
+    assert deadline.expires_at == datetime(2030, 1, 1, tzinfo=UTC)
+    assert repr(deadline) == (
+        "TaskDeadline(expires_at=datetime.datetime(2030, 1, 1, 0, 0, "
+        "tzinfo=datetime.timezone.utc))"
+    )
+
+
+def test_task_deadline_rejects_naive_time() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        TaskDeadline(datetime(2030, 1, 1))
 
 
 @pytest.mark.parametrize(

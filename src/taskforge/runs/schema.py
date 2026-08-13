@@ -154,6 +154,7 @@ task_runs = Table(
     Column("workflow_version_id", UUID(as_uuid=True), nullable=False),
     Column("step_identifier", String(128), nullable=False),
     Column("status", task_run_status, nullable=False),
+    Column("deadline_at", DateTime(timezone=True), nullable=True),
     Column(
         "created_at",
         DateTime(timezone=True),
