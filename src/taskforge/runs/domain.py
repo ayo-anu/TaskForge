@@ -13,6 +13,7 @@ from uuid import UUID
 
 from taskforge.workflows.domain import (
     MAX_TASK_DEADLINE_SECONDS,
+    MAX_TASK_EXECUTION_TIMEOUT_SECONDS,
     WorkflowDefinitionStatus,
 )
 from taskforge.workflows.task_types import (
@@ -143,6 +144,7 @@ class WorkflowRunVersionDependency:
 class WorkflowRunVersionStep:
     step_identifier: str
     deadline_seconds: int | None = None
+    execution_timeout_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if self.deadline_seconds is not None and (
@@ -150,6 +152,15 @@ class WorkflowRunVersionStep:
             or not 1 <= self.deadline_seconds <= MAX_TASK_DEADLINE_SECONDS
         ):
             raise ValueError("step deadline seconds must be within the supported range")
+        if self.execution_timeout_seconds is not None and (
+            type(self.execution_timeout_seconds) is not int
+            or not 1
+            <= self.execution_timeout_seconds
+            <= MAX_TASK_EXECUTION_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "step execution timeout seconds must be within the supported range"
+            )
 
 
 @dataclass(frozen=True)
@@ -170,6 +181,7 @@ class InitialTaskRun:
     step_identifier: str
     status: TaskRunStatus
     deadline_seconds: int | None = None
+    execution_timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +190,7 @@ class NewTaskRun:
     step_identifier: str
     status: TaskRunStatus
     deadline_seconds: int | None = None
+    execution_timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -514,6 +527,11 @@ def materialize_initial_tasks(
             ),
             deadline_seconds=next(
                 step.deadline_seconds
+                for step in snapshot.steps
+                if step.step_identifier == identifier
+            ),
+            execution_timeout_seconds=next(
+                step.execution_timeout_seconds
                 for step in snapshot.steps
                 if step.step_identifier == identifier
             ),

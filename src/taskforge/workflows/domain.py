@@ -26,6 +26,7 @@ MAX_WORKFLOW_NAME_LENGTH = 128
 MAX_WORKFLOW_DESCRIPTION_LENGTH = 4096
 MAX_IDENTIFIER_LENGTH = 128
 MAX_TASK_DEADLINE_SECONDS = 31_536_000
+MAX_TASK_EXECUTION_TIMEOUT_SECONDS = 31_536_000
 
 _STEP_IDENTIFIER = re.compile(r"\A[a-z][a-z0-9_-]{0,127}\Z")
 _TASK_TYPE_NAME = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
@@ -468,24 +469,38 @@ def validate_execution_policy(
     *,
     path: tuple[str | int, ...] = (),
 ) -> tuple[JSONMapping | None, tuple[WorkflowValidationIssue, ...]]:
-    """Validate bounded policy JSON and the deadline field owned by this task."""
+    """Validate bounded policy JSON and explicitly supported execution fields."""
     if value is None:
         return None, ()
     structural_issues, validated = validate_parameters(value, path=path)
     if structural_issues:
         return None, structural_issues
     assert validated is not None
+    issues: list[WorkflowValidationIssue] = []
     if "deadline_seconds" in validated:
         deadline = validated["deadline_seconds"]
         if type(deadline) is not int or not 1 <= deadline <= MAX_TASK_DEADLINE_SECONDS:
-            return None, (
+            issues.append(
                 WorkflowValidationIssue(
                     "invalid_deadline_seconds",
                     (*path, "deadline_seconds"),
                     "Deadline seconds must be a positive bounded integer.",
-                ),
+                )
             )
-    return validated, ()
+    if "execution_timeout_seconds" in validated:
+        timeout = validated["execution_timeout_seconds"]
+        if (
+            type(timeout) is not int
+            or not 1 <= timeout <= MAX_TASK_EXECUTION_TIMEOUT_SECONDS
+        ):
+            issues.append(
+                WorkflowValidationIssue(
+                    "invalid_execution_timeout_seconds",
+                    (*path, "execution_timeout_seconds"),
+                    "Execution timeout seconds must be a positive bounded integer.",
+                )
+            )
+    return (None, tuple(issues)) if issues else (validated, ())
 
 
 def resolve_deadline_seconds(
@@ -499,6 +514,22 @@ def resolve_deadline_seconds(
             raise WorkflowValidationError(issues)
         if validated is not None and "deadline_seconds" in validated:
             value = validated["deadline_seconds"]
+            assert type(value) is int
+            return value
+    return None
+
+
+def resolve_execution_timeout_seconds(
+    workflow_policy: JSONMapping | None,
+    step_policy: JSONMapping | None,
+) -> int | None:
+    """Resolve only execution_timeout_seconds with step-over-workflow precedence."""
+    for policy in (step_policy, workflow_policy):
+        validated, issues = validate_execution_policy(policy)
+        if issues:
+            raise WorkflowValidationError(issues)
+        if validated is not None and "execution_timeout_seconds" in validated:
+            value = validated["execution_timeout_seconds"]
             assert type(value) is int
             return value
     return None

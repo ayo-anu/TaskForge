@@ -24,12 +24,24 @@ from taskforge.dispatch.envelope import (
 from taskforge.dispatch.transport import DispatchTransportMetadata
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.worker.consumer_ports import BrokerDispatchDelivery
-from taskforge.worker.execution import WorkerConsumptionPaused, WorkerExecutionConsumer
+from taskforge.worker.execution import (
+    WorkerConsumptionPaused,
+    WorkerExecutionConsumer,
+    _execute_handler,
+)
 from taskforge.worker.handlers import (
     TaskContext,
     TaskDeadline,
     TaskHandlerDefinition,
     TaskHandlerRegistry,
+)
+from taskforge.worker.results import (
+    TaskCancellation,
+    TaskExecutionFailureKind,
+    TaskExecutionResult,
+    TaskExecutionResultKind,
+    TaskPermanentFailure,
+    TaskRetryableFailure,
 )
 from taskforge.worker.start import (
     TaskStartInvariantError,
@@ -103,6 +115,7 @@ def fixture(
     correlation_id: str | None = None,
     trace_context: TraceContext | None = None,
     deadline_at: datetime | None = None,
+    execution_timeout_seconds: int | None = None,
 ) -> tuple[Any, Control, IssuedTaskClaim, AuthenticatedWorker, Any]:
     task_attempt_id = task_attempt_id or uuid4()
     envelope = create_dispatch_envelope(
@@ -118,6 +131,7 @@ def fixture(
         correlation_id=correlation_id,
         trace_context=trace_context,
         deadline_at=deadline_at,
+        execution_timeout_seconds=execution_timeout_seconds,
     )
     metadata = DispatchTransportMetadata(
         str(envelope.dispatch_id), envelope.route, "application/json", "utf-8"
@@ -268,6 +282,7 @@ def test_handler_context_has_absent_deadline_and_no_infrastructure_authority() -
         "repository",
     }
     assert forbidden.isdisjoint(context.__dataclass_fields__)
+    assert "execution_timeout_seconds" not in context.__dataclass_fields__
 
 
 def test_task_context_repr_redacts_handler_data() -> None:
@@ -378,3 +393,226 @@ def test_claim_disposition_is_semantic(
     else:
         asyncio.run(consumer.consume(control))
     assert control.actions == ([] if action is None else [action])
+
+
+def context_fixture() -> TaskContext:
+    received, _ = execute_and_capture_context()
+    return received
+
+
+@pytest.mark.parametrize(
+    ("returned", "kind", "failure_kind"),
+    (
+        (object(), TaskExecutionResultKind.SUCCESS, None),
+        (
+            TaskRetryableFailure(),
+            TaskExecutionResultKind.RETRYABLE_FAILURE,
+            TaskExecutionFailureKind.HANDLER_REPORTED,
+        ),
+        (
+            TaskPermanentFailure(),
+            TaskExecutionResultKind.PERMANENT_FAILURE,
+            TaskExecutionFailureKind.HANDLER_REPORTED,
+        ),
+        (TaskCancellation(), TaskExecutionResultKind.CANCELLATION, None),
+    ),
+)
+def test_handler_returns_are_normalized(
+    returned: object,
+    kind: TaskExecutionResultKind,
+    failure_kind: TaskExecutionFailureKind | None,
+) -> None:
+    async def handler(context: TaskContext) -> object:
+        del context
+        return returned
+
+    result = asyncio.run(_execute_handler(handler, context_fixture(), None))
+
+    assert result.kind is kind
+    assert result.failure_kind is failure_kind
+    assert result.value is (
+        returned if kind is TaskExecutionResultKind.SUCCESS else None
+    )
+
+
+def test_ordinary_handler_exception_is_retryable_without_sensitive_text() -> None:
+    async def handler(context: TaskContext) -> object:
+        del context
+        raise RuntimeError("secret exception text")
+
+    result = asyncio.run(_execute_handler(handler, context_fixture(), None))
+
+    assert result.kind is TaskExecutionResultKind.RETRYABLE_FAILURE
+    assert result.failure_kind is TaskExecutionFailureKind.HANDLER_EXCEPTION
+    assert "secret exception text" not in repr(result)
+
+
+def test_execution_timeout_requests_cancellation_and_normalizes_distinctly() -> None:
+    cancelled = asyncio.Event()
+
+    async def handler(context: TaskContext) -> object:
+        del context
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return None
+
+    result = asyncio.run(_execute_handler(handler, context_fixture(), 0.001))  # type: ignore[arg-type]
+
+    assert cancelled.is_set()
+    assert result.kind is TaskExecutionResultKind.RETRYABLE_FAILURE
+    assert result.failure_kind is TaskExecutionFailureKind.EXECUTION_TIMEOUT
+
+
+def test_bare_cancelled_error_propagates_outside_ordinary_normalization() -> None:
+    async def handler(context: TaskContext) -> object:
+        del context
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_execute_handler(handler, context_fixture(), None))
+
+
+def test_handler_raised_timeout_error_is_not_execution_timeout() -> None:
+    async def handler(context: TaskContext) -> object:
+        del context
+        raise TimeoutError
+
+    result = asyncio.run(_execute_handler(handler, context_fixture(), 10))
+
+    assert result.failure_kind is TaskExecutionFailureKind.HANDLER_EXCEPTION
+
+
+def test_normalized_success_repr_redacts_output_and_context() -> None:
+    secret = "handler-output-secret"
+
+    async def handler(context: TaskContext) -> object:
+        del context
+        return {"payload": secret}
+
+    result = asyncio.run(_execute_handler(handler, context_fixture(), None))
+    rendered = repr(result)
+
+    assert secret not in rendered
+    assert "payload" not in rendered
+    assert "value=<redacted>" in rendered
+
+
+@pytest.mark.parametrize("kind", ("success", object(), None))
+def test_execution_result_rejects_non_enum_kind(kind: object) -> None:
+    with pytest.raises(ValueError, match="supported result kind"):
+        TaskExecutionResult(kind)  # type: ignore[arg-type]
+
+
+def test_execution_result_rejects_non_enum_failure_kind() -> None:
+    with pytest.raises(ValueError, match="supported failure kind"):
+        TaskExecutionResult(
+            TaskExecutionResultKind.RETRYABLE_FAILURE,
+            failure_kind="handler_exception",  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "value", "failure_kind"),
+    (
+        (
+            TaskExecutionResultKind.SUCCESS,
+            None,
+            TaskExecutionFailureKind.HANDLER_REPORTED,
+        ),
+        (TaskExecutionResultKind.RETRYABLE_FAILURE, object(), None),
+        (TaskExecutionResultKind.RETRYABLE_FAILURE, None, None),
+        (
+            TaskExecutionResultKind.PERMANENT_FAILURE,
+            None,
+            TaskExecutionFailureKind.HANDLER_EXCEPTION,
+        ),
+        (TaskExecutionResultKind.PERMANENT_FAILURE, object(), None),
+        (TaskExecutionResultKind.CANCELLATION, object(), None),
+        (
+            TaskExecutionResultKind.CANCELLATION,
+            None,
+            TaskExecutionFailureKind.HANDLER_REPORTED,
+        ),
+    ),
+)
+def test_execution_result_rejects_invalid_closed_model_combinations(
+    kind: TaskExecutionResultKind,
+    value: object | None,
+    failure_kind: TaskExecutionFailureKind | None,
+) -> None:
+    with pytest.raises(ValueError):
+        TaskExecutionResult(kind, value, failure_kind)
+
+
+def test_execution_result_accepts_success_with_none_value() -> None:
+    result = TaskExecutionResult.success(None)
+
+    assert result.kind is TaskExecutionResultKind.SUCCESS
+    assert result.value is None
+    assert result.failure_kind is None
+
+
+def test_consumer_uses_durable_timeout_only_for_handler_and_never_acks() -> None:
+    _, control, issued, worker, _ = fixture(execution_timeout_seconds=1)
+    events: list[str] = []
+
+    async def handler(context: TaskContext) -> object:
+        events.append("handler")
+        assert "execution_timeout_seconds" not in context.__dataclass_fields__
+        return TaskRetryableFailure()
+
+    consumer = WorkerExecutionConsumer(
+        ClaimService(issued),
+        StartService(events),
+        registry(handler),
+        worker,
+        issued.claim.worker_session_id,
+    )
+    asyncio.run(consumer.consume(control))
+
+    assert events == ["start", "handler"]
+    assert control.actions == []
+
+
+def test_timeout_boundary_begins_after_durable_start_and_wraps_only_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, control, issued, worker, _ = fixture(execution_timeout_seconds=30)
+    events: list[str] = []
+
+    class ObservedTimeout:
+        async def __aenter__(self) -> None:
+            events.append("timeout-enter")
+
+        async def __aexit__(self, *args: object) -> bool:
+            events.append("timeout-exit")
+            return False
+
+        def expired(self) -> bool:
+            return False
+
+    def observed_timeout(seconds: float | None) -> ObservedTimeout:
+        assert seconds == 30
+        return ObservedTimeout()
+
+    monkeypatch.setattr("taskforge.worker.execution.asyncio.timeout", observed_timeout)
+
+    async def handler(context: TaskContext) -> object:
+        del context
+        events.append("handler")
+        return None
+
+    consumer = WorkerExecutionConsumer(
+        ClaimService(issued),
+        StartService(events),
+        registry(handler),
+        worker,
+        issued.claim.worker_session_id,
+    )
+    asyncio.run(consumer.consume(control))
+
+    assert events == ["start", "timeout-enter", "handler", "timeout-exit"]
+    assert control.actions == []

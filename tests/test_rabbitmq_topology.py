@@ -106,7 +106,7 @@ def test_declares_generation_one_quorum_topology_once_per_capability() -> None:
     )
 
     assert DISPATCH_TOPOLOGY_GENERATION == 1
-    assert SUPPORTED_DISPATCH_ENVELOPE_VERSION == DISPATCH_ENVELOPE_VERSION == 2
+    assert SUPPORTED_DISPATCH_ENVELOPE_VERSION == DISPATCH_ENVELOPE_VERSION == 3
     assert [item[0] for item in channel.exchanges] == [
         "taskforge.dispatch.malformed.v1",
         "taskforge.dispatch.v1",

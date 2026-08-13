@@ -50,6 +50,14 @@ def legacy_envelope(**overrides: object) -> DispatchEnvelope:
     mapping = dispatch_envelope_to_mapping(create_envelope(**overrides))
     mapping["schema_version"] = 1
     del mapping["deadline_at"]
+    del mapping["execution_timeout_seconds"]
+    return deserialize_dispatch_envelope(canonical_bytes(mapping))
+
+
+def version_two_envelope(**overrides: object) -> DispatchEnvelope:
+    mapping = dispatch_envelope_to_mapping(create_envelope(**overrides))
+    mapping["schema_version"] = 2
+    del mapping["execution_timeout_seconds"]
     return deserialize_dispatch_envelope(canonical_bytes(mapping))
 
 
@@ -70,28 +78,28 @@ def test_v1_rejects_deadline_field() -> None:
 
 
 def test_v2_requires_nullable_or_canonical_deadline() -> None:
-    without = dispatch_envelope_to_mapping(create_envelope())
+    without = dispatch_envelope_to_mapping(version_two_envelope())
     del without["deadline_at"]
     with pytest.raises(DispatchEnvelopeValidationError) as missing:
         deserialize_dispatch_envelope(canonical_bytes(without))
     assert issue_codes(missing.value) == ("missing_field",)
 
-    assert dispatch_envelope_to_mapping(create_envelope())["deadline_at"] is None
+    assert dispatch_envelope_to_mapping(version_two_envelope())["deadline_at"] is None
     deadline = datetime(2026, 8, 13, 20, tzinfo=UTC)
-    present = create_envelope(deadline_at=deadline)
+    present = version_two_envelope(deadline_at=deadline)
     assert dispatch_envelope_to_mapping(present)["deadline_at"] == (
         "2026-08-13T20:00:00.000000Z"
     )
 
 
 def test_v2_rejects_noncanonical_deadline_and_unknown_field() -> None:
-    mapping = dispatch_envelope_to_mapping(create_envelope())
+    mapping = dispatch_envelope_to_mapping(version_two_envelope())
     mapping["deadline_at"] = "2026-08-13T20:00:00Z"
     with pytest.raises(DispatchEnvelopeValidationError) as deadline:
         deserialize_dispatch_envelope(canonical_bytes(mapping))
     assert issue_codes(deadline.value) == ("invalid_deadline_at",)
 
-    mapping = dispatch_envelope_to_mapping(create_envelope())
+    mapping = dispatch_envelope_to_mapping(version_two_envelope())
     mapping["extra"] = True
     with pytest.raises(DispatchEnvelopeValidationError) as unknown:
         deserialize_dispatch_envelope(canonical_bytes(mapping))
@@ -239,13 +247,64 @@ def test_deserialization_requires_canonical_uuid_strings() -> None:
         assert issue_codes(caught.value) == ("invalid_identifier",)
 
 
-@pytest.mark.parametrize("version", (None, True, 0, -1, 1.0, "1", 3))
+@pytest.mark.parametrize("version", (None, True, 0, -1, 1.0, "1", 4))
 def test_unknown_or_invalid_versions_fail_fast(version: object) -> None:
     mapping = dispatch_envelope_to_mapping(create_envelope())
     mapping["schema_version"] = version
     with pytest.raises(DispatchEnvelopeValidationError) as caught:
         deserialize_dispatch_envelope(canonical_bytes(mapping))
     assert issue_codes(caught.value) == ("unsupported_schema_version",)
+
+
+def test_v2_rejects_execution_timeout_and_round_trips_canonically() -> None:
+    envelope = version_two_envelope(correlation_id="optional")
+    encoded = serialize_dispatch_envelope(envelope)
+    assert (
+        serialize_dispatch_envelope(deserialize_dispatch_envelope(encoded)) == encoded
+    )
+    assert "execution_timeout_seconds" not in json.loads(encoded)
+
+    mapping = dispatch_envelope_to_mapping(envelope)
+    mapping["execution_timeout_seconds"] = None
+    with pytest.raises(DispatchEnvelopeValidationError) as caught:
+        deserialize_dispatch_envelope(canonical_bytes(mapping))
+    assert issue_codes(caught.value) == ("unknown_field",)
+
+
+def test_v3_requires_nullable_bounded_execution_timeout() -> None:
+    mapping = dispatch_envelope_to_mapping(create_envelope())
+    assert mapping["deadline_at"] is None
+    assert mapping["execution_timeout_seconds"] is None
+    del mapping["execution_timeout_seconds"]
+    with pytest.raises(DispatchEnvelopeValidationError) as missing:
+        deserialize_dispatch_envelope(canonical_bytes(mapping))
+    assert issue_codes(missing.value) == ("missing_field",)
+
+    for value in (True, 0, -1, 1.0, "1", 31_536_001):
+        mapping = dispatch_envelope_to_mapping(create_envelope())
+        mapping["execution_timeout_seconds"] = value
+        with pytest.raises(DispatchEnvelopeValidationError) as invalid:
+            deserialize_dispatch_envelope(canonical_bytes(mapping))
+        assert issue_codes(invalid.value) == ("invalid_execution_timeout_seconds",)
+
+    assert create_envelope(execution_timeout_seconds=1).execution_timeout_seconds == 1
+    assert (
+        create_envelope(execution_timeout_seconds=31_536_000).execution_timeout_seconds
+        == 31_536_000
+    )
+
+
+def test_v3_preserves_optional_correlation_and_trace_fields() -> None:
+    absent = dispatch_envelope_to_mapping(create_envelope())
+    assert "correlation_id" not in absent
+    assert "trace_context" not in absent
+
+    present = create_envelope(
+        correlation_id="correlation",
+        trace_context={"traceparent": VALID_TRACEPARENT},
+    )
+    assert present.correlation_id == "correlation"
+    assert present.trace_context == TraceContext(VALID_TRACEPARENT)
 
 
 def test_missing_and_unknown_fields_are_rejected_deterministically() -> None:

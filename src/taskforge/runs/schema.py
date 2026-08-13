@@ -155,6 +155,7 @@ task_runs = Table(
     Column("step_identifier", String(128), nullable=False),
     Column("status", task_run_status, nullable=False),
     Column("deadline_at", DateTime(timezone=True), nullable=True),
+    Column("execution_timeout_seconds", Integer, nullable=True),
     Column(
         "created_at",
         DateTime(timezone=True),
@@ -192,6 +193,11 @@ task_runs = Table(
     CheckConstraint(
         "length(btrim(step_identifier)) > 0",
         name="step_identifier_not_blank",
+    ),
+    CheckConstraint(
+        "execution_timeout_seconds IS NULL "
+        "OR execution_timeout_seconds BETWEEN 1 AND 31536000",
+        name="execution_timeout_seconds_valid",
     ),
 )
 

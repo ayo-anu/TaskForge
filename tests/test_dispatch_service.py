@@ -90,7 +90,14 @@ class FakeRepository:
 
 def prepared_dispatch() -> PreparedTaskDispatch:
     return PreparedTaskDispatch(
-        uuid4(), uuid4(), uuid4(), "extract", "document.extract", {"page": 2}, 1
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        "extract",
+        "document.extract",
+        {"page": 2},
+        1,
+        execution_timeout_seconds=45,
     )
 
 
@@ -123,6 +130,8 @@ def test_dispatch_persists_validated_snapshot_and_commits() -> None:
     assert outbox.payload["task_payload"] == {"page": 2}
     assert outbox.payload["references"] == {}
     assert outbox.payload["required_capability"] == "document-workers"
+    assert outbox.payload["schema_version"] == 3
+    assert outbox.payload["execution_timeout_seconds"] == 45
 
 
 def test_missing_or_nonrunnable_task_is_safely_suppressed() -> None:

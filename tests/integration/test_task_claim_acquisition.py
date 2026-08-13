@@ -550,9 +550,31 @@ async def exercise_service_rejections(
         TaskClaimRejectionReason.INVALID_DISPATCH,
     )
 
+    timeout_dispatch = await add_dispatched_task(setup)
+    timeout_tampering = create_dispatch_envelope(
+        dispatch_id=timeout_dispatch.dispatch_id,
+        task_attempt_id=timeout_dispatch.task_attempt_id,
+        task_run_id=timeout_dispatch.task_run_id,
+        workflow_run_id=timeout_dispatch.workflow_run_id,
+        attempt_number=timeout_dispatch.attempt_number,
+        task_type=timeout_dispatch.task_type,
+        required_capability=timeout_dispatch.required_capability,
+        task_payload={},
+        references={},
+        execution_timeout_seconds=30,
+    )
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        stale_worker,
+        timeout_tampering,
+        TaskClaimRejectionReason.INVALID_DISPATCH,
+    )
+
     downgraded_mapping = dispatch_envelope_to_mapping(deadline_dispatch)
     downgraded_mapping["schema_version"] = 1
     downgraded_mapping.pop("deadline_at")
+    downgraded_mapping.pop("execution_timeout_seconds")
     downgraded = deserialize_dispatch_envelope(
         json.dumps(downgraded_mapping).encode("utf-8")
     )
@@ -564,10 +586,25 @@ async def exercise_service_rejections(
         TaskClaimRejectionReason.INVALID_DISPATCH,
     )
 
+    version_two_mapping = dispatch_envelope_to_mapping(deadline_dispatch)
+    version_two_mapping["schema_version"] = 2
+    version_two_mapping.pop("execution_timeout_seconds")
+    version_two = deserialize_dispatch_envelope(
+        json.dumps(version_two_mapping).encode("utf-8")
+    )
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        stale_worker,
+        version_two,
+        TaskClaimRejectionReason.INVALID_DISPATCH,
+    )
+
     historical_dispatch = await add_dispatched_task(setup)
     historical_mapping = dispatch_envelope_to_mapping(historical_dispatch)
     historical_mapping["schema_version"] = 1
     historical_mapping.pop("deadline_at")
+    historical_mapping.pop("execution_timeout_seconds")
     historical_v1 = deserialize_dispatch_envelope(
         json.dumps(historical_mapping).encode("utf-8")
     )
@@ -583,6 +620,26 @@ async def exercise_service_rejections(
         historical_v1,
     )
     assert historical_claim.outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
+
+    historical_v2_dispatch = await add_dispatched_task(setup)
+    historical_v2_mapping = dispatch_envelope_to_mapping(historical_v2_dispatch)
+    historical_v2_mapping["schema_version"] = 2
+    historical_v2_mapping.pop("execution_timeout_seconds")
+    historical_v2 = deserialize_dispatch_envelope(
+        json.dumps(historical_v2_mapping).encode("utf-8")
+    )
+    await setup.execute(
+        "UPDATE task_dispatch_outbox SET payload = $2::jsonb WHERE id = $1",
+        historical_v2_dispatch.dispatch_id,
+        json.dumps(historical_v2_mapping),
+    )
+    historical_v2_worker = await add_worker(setup)
+    historical_v2_claim = await service.claim_task(
+        historical_v2_worker.authenticated,
+        historical_v2_worker.session_id,
+        historical_v2,
+    )
+    assert historical_v2_claim.outcome is TaskClaimOutcome.ACQUIRED_ACTIVE
 
     nonclaimable_worker = await add_worker(setup)
     nonclaimable_dispatch = await add_dispatched_task(setup, status="succeeded")

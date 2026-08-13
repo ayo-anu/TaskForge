@@ -9,6 +9,11 @@ from types import MappingProxyType
 from uuid import UUID
 
 from taskforge.dispatch.envelope import FrozenJSONMapping, TraceContext
+from taskforge.worker.results import (
+    TaskCancellation,
+    TaskPermanentFailure,
+    TaskRetryableFailure,
+)
 from taskforge.workflows.task_types import TaskTypeRegistry
 
 
@@ -87,7 +92,10 @@ def create_task_context(
     )
 
 
-type TaskHandler = Callable[[TaskContext], Awaitable[object]]
+type TaskHandlerResult = (
+    object | TaskRetryableFailure | TaskPermanentFailure | TaskCancellation
+)
+type TaskHandler = Callable[[TaskContext], Awaitable[TaskHandlerResult]]
 
 
 @dataclass(frozen=True)

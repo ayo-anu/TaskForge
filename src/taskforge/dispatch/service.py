@@ -89,6 +89,7 @@ class TaskDispatchService:
                         task_payload=prepared.task_parameters,
                         references={},
                         deadline_at=prepared.deadline_at,
+                        execution_timeout_seconds=(prepared.execution_timeout_seconds),
                         correlation_id=correlation_id,
                         trace_context=trace_context,
                     )

@@ -10,6 +10,7 @@ import pytest
 
 from taskforge.workflows.domain import (
     MAX_TASK_DEADLINE_SECONDS,
+    MAX_TASK_EXECUTION_TIMEOUT_SECONDS,
     MAX_WORKFLOW_DESCRIPTION_LENGTH,
     MAX_WORKFLOW_NAME_LENGTH,
     DraftWorkflowStep,
@@ -28,6 +29,7 @@ from taskforge.workflows.domain import (
     create_workflow_draft,
     replace_workflow_draft,
     resolve_deadline_seconds,
+    resolve_execution_timeout_seconds,
     validate_execution_policy,
 )
 from taskforge.workflows.task_types import (
@@ -57,6 +59,45 @@ def test_deadline_resolution_is_explicit_step_over_workflow() -> None:
         == 50
     )
     assert resolve_deadline_seconds({"future": True}, {"other": True}) is None
+
+
+@pytest.mark.parametrize("value", (True, False, 0, -1, 1.5, "1", None, 31_536_001))
+def test_execution_timeout_is_positive_bounded_non_boolean(value: object) -> None:
+    _, issues = validate_execution_policy({"execution_timeout_seconds": value})
+    assert [issue.code for issue in issues] == ["invalid_execution_timeout_seconds"]
+
+
+def test_execution_timeout_resolution_is_independent_step_over_workflow() -> None:
+    assert MAX_TASK_EXECUTION_TIMEOUT_SECONDS == 31_536_000
+    assert (
+        resolve_execution_timeout_seconds({"execution_timeout_seconds": 100}, None)
+        == 100
+    )
+    assert (
+        resolve_execution_timeout_seconds(
+            {"execution_timeout_seconds": 100, "deadline_seconds": 500},
+            {"execution_timeout_seconds": 50, "deadline_seconds": 200},
+        )
+        == 50
+    )
+    assert (
+        resolve_deadline_seconds(
+            {"execution_timeout_seconds": 100, "deadline_seconds": 500},
+            {"execution_timeout_seconds": 50, "deadline_seconds": 200},
+        )
+        == 200
+    )
+    assert resolve_execution_timeout_seconds({"future": True}, None) is None
+
+
+def test_policy_reports_deadline_and_timeout_issues_independently() -> None:
+    _, issues = validate_execution_policy(
+        {"deadline_seconds": False, "execution_timeout_seconds": True}
+    )
+    assert [issue.code for issue in issues] == [
+        "invalid_deadline_seconds",
+        "invalid_execution_timeout_seconds",
+    ]
 
 
 @dataclass(frozen=True)

@@ -186,6 +186,7 @@ class SQLAlchemyTaskDispatchTransaction:
             task_parameters=deepcopy(task.parameters),
             attempt_number=attempt_number,
             deadline_at=task.deadline_at,
+            execution_timeout_seconds=task.execution_timeout_seconds,
         )
 
     async def persist_dispatch(
@@ -283,6 +284,7 @@ def _runnable_task_dispatch_snapshot_statement(
         select(
             task_runs.c.step_identifier,
             task_runs.c.deadline_at,
+            task_runs.c.execution_timeout_seconds,
             workflow_version_steps.c.task_type,
             workflow_version_steps.c.parameters,
         )

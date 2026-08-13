@@ -208,6 +208,32 @@ async def assert_run_schema_catalog(
         "SELECT EXISTS (SELECT FROM pg_indexes WHERE schemaname = 'public' "
         "AND indexname = 'ix_task_runs_workflow_run_id_workflow_version_id')"
     )
+    column = await connection.fetchrow(
+        "SELECT data_type, is_nullable, column_default "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'task_runs' "
+        "AND column_name = 'execution_timeout_seconds'"
+    )
+    assert dict(column) == {
+        "data_type": "integer",
+        "is_nullable": "YES",
+        "column_default": None,
+    }
+    immutable_constraints = await connection.fetch(
+        "SELECT c.relname AS table_name, con.convalidated "
+        "FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid "
+        "WHERE con.conname = ANY($1::text[]) ORDER BY c.relname",
+        [
+            "ck_workflow_versions_execution_timeout_seconds_valid",
+            "ck_workflow_version_steps_execution_timeout_seconds_valid",
+        ],
+    )
+    assert [
+        (row["table_name"], row["convalidated"]) for row in immutable_constraints
+    ] == [
+        ("workflow_version_steps", False),
+        ("workflow_versions", False),
+    ]
 
 
 async def inspect_upgraded_run_schema(database_url: URL) -> None:

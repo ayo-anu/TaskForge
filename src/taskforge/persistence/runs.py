@@ -64,6 +64,7 @@ from taskforge.runs.schema import (
 from taskforge.workflows.domain import (
     WorkflowDefinitionStatus,
     resolve_deadline_seconds,
+    resolve_execution_timeout_seconds,
 )
 from taskforge.workflows.schema import (
     workflow_definitions,
@@ -487,6 +488,9 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                                 + timedelta(seconds=task.deadline_seconds)
                                 if task.deadline_seconds is not None
                                 else None
+                            ),
+                            "execution_timeout_seconds": (
+                                task.execution_timeout_seconds
                             ),
                         }
                         for task in task_run_values
@@ -1122,6 +1126,10 @@ def _creation_snapshot(
             WorkflowRunVersionStep(
                 row.step_identifier,
                 resolve_deadline_seconds(
+                    getattr(version, "execution_policy", None),
+                    getattr(row, "execution_policy", None),
+                ),
+                resolve_execution_timeout_seconds(
                     getattr(version, "execution_policy", None),
                     getattr(row, "execution_policy", None),
                 ),

@@ -21,7 +21,9 @@ from taskforge.workflows.task_types import (
 )
 
 LEGACY_DISPATCH_ENVELOPE_VERSION = 1
-DISPATCH_ENVELOPE_VERSION = 2
+DEADLINE_DISPATCH_ENVELOPE_VERSION = 2
+DISPATCH_ENVELOPE_VERSION = 3
+MAX_TASK_EXECUTION_TIMEOUT_SECONDS = 31_536_000
 MAX_TASK_PAYLOAD_BYTES = 16 * 1024
 MAX_REFERENCE_BYTES = 16 * 1024
 MAX_DISPATCH_ENVELOPE_BYTES = 32 * 1024
@@ -56,6 +58,8 @@ _V1_ENVELOPE_FIELDS = frozenset(
 _V1_REQUIRED_FIELDS = _V1_ENVELOPE_FIELDS - {"correlation_id", "trace_context"}
 _V2_ENVELOPE_FIELDS = _V1_ENVELOPE_FIELDS | {"deadline_at"}
 _V2_REQUIRED_FIELDS = _V1_REQUIRED_FIELDS | {"deadline_at"}
+_V3_ENVELOPE_FIELDS = _V2_ENVELOPE_FIELDS | {"execution_timeout_seconds"}
+_V3_REQUIRED_FIELDS = _V2_REQUIRED_FIELDS | {"execution_timeout_seconds"}
 _VALIDATED_CONSTRUCTION = object()
 
 
@@ -100,6 +104,7 @@ class DispatchEnvelope:
     task_payload: FrozenJSONMapping
     references: FrozenJSONMapping
     deadline_at: datetime | None = None
+    execution_timeout_seconds: int | None = None
     correlation_id: str | None = None
     trace_context: TraceContext | None = None
     _validated_construction: InitVar[object] = None
@@ -124,7 +129,9 @@ class DispatchEnvelope:
             f"task_type={self.task_type!r}, "
             f"required_capability={self.required_capability!r}, "
             "task_payload=<redacted>, references=<redacted>, "
-            f"deadline_at={self.deadline_at!r}, correlation_id={self.correlation_id!r}, "
+            f"deadline_at={self.deadline_at!r}, "
+            f"execution_timeout_seconds={self.execution_timeout_seconds!r}, "
+            f"correlation_id={self.correlation_id!r}, "
             "trace_context=<redacted>)"
         )
 
@@ -158,6 +165,7 @@ def create_dispatch_envelope(
     task_payload: object,
     references: object,
     deadline_at: object = None,
+    execution_timeout_seconds: object = None,
     correlation_id: object = None,
     trace_context: object = None,
 ) -> DispatchEnvelope:
@@ -175,6 +183,7 @@ def create_dispatch_envelope(
             "task_payload": task_payload,
             "references": references,
             "deadline_at": deadline_at,
+            "execution_timeout_seconds": execution_timeout_seconds,
             "correlation_id": correlation_id,
             "trace_context": trace_context,
         },
@@ -196,12 +205,17 @@ def dispatch_envelope_to_mapping(envelope: DispatchEnvelope) -> dict[str, object
         "task_payload": _thaw_json(envelope.task_payload),
         "references": _thaw_json(envelope.references),
     }
-    if envelope.schema_version == DISPATCH_ENVELOPE_VERSION:
+    if envelope.schema_version in (
+        DEADLINE_DISPATCH_ENVELOPE_VERSION,
+        DISPATCH_ENVELOPE_VERSION,
+    ):
         mapping["deadline_at"] = (
             format_canonical_deadline(envelope.deadline_at)
             if envelope.deadline_at is not None
             else None
         )
+    if envelope.schema_version == DISPATCH_ENVELOPE_VERSION:
+        mapping["execution_timeout_seconds"] = envelope.execution_timeout_seconds
     if envelope.correlation_id is not None:
         mapping["correlation_id"] = envelope.correlation_id
     if envelope.trace_context is not None:
@@ -261,6 +275,7 @@ def _create_from_mapping(
     version = value.get("schema_version")
     if type(version) is not int or version not in (
         LEGACY_DISPATCH_ENVELOPE_VERSION,
+        DEADLINE_DISPATCH_ENVELOPE_VERSION,
         DISPATCH_ENVELOPE_VERSION,
     ):
         raise _single_issue(
@@ -269,11 +284,12 @@ def _create_from_mapping(
             "Dispatch envelope schema version is unsupported.",
         )
 
-    fields, required_fields = (
-        (_V1_ENVELOPE_FIELDS, _V1_REQUIRED_FIELDS)
-        if version == LEGACY_DISPATCH_ENVELOPE_VERSION
-        else (_V2_ENVELOPE_FIELDS, _V2_REQUIRED_FIELDS)
-    )
+    if version == LEGACY_DISPATCH_ENVELOPE_VERSION:
+        fields, required_fields = _V1_ENVELOPE_FIELDS, _V1_REQUIRED_FIELDS
+    elif version == DEADLINE_DISPATCH_ENVELOPE_VERSION:
+        fields, required_fields = _V2_ENVELOPE_FIELDS, _V2_REQUIRED_FIELDS
+    else:
+        fields, required_fields = _V3_ENVELOPE_FIELDS, _V3_REQUIRED_FIELDS
     issues: list[DispatchEnvelopeIssue] = []
     for field in sorted(required_fields - value.keys()):
         issues.append(
@@ -334,6 +350,13 @@ def _create_from_mapping(
         if version == LEGACY_DISPATCH_ENVELOPE_VERSION
         else _validate_deadline_at(value.get("deadline_at"), issues)
     )
+    execution_timeout_seconds = (
+        _validate_execution_timeout_seconds(
+            value.get("execution_timeout_seconds"), issues
+        )
+        if version == DISPATCH_ENVELOPE_VERSION
+        else None
+    )
     if issues:
         raise DispatchEnvelopeValidationError(tuple(issues))
 
@@ -358,6 +381,7 @@ def _create_from_mapping(
         task_payload=frozen_payload,
         references=frozen_references,
         deadline_at=deadline_at,
+        execution_timeout_seconds=execution_timeout_seconds,
         correlation_id=correlation_id,
         trace_context=trace_context,
         _validated_construction=_VALIDATED_CONSTRUCTION,
@@ -407,6 +431,23 @@ def _validate_deadline_at(
             "invalid_deadline_at",
             ("deadline_at",),
             "Deadline must be null or a canonical UTC timestamp.",
+        )
+    )
+    return None
+
+
+def _validate_execution_timeout_seconds(
+    value: object, issues: list[DispatchEnvelopeIssue]
+) -> int | None:
+    if value is None:
+        return None
+    if type(value) is int and 1 <= value <= MAX_TASK_EXECUTION_TIMEOUT_SECONDS:
+        return value
+    issues.append(
+        DispatchEnvelopeIssue(
+            "invalid_execution_timeout_seconds",
+            ("execution_timeout_seconds",),
+            "Execution timeout seconds must be null or a positive bounded integer.",
         )
     )
     return None

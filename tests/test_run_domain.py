@@ -520,3 +520,12 @@ def test_request_fingerprint_is_canonical_and_covers_request_semantics() -> None
 def test_version_step_rejects_deadline_outside_policy_domain(deadline: object) -> None:
     with pytest.raises(ValueError, match="supported range"):
         WorkflowRunVersionStep("step", deadline)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("timeout", (True, 0, 31_536_001))
+def test_version_step_rejects_timeout_outside_policy_domain(timeout: object) -> None:
+    with pytest.raises(ValueError, match="execution timeout"):
+        WorkflowRunVersionStep(
+            "step",
+            execution_timeout_seconds=timeout,  # type: ignore[arg-type]
+        )

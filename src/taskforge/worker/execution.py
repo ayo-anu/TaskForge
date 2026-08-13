@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Protocol
 from uuid import UUID
 
@@ -23,9 +24,17 @@ from taskforge.dispatch.transport import (
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.worker.consumer_ports import DispatchDeliveryControl
 from taskforge.worker.handlers import (
+    TaskContext,
     TaskDeadline,
+    TaskHandler,
     TaskHandlerRegistry,
     create_task_context,
+)
+from taskforge.worker.results import (
+    TaskCancellation,
+    TaskExecutionResult,
+    TaskPermanentFailure,
+    TaskRetryableFailure,
 )
 from taskforge.worker.start import (
     TaskStartInvariantError,
@@ -38,10 +47,6 @@ from taskforge.worker.start import (
 
 class WorkerConsumptionPaused(Exception):
     """Consumption must pause while preserving the current valid delivery."""
-
-
-class HandlerDispatchFailed(Exception):
-    """A trusted registered handler raised during dispatch."""
 
 
 class TaskClaimAcquirer(Protocol):
@@ -166,7 +171,36 @@ class WorkerExecutionConsumer:
                 else None
             ),
         )
-        try:
-            await definition.handler(context)
-        except Exception as error:
-            raise HandlerDispatchFailed from error
+        await _execute_handler(
+            definition.handler,
+            context,
+            envelope.execution_timeout_seconds,
+        )
+
+
+async def _execute_handler(
+    handler: TaskHandler,
+    context: TaskContext,
+    execution_timeout_seconds: int | None,
+) -> TaskExecutionResult:
+    try:
+        if execution_timeout_seconds is None:
+            raw_result = await handler(context)
+        else:
+            timeout = asyncio.timeout(execution_timeout_seconds)
+            try:
+                async with timeout:
+                    raw_result = await handler(context)
+            except TimeoutError:
+                if timeout.expired():
+                    return TaskExecutionResult.retryable_execution_timeout()
+                return TaskExecutionResult.retryable_handler_exception()
+    except Exception:
+        return TaskExecutionResult.retryable_handler_exception()
+    if isinstance(raw_result, TaskRetryableFailure):
+        return TaskExecutionResult.retryable_handler_reported()
+    if isinstance(raw_result, TaskPermanentFailure):
+        return TaskExecutionResult.permanent_failure()
+    if isinstance(raw_result, TaskCancellation):
+        return TaskExecutionResult.cancellation()
+    return TaskExecutionResult.success(raw_result)

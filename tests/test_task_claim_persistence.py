@@ -40,12 +40,13 @@ def legacy(envelope: DispatchEnvelope) -> DispatchEnvelope:
     mapping = dispatch_envelope_to_mapping(envelope)
     mapping["schema_version"] = 1
     del mapping["deadline_at"]
+    del mapping["execution_timeout_seconds"]
     return deserialize_dispatch_envelope(
         json.dumps(mapping, separators=(",", ":"), sort_keys=True).encode()
     )
 
 
-def test_full_payload_match_fences_v2_deadline_and_version() -> None:
+def test_full_payload_match_fences_v3_policy_and_version() -> None:
     deadline = datetime(2026, 8, 13, 20, tzinfo=UTC)
     envelope = create_dispatch_envelope(
         dispatch_id=uuid4(),
@@ -58,6 +59,7 @@ def test_full_payload_match_fences_v2_deadline_and_version() -> None:
         task_payload={},
         references={},
         deadline_at=deadline,
+        execution_timeout_seconds=30,
     )
     durable = SimpleNamespace(
         attempt_number=1,
@@ -76,10 +78,26 @@ def test_full_payload_match_fences_v2_deadline_and_version() -> None:
         task_payload={},
         references={},
         deadline_at=deadline + timedelta(seconds=1),
+        execution_timeout_seconds=30,
     )
     assert _dispatch_matches(envelope, cast(Any, durable))
     assert not _dispatch_matches(changed, cast(Any, durable))
     assert not _dispatch_matches(legacy(envelope), cast(Any, durable))
+
+    changed_timeout = create_dispatch_envelope(
+        dispatch_id=envelope.dispatch_id,
+        task_attempt_id=envelope.task_attempt_id,
+        task_run_id=envelope.task_run_id,
+        workflow_run_id=envelope.workflow_run_id,
+        attempt_number=1,
+        task_type="test.task",
+        required_capability="test-capability",
+        task_payload={},
+        references={},
+        deadline_at=deadline,
+        execution_timeout_seconds=31,
+    )
+    assert not _dispatch_matches(changed_timeout, cast(Any, durable))
 
 
 def test_full_payload_match_preserves_historical_v1() -> None:
@@ -102,6 +120,7 @@ def test_full_payload_match_preserves_historical_v1() -> None:
         payload=dispatch_envelope_to_mapping(envelope),
     )
     assert envelope.deadline_at is None
+    assert envelope.execution_timeout_seconds is None
     assert _dispatch_matches(envelope, cast(Any, durable))
 
 

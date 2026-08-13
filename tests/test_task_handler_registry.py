@@ -11,6 +11,11 @@ from taskforge.worker.handlers import (
     TaskHandlerDefinition,
     TaskHandlerRegistry,
 )
+from taskforge.worker.results import (
+    TaskCancellation,
+    TaskPermanentFailure,
+    TaskRetryableFailure,
+)
 from taskforge.workflows.task_types import (
     JSONMapping,
     TaskTypeDefinition,
@@ -61,6 +66,11 @@ def test_task_deadline_normalizes_to_utc_and_has_safe_repr() -> None:
 def test_task_deadline_rejects_naive_time() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         TaskDeadline(datetime(2030, 1, 1))
+
+
+def test_handler_markers_are_fieldless_immutable_types() -> None:
+    for marker in (TaskRetryableFailure(), TaskPermanentFailure(), TaskCancellation()):
+        assert marker.__dataclass_fields__ == {}
 
 
 @pytest.mark.parametrize(

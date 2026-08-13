@@ -88,7 +88,10 @@ async def seed_workflow(
                     "workflow_definition_id": workflow_id,
                     "version_number": 1,
                     "name": "one",
-                    "execution_policy": {"deadline_seconds": 100},
+                    "execution_policy": {
+                        "deadline_seconds": 100,
+                        "execution_timeout_seconds": 60,
+                    },
                 },
                 {
                     "id": version_two_id,
@@ -108,7 +111,12 @@ async def seed_workflow(
                     "task_type": "test.task",
                     "parameters": {},
                     "execution_policy": (
-                        {"deadline_seconds": 25} if identifier == "leaf" else None
+                        {
+                            "deadline_seconds": 25,
+                            "execution_timeout_seconds": 10,
+                        }
+                        if identifier == "leaf"
+                        else None
                     ),
                 }
                 for identifier in ("root", "leaf")
@@ -192,18 +200,27 @@ async def verify_creation(database_url: URL) -> None:
             ).one()
             assert explicit_input.payload == {"value": 1}
             assert explicit_input.input_references == {"artifact": {"kind": "object"}}
-            explicit_deadlines = (
+            explicit_policies = (
                 await session.execute(
-                    select(task_runs.c.step_identifier, task_runs.c.deadline_at)
+                    select(
+                        task_runs.c.step_identifier,
+                        task_runs.c.deadline_at,
+                        task_runs.c.execution_timeout_seconds,
+                    )
                     .where(task_runs.c.workflow_run_id == explicit.id)
                     .order_by(task_runs.c.step_identifier)
                 )
             ).all()
             assert [
-                (row.step_identifier, row.deadline_at) for row in explicit_deadlines
+                (
+                    row.step_identifier,
+                    row.deadline_at,
+                    row.execution_timeout_seconds,
+                )
+                for row in explicit_policies
             ] == [
-                ("leaf", explicit.created_at + timedelta(seconds=25)),
-                ("root", explicit.created_at + timedelta(seconds=100)),
+                ("leaf", explicit.created_at + timedelta(seconds=25), 10),
+                ("root", explicit.created_at + timedelta(seconds=100), 60),
             ]
             rows = (
                 await session.execute(

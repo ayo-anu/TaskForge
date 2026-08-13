@@ -71,6 +71,15 @@ workflow_definitions = Table(
         "BETWEEN 1 AND 31536000)",
         name="deadline_seconds_valid",
     ),
+    CheckConstraint(
+        "execution_policy IS NULL "
+        "OR NOT (execution_policy ? 'execution_timeout_seconds') "
+        "OR (jsonb_typeof(execution_policy -> 'execution_timeout_seconds') = 'number' "
+        "AND (execution_policy ->> 'execution_timeout_seconds') ~ '^[0-9]+$' "
+        "AND (execution_policy ->> 'execution_timeout_seconds')::numeric "
+        "BETWEEN 1 AND 31536000)",
+        name="execution_timeout_seconds_valid",
+    ),
 )
 
 Index(
@@ -123,6 +132,15 @@ workflow_draft_steps = Table(
         "AND (execution_policy ->> 'deadline_seconds')::numeric "
         "BETWEEN 1 AND 31536000)",
         name="deadline_seconds_valid",
+    ),
+    CheckConstraint(
+        "execution_policy IS NULL "
+        "OR NOT (execution_policy ? 'execution_timeout_seconds') "
+        "OR (jsonb_typeof(execution_policy -> 'execution_timeout_seconds') = 'number' "
+        "AND (execution_policy ->> 'execution_timeout_seconds') ~ '^[0-9]+$' "
+        "AND (execution_policy ->> 'execution_timeout_seconds')::numeric "
+        "BETWEEN 1 AND 31536000)",
+        name="execution_timeout_seconds_valid",
     ),
 )
 
@@ -210,6 +228,16 @@ workflow_versions = Table(
         name="deadline_seconds_valid",
         postgresql_not_valid=True,
     ),
+    CheckConstraint(
+        "execution_policy IS NULL "
+        "OR NOT (execution_policy ? 'execution_timeout_seconds') "
+        "OR (jsonb_typeof(execution_policy -> 'execution_timeout_seconds') = 'number' "
+        "AND (execution_policy ->> 'execution_timeout_seconds') ~ '^[0-9]+$' "
+        "AND (execution_policy ->> 'execution_timeout_seconds')::numeric "
+        "BETWEEN 1 AND 31536000)",
+        name="execution_timeout_seconds_valid",
+        postgresql_not_valid=True,
+    ),
 )
 
 workflow_version_steps = Table(
@@ -243,6 +271,16 @@ workflow_version_steps = Table(
         "AND (execution_policy ->> 'deadline_seconds')::numeric "
         "BETWEEN 1 AND 31536000)",
         name="deadline_seconds_valid",
+        postgresql_not_valid=True,
+    ),
+    CheckConstraint(
+        "execution_policy IS NULL "
+        "OR NOT (execution_policy ? 'execution_timeout_seconds') "
+        "OR (jsonb_typeof(execution_policy -> 'execution_timeout_seconds') = 'number' "
+        "AND (execution_policy ->> 'execution_timeout_seconds') ~ '^[0-9]+$' "
+        "AND (execution_policy ->> 'execution_timeout_seconds')::numeric "
+        "BETWEEN 1 AND 31536000)",
+        name="execution_timeout_seconds_valid",
         postgresql_not_valid=True,
     ),
 )

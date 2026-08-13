@@ -33,12 +33,18 @@ class PreparedTaskDispatch:
     task_parameters: JSONMapping
     attempt_number: int
     deadline_at: datetime | None = None
+    execution_timeout_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if self.deadline_at is not None:
             if self.deadline_at.tzinfo is None or self.deadline_at.utcoffset() is None:
                 raise ValueError("dispatch deadline must be timezone-aware")
             object.__setattr__(self, "deadline_at", self.deadline_at.astimezone(UTC))
+        if self.execution_timeout_seconds is not None and (
+            type(self.execution_timeout_seconds) is not int
+            or not 1 <= self.execution_timeout_seconds <= 31_536_000
+        ):
+            raise ValueError("dispatch execution timeout must be positive and bounded")
 
     def __repr__(self) -> str:
         return (
@@ -49,7 +55,8 @@ class PreparedTaskDispatch:
             f"step_identifier={self.step_identifier!r}, "
             f"task_type={self.task_type!r}, task_parameters=<redacted>, "
             f"attempt_number={self.attempt_number!r}, "
-            f"deadline_at={self.deadline_at!r})"
+            f"deadline_at={self.deadline_at!r}, "
+            f"execution_timeout_seconds={self.execution_timeout_seconds!r})"
         )
 
 
