@@ -35,7 +35,12 @@ from taskforge.claims.persistence_ports import (
     TaskClaimSessionUnavailable,
     TaskClaimWorkerUnavailable,
 )
-from taskforge.claims.service import TaskClaimInspectionService, TaskClaimService
+from taskforge.claims.service import (
+    TaskClaimInspectionService,
+    TaskClaimService,
+    TaskClaimServiceInvariantError,
+    TaskClaimServiceUnavailable,
+)
 from taskforge.dispatch.envelope import create_dispatch_envelope
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.authorization import OwnerFilter
@@ -173,32 +178,32 @@ def test_service_forwards_renewal_without_result_authority() -> None:
     (
         (
             TaskClaimDispatchRejected(),
-            TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+            TaskClaimRejectionReason.INVALID_DISPATCH,
         ),
         (
             TaskClaimAttemptStale(),
-            TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+            TaskClaimRejectionReason.STALE_ATTEMPT,
         ),
-        (TaskClaimNotEligible(), TaskClaimRejectionReason.TASK_NOT_CLAIMABLE),
+        (TaskClaimNotEligible(), TaskClaimRejectionReason.OBSOLETE_TASK),
         (
             TaskClaimAuthorityRejected(),
             TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
         ),
         (
             TaskClaimSessionUnavailable(),
-            TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
+            TaskClaimRejectionReason.WORKER_SESSION_UNAVAILABLE,
         ),
         (
             TaskClaimSessionInactive(),
-            TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
+            TaskClaimRejectionReason.WORKER_SESSION_INACTIVE,
         ),
         (
             TaskClaimWorkerUnavailable(),
-            TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
+            TaskClaimRejectionReason.WORKER_UNAVAILABLE,
         ),
         (
             TaskClaimCapabilityMismatch(),
-            TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
+            TaskClaimRejectionReason.CAPABILITY_MISMATCH,
         ),
         (
             TaskClaimAlreadyOwned(),
@@ -247,11 +252,14 @@ def test_service_maps_expected_acquisition_denials_to_safe_rejections(
 
 
 @pytest.mark.parametrize(
-    "repository_error",
-    (TaskClaimInvariantViolation(), TaskClaimPersistenceUnavailable()),
+    ("repository_error", "service_error"),
+    (
+        (TaskClaimInvariantViolation(), TaskClaimServiceInvariantError),
+        (TaskClaimPersistenceUnavailable(), TaskClaimServiceUnavailable),
+    ),
 )
-def test_service_does_not_convert_internal_acquisition_failures(
-    repository_error: Exception,
+def test_service_translates_internal_acquisition_failures(
+    repository_error: Exception, service_error: type[Exception]
 ) -> None:
     acquired = datetime.now(UTC)
     result = TaskClaimResult(
@@ -275,13 +283,13 @@ def test_service_does_not_convert_internal_acquisition_failures(
         references={},
     )
 
-    with pytest.raises(type(repository_error)) as raised:
+    with pytest.raises(service_error) as raised:
         asyncio.run(
             service.claim_task(worker, result.claim.worker_session_id, envelope)
         )
 
-    assert raised.value is repository_error
     assert not isinstance(raised.value, TaskClaimRejected)
+    assert raised.value.__cause__ is repository_error
 
 
 class FakeInspectionRepository:

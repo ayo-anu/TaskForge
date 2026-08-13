@@ -22,7 +22,9 @@ from taskforge.claims.persistence_ports import (
     TaskClaimInspectionNotFound,
     TaskClaimInspectionPersistenceUnavailable,
     TaskClaimInspectionRepository,
+    TaskClaimInvariantViolation,
     TaskClaimNotEligible,
+    TaskClaimPersistenceUnavailable,
     TaskClaimRepository,
     TaskClaimSessionInactive,
     TaskClaimSessionUnavailable,
@@ -33,17 +35,25 @@ from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.authorization import OwnerFilter
 
 _ACQUISITION_REJECTION_REASONS: dict[type[Exception], TaskClaimRejectionReason] = {
-    TaskClaimDispatchRejected: TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
-    TaskClaimAttemptStale: TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
-    TaskClaimNotEligible: TaskClaimRejectionReason.TASK_NOT_CLAIMABLE,
+    TaskClaimDispatchRejected: TaskClaimRejectionReason.INVALID_DISPATCH,
+    TaskClaimAttemptStale: TaskClaimRejectionReason.STALE_ATTEMPT,
+    TaskClaimNotEligible: TaskClaimRejectionReason.OBSOLETE_TASK,
     TaskClaimAuthorityRejected: TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
-    TaskClaimSessionUnavailable: TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
-    TaskClaimSessionInactive: TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED,
-    TaskClaimWorkerUnavailable: TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
-    TaskClaimCapabilityMismatch: TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
+    TaskClaimSessionUnavailable: TaskClaimRejectionReason.WORKER_SESSION_UNAVAILABLE,
+    TaskClaimSessionInactive: TaskClaimRejectionReason.WORKER_SESSION_INACTIVE,
+    TaskClaimWorkerUnavailable: TaskClaimRejectionReason.WORKER_UNAVAILABLE,
+    TaskClaimCapabilityMismatch: TaskClaimRejectionReason.CAPABILITY_MISMATCH,
     TaskClaimAlreadyOwned: TaskClaimRejectionReason.ALREADY_AUTHORITATIVE,
 }
 _EXPECTED_ACQUISITION_REJECTIONS = tuple(_ACQUISITION_REJECTION_REASONS)
+
+
+class TaskClaimServiceInvariantError(Exception):
+    """Durable claim state violated an internal invariant."""
+
+
+class TaskClaimServiceUnavailable(Exception):
+    """Claim persistence is operationally unavailable."""
 
 
 class TaskClaimService:
@@ -77,6 +87,10 @@ class TaskClaimService:
             raise TaskClaimRejected(
                 _ACQUISITION_REJECTION_REASONS[type(error)]
             ) from error
+        except TaskClaimInvariantViolation as error:
+            raise TaskClaimServiceInvariantError from error
+        except TaskClaimPersistenceUnavailable as error:
+            raise TaskClaimServiceUnavailable from error
         authority = None
         if result.outcome is not TaskClaimOutcome.REPLAYED_EXPIRED:
             authority = self._authority_issuer.issue(

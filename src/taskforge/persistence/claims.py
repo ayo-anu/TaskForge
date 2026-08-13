@@ -128,7 +128,7 @@ class SQLAlchemyTaskClaimRepository:
                     )
                 ).one_or_none()
                 if task is None:
-                    raise TaskClaimDispatchRejected
+                    raise TaskClaimInvariantViolation
 
                 durable = (
                     await session.execute(
@@ -168,7 +168,9 @@ class SQLAlchemyTaskClaimRepository:
                         )
                     )
                 ).one_or_none()
-                if durable is None or not _dispatch_matches(dispatch, durable):
+                if durable is None:
+                    raise TaskClaimInvariantViolation
+                if not _dispatch_matches(dispatch, durable):
                     raise TaskClaimDispatchRejected
 
                 latest_attempt = await session.scalar(
@@ -195,10 +197,13 @@ class SQLAlchemyTaskClaimRepository:
                     )
                 ).one_or_none()
                 if current is not None:
+                    if task.status not in (
+                        TaskRunStatus.CLAIMED.value,
+                        TaskRunStatus.RUNNING.value,
+                    ):
+                        raise TaskClaimInvariantViolation
                     if current.worker_session_id != worker_session_id:
                         raise TaskClaimAlreadyOwned
-                    if task.status != TaskRunStatus.CLAIMED.value:
-                        raise TaskClaimInvariantViolation
                     expired = await session.scalar(
                         select(current.lease_expires_at <= func.statement_timestamp())
                     )
@@ -208,10 +213,20 @@ class SQLAlchemyTaskClaimRepository:
                         if expired
                         else TaskClaimOutcome.REPLAYED_ACTIVE,
                     )
-                if task.status == TaskRunStatus.CLAIMED.value:
+                if task.status in (
+                    TaskRunStatus.CLAIMED.value,
+                    TaskRunStatus.RUNNING.value,
+                ):
                     raise TaskClaimInvariantViolation
                 if task.status != TaskRunStatus.DISPATCHED.value:
-                    raise TaskClaimNotEligible
+                    if task.status in (
+                        TaskRunStatus.SUCCEEDED.value,
+                        TaskRunStatus.FAILED.value,
+                        TaskRunStatus.SKIPPED.value,
+                        TaskRunStatus.CANCELLED.value,
+                    ):
+                        raise TaskClaimNotEligible
+                    raise TaskClaimInvariantViolation
 
                 health = (
                     await session.execute(

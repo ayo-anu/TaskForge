@@ -22,10 +22,14 @@ class TaskClaimOutcome(StrEnum):
 
 
 class TaskClaimRejectionReason(StrEnum):
-    INVALID_OR_STALE_DISPATCH = "invalid_or_stale_dispatch"
-    TASK_NOT_CLAIMABLE = "task_not_claimable"
+    INVALID_DISPATCH = "invalid_dispatch"
+    STALE_ATTEMPT = "stale_attempt"
+    OBSOLETE_TASK = "obsolete_task"
     WORKER_AUTHORITY_REJECTED = "worker_authority_rejected"
-    WORKER_NOT_ELIGIBLE = "worker_not_eligible"
+    WORKER_SESSION_UNAVAILABLE = "worker_session_unavailable"
+    WORKER_SESSION_INACTIVE = "worker_session_inactive"
+    WORKER_UNAVAILABLE = "worker_unavailable"
+    CAPABILITY_MISMATCH = "capability_mismatch"
     ALREADY_AUTHORITATIVE = "already_authoritative"
 
 

@@ -25,10 +25,9 @@ from taskforge.claims.domain import (
 )
 from taskforge.claims.persistence_ports import (
     TaskClaimAttemptStale,
-    TaskClaimPersistenceUnavailable,
     TaskClaimWorkerUnavailable,
 )
-from taskforge.claims.service import TaskClaimService
+from taskforge.claims.service import TaskClaimService, TaskClaimServiceUnavailable
 from taskforge.dispatch.envelope import (
     DispatchEnvelope,
     create_dispatch_envelope,
@@ -422,7 +421,7 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
             "CREATE TRIGGER reject_claimed_transition_trigger BEFORE UPDATE ON "
             "task_runs FOR EACH ROW EXECUTE FUNCTION reject_claimed_transition()"
         )
-        with pytest.raises(TaskClaimPersistenceUnavailable):
+        with pytest.raises(TaskClaimServiceUnavailable):
             await service.claim_task(
                 rollback_worker.authenticated,
                 rollback_worker.session_id,
@@ -505,19 +504,19 @@ async def exercise_service_rejections(
         service,
         stale_worker,
         stale_dispatch,
-        TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+        TaskClaimRejectionReason.STALE_ATTEMPT,
     )
 
     mismatched_dispatch = await add_dispatched_task(setup)
     mismatched_delivery = create_dispatch_envelope(
-        dispatch_id=uuid4(),
+        dispatch_id=mismatched_dispatch.dispatch_id,
         task_attempt_id=mismatched_dispatch.task_attempt_id,
         task_run_id=mismatched_dispatch.task_run_id,
         workflow_run_id=mismatched_dispatch.workflow_run_id,
         attempt_number=mismatched_dispatch.attempt_number,
         task_type=mismatched_dispatch.task_type,
         required_capability=mismatched_dispatch.required_capability,
-        task_payload={},
+        task_payload={"mismatched": True},
         references={},
     )
     await assert_service_rejection_does_not_mutate(
@@ -525,17 +524,17 @@ async def exercise_service_rejections(
         service,
         stale_worker,
         mismatched_delivery,
-        TaskClaimRejectionReason.INVALID_OR_STALE_DISPATCH,
+        TaskClaimRejectionReason.INVALID_DISPATCH,
     )
 
     nonclaimable_worker = await add_worker(setup)
-    nonclaimable_dispatch = await add_dispatched_task(setup, status="running")
+    nonclaimable_dispatch = await add_dispatched_task(setup, status="succeeded")
     await assert_service_rejection_does_not_mutate(
         setup,
         service,
         nonclaimable_worker,
         nonclaimable_dispatch,
-        TaskClaimRejectionReason.TASK_NOT_CLAIMABLE,
+        TaskClaimRejectionReason.OBSOLETE_TASK,
     )
 
     disabled_worker = await add_worker(setup)
@@ -565,7 +564,7 @@ async def exercise_service_rejections(
         service,
         unavailable_worker,
         unavailable_dispatch,
-        TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE,
+        TaskClaimRejectionReason.WORKER_UNAVAILABLE,
     )
 
     owner = await add_worker(setup)
@@ -626,9 +625,9 @@ async def exercise_session_and_capability_races(
             with pytest.raises(TaskClaimRejected) as raised:
                 await pending
             expected_reason = (
-                TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED
+                TaskClaimRejectionReason.WORKER_SESSION_INACTIVE
                 if terminate
-                else TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE
+                else TaskClaimRejectionReason.CAPABILITY_MISMATCH
             )
             assert raised.value.reason is expected_reason
         finally:
@@ -791,7 +790,7 @@ async def exercise_health_mutation_race(
         await transaction.commit()
         with pytest.raises(TaskClaimRejected) as rejected:
             await pending
-        assert rejected.value.reason is TaskClaimRejectionReason.WORKER_NOT_ELIGIBLE
+        assert rejected.value.reason is TaskClaimRejectionReason.WORKER_UNAVAILABLE
         assert not await setup.fetchval(
             "SELECT EXISTS (SELECT FROM task_attempt_claims WHERE task_attempt_id = $1)",
             dispatch.task_attempt_id,
