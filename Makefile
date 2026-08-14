@@ -1,4 +1,4 @@
-.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test claim-test renewal-test retry-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test check clean
+.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test claim-test renewal-test retry-test recovery-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test check clean
 
 install:
 	uv sync --locked --dev
@@ -43,6 +43,11 @@ retry-test:
 	@test "$${TASKFORGE_RUN_RETRY_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_RETRY_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_RETRY_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_RETRY_TEST_DATABASE_URL is required" >&2; exit 2)
 	uv run pytest tests/integration/test_retry_transition.py tests/integration/test_retry_scanner.py tests/integration/test_retry_inspection.py
+
+recovery-test:
+	@test "$${TASKFORGE_RUN_RECOVERY_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_RECOVERY_INTEGRATION=1 is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_RECOVERY_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_RECOVERY_TEST_DATABASE_URL is required" >&2; exit 2)
+	uv run pytest tests/integration/test_recovery_scanner.py
 
 authentication-test:
 	@test "$${TASKFORGE_RUN_AUTHENTICATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_AUTHENTICATION_INTEGRATION=1 is required" >&2; exit 2)
