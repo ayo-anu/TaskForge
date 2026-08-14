@@ -15,6 +15,13 @@ from taskforge.retries.domain import (
     resolve_persisted_retry_policy,
     validate_retry_policy_configuration,
 )
+from taskforge.retries.service import (
+    RetryTransitionInvariantError,
+    RetryTransitionOutcome,
+    RetryTransitionReceipt,
+    RetryTransitionService,
+    RetryTransitionServiceUnavailable,
+)
 
 __all__ = [
     "MAX_CONFIGURED_RETRY_ATTEMPTS",
@@ -26,6 +33,11 @@ __all__ = [
     "RetryDecisionKind",
     "RetryPolicy",
     "RetryPolicyValidationIssue",
+    "RetryTransitionInvariantError",
+    "RetryTransitionOutcome",
+    "RetryTransitionReceipt",
+    "RetryTransitionService",
+    "RetryTransitionServiceUnavailable",
     "decide_retry",
     "parse_persisted_retry_policy",
     "resolve_persisted_retry_policy",
