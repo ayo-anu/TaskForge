@@ -19,6 +19,7 @@ from taskforge.claims.domain import (
 )
 from taskforge.claims.persistence_ports import (
     TaskClaimAuthorityRejected,
+    TaskClaimRenewalRecovered,
     TaskClaimSessionInactive,
 )
 from taskforge.dispatch.envelope import (
@@ -350,6 +351,7 @@ def renewal_rows(
         worker_session_id=request.worker_session_id,
         acquired_at=acquired_at,
         lease_expires_at=current_expiry,
+        terminated_at=None,
     )
     rows: list[object] = [
         SimpleNamespace(id=worker.worker_identity_id),
@@ -357,6 +359,7 @@ def renewal_rows(
         SimpleNamespace(ended_at=None),
         SimpleNamespace(id=uuid4(), status="claimed", attempt_number=1),
         claim,
+        None,
         SimpleNamespace(
             reference_time=current_expiry - timedelta(seconds=10),
             candidate_expiry=candidate_expiry,
@@ -462,3 +465,48 @@ def test_repository_active_unchanged_and_replay_are_genuine_no_write_paths() -> 
     assert not any(
         isinstance(statement, Update) for statement in replay_session.statements
     )
+
+
+def test_repository_rejects_exact_recovered_generation_without_result_row_lock() -> (
+    None
+):
+    worker = AuthenticatedWorker(uuid4(), uuid4())
+    session_id, attempt_id = uuid4(), uuid4()
+    expiry = datetime.now(UTC) - timedelta(seconds=1)
+    request = TaskClaimRenewalRequest(attempt_id, 2, session_id, expiry)
+    session = FakeSession(
+        [
+            SimpleNamespace(id=worker.worker_identity_id),
+            SimpleNamespace(id=worker.credential_id),
+            SimpleNamespace(ended_at=None),
+            SimpleNamespace(id=uuid4(), status="retry_scheduled", attempt_number=1),
+            SimpleNamespace(
+                task_attempt_id=attempt_id,
+                generation=2,
+                worker_session_id=session_id,
+                acquired_at=expiry - timedelta(seconds=60),
+                lease_expires_at=expiry,
+                terminated_at=expiry,
+            ),
+            SimpleNamespace(
+                claim_generation=2,
+                result_kind="retryable_failure",
+                failure_kind="claim_expired",
+                dispatch_attempt_id=attempt_id,
+            ),
+        ],
+        [],
+    )
+    repository = SQLAlchemyTaskClaimRepository(
+        cast(async_sessionmaker[AsyncSession], FakeSessions(session)),
+        worker_stale_after_seconds=30,
+    )
+
+    with pytest.raises(TaskClaimRenewalRecovered):
+        asyncio.run(repository.renew_claim(worker, request, lease_seconds=60))
+
+    result_statement = cast(Any, session.statements[-1])
+    result_sql = str(result_statement.compile(compile_kwargs={"literal_binds": True}))
+    assert "task_attempt_results" in result_sql
+    assert "FOR UPDATE" not in result_sql
+    assert not any(isinstance(statement, Update) for statement in session.statements)

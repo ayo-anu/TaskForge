@@ -34,6 +34,7 @@ from taskforge.claims.persistence_ports import (
     TaskClaimNotEligible,
     TaskClaimPersistenceUnavailable,
     TaskClaimRenewalExpired,
+    TaskClaimRenewalRecovered,
     TaskClaimRenewalStale,
     TaskClaimRenewalTaskInactive,
     TaskClaimSessionInactive,
@@ -50,6 +51,7 @@ from taskforge.identity.schema import worker_credentials, worker_identities
 from taskforge.runs.domain import TaskRunStatus
 from taskforge.runs.schema import (
     task_attempt_claims,
+    task_attempt_results,
     task_attempts,
     task_claim_events,
     task_dispatch_outbox,
@@ -76,6 +78,7 @@ _CLAIM_REJECTIONS = (
     TaskClaimSessionUnavailable,
     TaskClaimWorkerUnavailable,
     TaskClaimRenewalExpired,
+    TaskClaimRenewalRecovered,
     TaskClaimRenewalStale,
     TaskClaimRenewalTaskInactive,
 )
@@ -359,6 +362,66 @@ class SQLAlchemyTaskClaimRepository:
                 ).one_or_none()
                 if task is None:
                     raise TaskClaimRenewalStale
+                current = (
+                    await session.execute(
+                        select(
+                            task_attempt_claims.c.task_attempt_id,
+                            task_attempt_claims.c.generation,
+                            task_attempt_claims.c.worker_session_id,
+                            task_attempt_claims.c.acquired_at,
+                            task_attempt_claims.c.lease_expires_at,
+                            task_attempt_claims.c.terminated_at,
+                        )
+                        .where(
+                            task_attempt_claims.c.task_attempt_id
+                            == request.task_attempt_id,
+                            task_attempt_claims.c.generation == request.generation,
+                        )
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if (
+                    current is None
+                    or current.worker_session_id != request.worker_session_id
+                ):
+                    raise TaskClaimRenewalStale
+
+                accepted = (
+                    await session.execute(
+                        select(
+                            task_attempt_results.c.claim_generation,
+                            task_attempt_results.c.result_kind,
+                            task_attempt_results.c.failure_kind,
+                            task_dispatch_outbox.c.task_attempt_id.label(
+                                "dispatch_attempt_id"
+                            ),
+                        )
+                        .select_from(
+                            task_attempt_results.join(
+                                task_dispatch_outbox,
+                                task_dispatch_outbox.c.id
+                                == task_attempt_results.c.dispatch_id,
+                            )
+                        )
+                        .where(
+                            task_attempt_results.c.task_attempt_id
+                            == request.task_attempt_id
+                        )
+                    )
+                ).one_or_none()
+                if (
+                    accepted is not None
+                    and accepted.claim_generation == request.generation
+                    and accepted.result_kind == "retryable_failure"
+                    and accepted.failure_kind == "claim_expired"
+                ):
+                    if (
+                        current.terminated_at is None
+                        or accepted.dispatch_attempt_id != request.task_attempt_id
+                    ):
+                        raise TaskClaimInvariantViolation
+                    raise TaskClaimRenewalRecovered
+
                 if task.status not in (
                     TaskRunStatus.CLAIMED.value,
                     TaskRunStatus.RUNNING.value,
@@ -372,29 +435,7 @@ class SQLAlchemyTaskClaimRepository:
                 )
                 if latest_attempt != task.attempt_number:
                     raise TaskClaimRenewalStale
-
-                current = (
-                    await session.execute(
-                        select(
-                            task_attempt_claims.c.task_attempt_id,
-                            task_attempt_claims.c.generation,
-                            task_attempt_claims.c.worker_session_id,
-                            task_attempt_claims.c.acquired_at,
-                            task_attempt_claims.c.lease_expires_at,
-                        )
-                        .where(
-                            task_attempt_claims.c.task_attempt_id
-                            == request.task_attempt_id,
-                            task_attempt_claims.c.terminated_at.is_(None),
-                        )
-                        .with_for_update()
-                    )
-                ).one_or_none()
-                if (
-                    current is None
-                    or current.generation != request.generation
-                    or current.worker_session_id != request.worker_session_id
-                ):
+                if current.terminated_at is not None:
                     raise TaskClaimRenewalStale
 
                 timing = (

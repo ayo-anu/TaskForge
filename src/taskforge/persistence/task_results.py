@@ -30,7 +30,10 @@ from taskforge.worker.result_persistence_ports import (
     TaskResultPersistenceNotFound,
     TaskResultPersistenceUnavailable,
 )
-from taskforge.worker.results import TaskExecutionResultKind
+from taskforge.worker.results import (
+    TaskExecutionFailureKind,
+    TaskExecutionResultKind,
+)
 from taskforge.worker.schema import worker_sessions
 
 _EXPECTED_REJECTIONS = (
@@ -128,6 +131,8 @@ class SQLAlchemyTaskResultRepository:
                         select(
                             task_attempt_results.c.claim_generation,
                             task_attempt_results.c.dispatch_id,
+                            task_attempt_results.c.result_kind,
+                            task_attempt_results.c.failure_kind,
                             task_attempt_results.c.result_fingerprint,
                         ).where(
                             task_attempt_results.c.task_attempt_id
@@ -136,6 +141,27 @@ class SQLAlchemyTaskResultRepository:
                     )
                 ).one_or_none()
                 if accepted is not None:
+                    recovered_generation = (
+                        accepted.claim_generation == result.claim_generation
+                        and accepted.dispatch_id == result.dispatch_id
+                        and accepted.result_kind
+                        == TaskExecutionResultKind.RETRYABLE_FAILURE.value
+                        and accepted.failure_kind
+                        == TaskExecutionFailureKind.CLAIM_EXPIRED.value
+                    )
+                    if recovered_generation:
+                        if claim.terminated_at is None:
+                            raise TaskResultPersistenceInvariantViolation
+                        await _append_event(
+                            session,
+                            worker_session_id,
+                            result,
+                            "result_stale_rejected",
+                        )
+                        return PersistedTaskResult(
+                            PersistedTaskResultOutcome.STALE_REJECTED,
+                            result.task_attempt_id,
+                        )
                     if accepted.claim_generation != result.claim_generation:
                         await _append_event(
                             session,

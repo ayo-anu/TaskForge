@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections import Counter
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -16,7 +17,13 @@ from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
-from taskforge.claims.domain import IssuedTaskClaim, TaskClaimResultAuthority
+from taskforge.claims.domain import (
+    IssuedTaskClaim,
+    TaskClaimRenewalOutcome,
+    TaskClaimRenewalRequest,
+    TaskClaimResultAuthority,
+)
+from taskforge.claims.persistence_ports import TaskClaimRenewalRecovered
 from taskforge.claims.service import TaskClaimService
 from taskforge.dispatch.envelope import (
     DispatchEnvelope,
@@ -50,7 +57,7 @@ from taskforge.retries.scanner import DueRetryScanner
 from taskforge.runs.domain import WorkflowRunStatus
 from taskforge.runs.service import WorkflowRunService
 from taskforge.worker.result_submission import (
-    TaskResultConflict,
+    TaskResultStale,
     TaskResultSubmissionRequest,
     TaskResultSubmissionService,
 )
@@ -191,6 +198,18 @@ async def wait_until_lock_blocked(
     pytest.fail(f"{application_name} did not reach the expected row lock")
 
 
+async def wait_until_expired(
+    connection: asyncpg.Connection[asyncpg.Record], lease_expires_at: datetime
+) -> datetime:
+    for _ in range(100):
+        observed_at = await connection.fetchval("SELECT statement_timestamp()")
+        assert isinstance(observed_at, datetime)
+        if observed_at >= lease_expires_at:
+            return observed_at
+        await asyncio.sleep(0.01)
+    pytest.fail("claim did not reach its PostgreSQL expiry boundary")
+
+
 async def late_renewal(database_url: URL, candidate: ExpiredClaimCandidate) -> str:
     connection = await asyncpg.connect(asyncpg_dsn(database_url))
     try:
@@ -262,6 +281,9 @@ async def exercise_recovery(database_url: URL) -> None:
         issuer,
         lease_seconds=60,
     )
+    result_service = TaskResultSubmissionService(
+        SQLAlchemyTaskResultRepository(build_session_factory(engine)), issuer
+    )
     run_service = WorkflowRunService(
         SQLAlchemyWorkflowRunRepository(build_session_factory(engine))
     )
@@ -283,6 +305,14 @@ async def exercise_recovery(database_url: URL) -> None:
         assert retry_shape[4:6] == (2, 2)
         assert retry_shape[6] == recovered.recovered_at + timedelta(seconds=7)
         assert retry_shape[7] == 1
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_result_events WHERE task_attempt_id = $1 "
+                "AND event_type = 'result_recovered'",
+                retryable.task_attempt_id,
+            )
+            == 1
+        )
         assert await connection.fetchval(
             "SELECT result_fingerprint FROM task_attempt_results WHERE "
             "task_attempt_id = $1",
@@ -296,6 +326,14 @@ async def exercise_recovery(database_url: URL) -> None:
         duplicate = await service.recover_expired_claim(retryable)
         assert duplicate.outcome is ExpiredClaimRecoveryOutcome.ALREADY_RECOVERED
         assert (await shape(connection, retryable))[4:] == retry_shape[4:]
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_result_events WHERE task_attempt_id = $1 "
+                "AND event_type = 'result_recovered'",
+                retryable.task_attempt_id,
+            )
+            == 1
+        )
         original_dispatch = await connection.fetchval(
             "SELECT id FROM task_dispatch_outbox WHERE task_attempt_id = $1",
             retryable.task_attempt_id,
@@ -316,11 +354,27 @@ async def exercise_recovery(database_url: URL) -> None:
         no_policy_result = await service.recover_expired_claim(no_policy)
         assert no_policy_result.outcome is ExpiredClaimRecoveryOutcome.FAILED_NO_POLICY
         assert (await shape(connection, no_policy))[0:8:4] == ("failed", 1)
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_result_events WHERE task_attempt_id = $1 "
+                "AND event_type = 'result_recovered'",
+                no_policy.task_attempt_id,
+            )
+            == 1
+        )
 
         exhausted = await recoverable_candidate(connection, maximum_attempts=1)
         exhausted_result = await service.recover_expired_claim(exhausted)
         assert exhausted_result.outcome is ExpiredClaimRecoveryOutcome.FAILED_EXHAUSTED
         assert (await shape(connection, exhausted))[4:6] == (1, 1)
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_result_events WHERE task_attempt_id = $1 "
+                "AND event_type = 'result_recovered'",
+                exhausted.task_attempt_id,
+            )
+            == 1
+        )
 
         renewed = await recoverable_candidate(connection)
         await connection.execute(
@@ -371,6 +425,46 @@ async def exercise_recovery(database_url: URL) -> None:
         assert (
             result_outcome.outcome
             is ExpiredClaimRecoveryOutcome.RESULT_ALREADY_ACCEPTED
+        )
+
+        (
+            production_result_first,
+            first_worker,
+            first_dispatch,
+            first_claim,
+        ) = await production_result_race_candidate(connection, claim_service)
+        await connection.execute(
+            "UPDATE task_attempt_claims SET lease_expires_at = "
+            "statement_timestamp() + interval '1 minute' WHERE "
+            "task_attempt_id = $1 AND generation = $2",
+            production_result_first.task_attempt_id,
+            production_result_first.generation,
+        )
+        await connection.execute(
+            "UPDATE task_runs SET status = 'running' WHERE id = $1",
+            production_result_first.task_run_id,
+        )
+        first_authority = first_claim.result_authority
+        assert isinstance(first_authority, TaskClaimResultAuthority)
+        await result_service.submit_result(
+            first_worker.authenticated,
+            first_worker.session_id,
+            TaskResultSubmissionRequest(
+                first_dispatch.dispatch_id,
+                first_dispatch.task_run_id,
+                first_dispatch.task_attempt_id,
+                first_claim.claim.generation,
+                first_authority,
+                TaskExecutionResult.success("worker-won"),
+            ),
+        )
+        assert (
+            await service.recover_expired_claim(production_result_first)
+        ).outcome is ExpiredClaimRecoveryOutcome.RESULT_ALREADY_ACCEPTED
+        assert not await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM task_result_events WHERE "
+            "task_attempt_id = $1 AND event_type = 'result_recovered')",
+            production_result_first.task_attempt_id,
         )
 
         boundary = await recoverable_candidate(connection)
@@ -445,6 +539,176 @@ async def exercise_recovery(database_url: URL) -> None:
         )
 
         (
+            renewal_race,
+            renewal_worker,
+            _,
+            _,
+        ) = await production_result_race_candidate(connection, claim_service)
+        renewal_engine = create_async_engine(
+            database_url.set(drivername="postgresql+asyncpg"),
+            connect_args={"server_settings": {"application_name": "recovered-renewal"}},
+        )
+        renewal_service = TaskClaimService(
+            SQLAlchemyTaskClaimRepository(
+                build_session_factory(renewal_engine), worker_stale_after_seconds=30
+            ),
+            issuer,
+            lease_seconds=60,
+        )
+        renewal_context = repository.recovery_transaction()
+        renewal_transaction = await renewal_context.__aenter__()
+        try:
+            renewal_prepared = await renewal_transaction.prepare_recovery(renewal_race)
+            assert isinstance(renewal_prepared, PreparedExpiredClaimRecovery)
+            renewal_request = TaskClaimRenewalRequest(
+                renewal_race.task_attempt_id,
+                renewal_race.generation,
+                renewal_race.worker_session_id,
+                renewal_race.lease_expires_at,
+            )
+            renewal_submission = asyncio.create_task(
+                renewal_service.renew_claim(
+                    renewal_worker.authenticated, renewal_request
+                )
+            )
+            await wait_until_lock_blocked(connection, "recovered-renewal")
+            assert not renewal_submission.done()
+            await renewal_transaction.exhaust(
+                renewal_prepared, RetryNotScheduledReason.NO_POLICY
+            )
+        except BaseException as error:
+            await renewal_context.__aexit__(type(error), error, error.__traceback__)
+            raise
+        else:
+            await renewal_context.__aexit__(None, None, None)
+        with pytest.raises(TaskClaimRenewalRecovered):
+            await renewal_submission
+        await renewal_engine.dispose()
+        assert (
+            await connection.fetchval(
+                "SELECT lease_expires_at FROM task_attempt_claims WHERE "
+                "task_attempt_id = $1 AND generation = $2",
+                renewal_race.task_attempt_id,
+                renewal_race.generation,
+            )
+            == renewal_race.lease_expires_at
+        )
+
+        renewal_winner_worker = await add_worker(connection)
+        renewal_winner_dispatch = await add_dispatched_task(connection)
+        renewal_winner_claim = await claim_service.claim_task(
+            renewal_winner_worker.authenticated,
+            renewal_winner_worker.session_id,
+            renewal_winner_dispatch,
+        )
+        short_expiry = await connection.fetchval(
+            "UPDATE task_attempt_claims SET lease_expires_at = "
+            "statement_timestamp() + interval '250 milliseconds' WHERE "
+            "task_attempt_id = $1 AND generation = $2 RETURNING lease_expires_at",
+            renewal_winner_dispatch.task_attempt_id,
+            renewal_winner_claim.claim.generation,
+        )
+        assert isinstance(short_expiry, datetime)
+        await connection.execute("SELECT pg_advisory_lock(13000401)")
+        await connection.execute(
+            "CREATE FUNCTION pause_winning_renewal() RETURNS trigger LANGUAGE "
+            "plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(13000401); "
+            "RETURN NEW; END $$"
+        )
+        await connection.execute(
+            "CREATE TRIGGER trg_pause_winning_renewal BEFORE UPDATE OF "
+            "lease_expires_at ON task_attempt_claims FOR EACH ROW EXECUTE "
+            "FUNCTION pause_winning_renewal()"
+        )
+        renewal_winner_engine = create_async_engine(
+            database_url.set(drivername="postgresql+asyncpg"),
+            connect_args={"server_settings": {"application_name": "winning-renewal"}},
+        )
+        renewal_winner_service = TaskClaimService(
+            SQLAlchemyTaskClaimRepository(
+                build_session_factory(renewal_winner_engine),
+                worker_stale_after_seconds=30,
+            ),
+            issuer,
+            lease_seconds=60,
+        )
+        winning_renewal = asyncio.create_task(
+            renewal_winner_service.renew_claim(
+                renewal_winner_worker.authenticated,
+                TaskClaimRenewalRequest(
+                    renewal_winner_dispatch.task_attempt_id,
+                    renewal_winner_claim.claim.generation,
+                    renewal_winner_worker.session_id,
+                    short_expiry,
+                ),
+            )
+        )
+        await wait_until_lock_blocked(connection, "winning-renewal")
+        observed_at = await wait_until_expired(connection, short_expiry)
+        renewal_winner_candidate = ExpiredClaimCandidate(
+            renewal_winner_dispatch.task_attempt_id,
+            renewal_winner_dispatch.task_run_id,
+            renewal_winner_dispatch.workflow_run_id,
+            renewal_winner_dispatch.attempt_number,
+            renewal_winner_claim.claim.generation,
+            renewal_winner_worker.session_id,
+            short_expiry,
+            observed_at,
+        )
+        blocked_recovery_engine = create_async_engine(
+            database_url.set(drivername="postgresql+asyncpg"),
+            connect_args={
+                "server_settings": {"application_name": "renewal-blocked-recovery"}
+            },
+        )
+        blocked_recovery_service = ExpiredClaimRecoveryService(
+            SQLAlchemyExpiredClaimRecoveryRepository(
+                build_session_factory(blocked_recovery_engine)
+            )
+        )
+        blocked_recovery = asyncio.create_task(
+            blocked_recovery_service.recover_expired_claim(renewal_winner_candidate)
+        )
+        await wait_until_lock_blocked(connection, "renewal-blocked-recovery")
+        assert not winning_renewal.done()
+        assert not blocked_recovery.done()
+        assert await connection.fetchval("SELECT pg_advisory_unlock(13000401)") is True
+        renewed_receipt = await winning_renewal
+        recovery_after_renewal = await blocked_recovery
+        assert renewed_receipt.outcome is TaskClaimRenewalOutcome.RENEWED
+        assert (
+            recovery_after_renewal.outcome
+            is ExpiredClaimRecoveryOutcome.CANDIDATE_NO_LONGER_EXPIRED
+        )
+        renewal_winner_state = await connection.fetchrow(
+            "SELECT c.lease_expires_at, c.terminated_at, "
+            "(SELECT count(*) FROM task_attempt_results r WHERE "
+            "r.task_attempt_id = c.task_attempt_id AND "
+            "r.failure_kind = 'claim_expired') AS recovery_results, "
+            "(SELECT count(*) FROM task_result_events e WHERE "
+            "e.task_attempt_id = c.task_attempt_id AND "
+            "e.event_type = 'result_recovered') AS recovery_events, "
+            "(SELECT count(*) FROM task_attempts a WHERE a.task_run_id = $2) "
+            "AS attempt_count, (SELECT count(*) FROM task_retry_events e "
+            "WHERE e.task_run_id = $2) AS retry_events FROM "
+            "task_attempt_claims c WHERE c.task_attempt_id = $1 AND "
+            "c.generation = $3",
+            renewal_winner_candidate.task_attempt_id,
+            renewal_winner_candidate.task_run_id,
+            renewal_winner_candidate.generation,
+        )
+        assert renewal_winner_state is not None
+        assert renewal_winner_state["lease_expires_at"] > short_expiry
+        assert renewal_winner_state["terminated_at"] is None
+        assert tuple(renewal_winner_state)[2:] == (0, 0, 1, 0)
+        await renewal_winner_engine.dispose()
+        await blocked_recovery_engine.dispose()
+        await connection.execute(
+            "DROP TRIGGER trg_pause_winning_renewal ON task_attempt_claims"
+        )
+        await connection.execute("DROP FUNCTION pause_winning_renewal()")
+
+        (
             result_race,
             result_worker,
             result_dispatch,
@@ -490,7 +754,7 @@ async def exercise_recovery(database_url: URL) -> None:
             raise
         else:
             await result_context.__aexit__(None, None, None)
-        with pytest.raises(TaskResultConflict):
+        with pytest.raises(TaskResultStale):
             await submitted
         result_race_shape = await shape(connection, result_race)
         assert result_race_shape[:6] == (
@@ -513,12 +777,82 @@ async def exercise_recovery(database_url: URL) -> None:
         assert (
             await connection.fetchval(
                 "SELECT count(*) FROM task_result_events WHERE task_attempt_id = $1 "
-                "AND event_type = 'result_conflict_rejected'",
+                "AND event_type = 'result_stale_rejected'",
                 result_race.task_attempt_id,
             )
             == 1
         )
+        for late_value in ("late", "different-late-result"):
+            with pytest.raises(TaskResultStale):
+                await result_service.submit_result(
+                    result_worker.authenticated,
+                    result_worker.session_id,
+                    TaskResultSubmissionRequest(
+                        result_dispatch.dispatch_id,
+                        result_dispatch.task_run_id,
+                        result_dispatch.task_attempt_id,
+                        result_claim.claim.generation,
+                        authority,
+                        TaskExecutionResult.success(late_value),
+                    ),
+                )
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_result_events WHERE task_attempt_id = $1 "
+                "AND event_type = 'result_stale_rejected'",
+                result_race.task_attempt_id,
+            )
+            == 3
+        )
+        stale_fingerprints = await connection.fetch(
+            "SELECT result_fingerprint FROM task_result_events WHERE "
+            "task_attempt_id = $1 AND event_type = 'result_stale_rejected'",
+            result_race.task_attempt_id,
+        )
+        assert Counter(row["result_fingerprint"] for row in stale_fingerprints) == (
+            Counter(
+                task_result_fingerprint(
+                    result_kind=TaskExecutionResultKind.SUCCESS,
+                    failure_kind=None,
+                    output=value,
+                )
+                for value in ("late", "late", "different-late-result")
+            )
+        )
         await result_engine.dispose()
+
+        event_rollback = await recoverable_candidate(connection)
+        await connection.execute(
+            "CREATE FUNCTION reject_recovery_result_event() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION "
+            "'injected recovery event failure'; END $$"
+        )
+        await connection.execute(
+            "CREATE TRIGGER trg_inject_recovery_event_failure BEFORE INSERT ON "
+            "task_result_events FOR EACH ROW WHEN "
+            "(NEW.event_type = 'result_recovered') EXECUTE FUNCTION "
+            "reject_recovery_result_event()"
+        )
+        with pytest.raises(ExpiredClaimRecoveryServiceUnavailable):
+            await service.recover_expired_claim(event_rollback)
+        assert (await shape(connection, event_rollback)) == (
+            "running",
+            None,
+            None,
+            None,
+            1,
+            1,
+            None,
+            0,
+        )
+        assert not await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM task_result_events WHERE task_attempt_id = $1)",
+            event_rollback.task_attempt_id,
+        )
+        await connection.execute(
+            "DROP TRIGGER trg_inject_recovery_event_failure ON task_result_events"
+        )
+        await connection.execute("DROP FUNCTION reject_recovery_result_event()")
 
         rollback = await recoverable_candidate(connection)
         await connection.execute(

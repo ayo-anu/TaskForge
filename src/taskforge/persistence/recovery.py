@@ -62,6 +62,7 @@ from taskforge.runs.schema import (
     task_attempt_results,
     task_attempts,
     task_dispatch_outbox,
+    task_result_events,
     task_retry_events,
     task_runs,
     workflow_runs,
@@ -353,9 +354,21 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             accepted = (
                 await session.execute(
                     select(
+                        task_attempt_results.c.result_kind,
                         task_attempt_results.c.failure_kind,
                         task_attempt_results.c.claim_generation,
-                    ).where(
+                        task_dispatch_outbox.c.task_attempt_id.label(
+                            "dispatch_attempt_id"
+                        ),
+                    )
+                    .select_from(
+                        task_attempt_results.join(
+                            task_dispatch_outbox,
+                            task_dispatch_outbox.c.id
+                            == task_attempt_results.c.dispatch_id,
+                        )
+                    )
+                    .where(
                         task_attempt_results.c.task_attempt_id
                         == candidate.task_attempt_id
                     )
@@ -363,11 +376,19 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             ).one_or_none()
             if accepted is not None:
                 if (
-                    accepted.failure_kind
+                    accepted.result_kind
+                    == TaskExecutionResultKind.RETRYABLE_FAILURE.value
+                    and accepted.failure_kind
                     == TaskExecutionFailureKind.CLAIM_EXPIRED.value
                     and accepted.claim_generation == candidate.generation
                     and claim.lease_expires_at == candidate.lease_expires_at
                 ):
+                    if (
+                        claim.terminated_at is None
+                        or claim.worker_session_id != candidate.worker_session_id
+                        or accepted.dispatch_attempt_id != candidate.task_attempt_id
+                    ):
+                        raise ExpiredClaimRecoveryPersistenceInvariantViolation
                     return ExpiredClaimRecoveryNoOp(
                         ExpiredClaimRecoveryNoOpReason.ALREADY_RECOVERED
                     )
@@ -466,6 +487,7 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                 candidate.workflow_run_id,
                 candidate.attempt_number,
                 candidate.generation,
+                claim.worker_session_id,
                 attempt.dispatch_id,
                 claim.lease_expires_at,
                 recovered_at,
@@ -610,6 +632,20 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             ).one_or_none()
             if terminated is None:
                 raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            await session.execute(
+                insert(task_result_events).values(
+                    id=uuid4(),
+                    task_attempt_id=prepared.task_attempt_id,
+                    claim_generation=prepared.generation,
+                    worker_session_id=prepared.worker_session_id,
+                    dispatch_id=prepared.dispatch_id,
+                    event_type="result_recovered",
+                    result_kind=TaskExecutionResultKind.RETRYABLE_FAILURE.value,
+                    failure_kind=TaskExecutionFailureKind.CLAIM_EXPIRED.value,
+                    result_fingerprint=fingerprint,
+                    occurred_at=prepared.recovered_at,
+                )
+            )
         except IntegrityError as error:
             raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
         except DBAPIError as error:

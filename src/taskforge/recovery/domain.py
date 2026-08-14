@@ -21,6 +21,7 @@ class PreparedExpiredClaimRecovery:
     workflow_run_id: UUID
     attempt_number: int
     generation: int
+    worker_session_id: UUID
     dispatch_id: UUID
     lease_expires_at: datetime
     recovered_at: datetime

@@ -78,6 +78,7 @@ def prepared(
         value.workflow_run_id,
         attempt_number,
         value.generation,
+        value.worker_session_id,
         uuid4(),
         value.lease_expires_at,
         RECOVERED_AT,

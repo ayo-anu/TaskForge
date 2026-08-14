@@ -30,7 +30,7 @@ SAFE_DATABASE_NAME = re.compile(
     r"taskforge_retry_scanner|taskforge_retry_inspection|"
     r"taskforge_recovery_scanner|taskforge_recovery_transition|"
     r"taskforge_stale_recovery|"
-    r"taskforge_recovery_migration)_[0-9a-f]{32}\Z"
+    r"taskforge_recovery_migration|taskforge_recovery_event_mig)_[0-9a-f]{32}\Z"
 )
 
 

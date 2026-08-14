@@ -449,7 +449,8 @@ task_result_events = Table(
     CheckConstraint("claim_generation > 0", name="claim_generation_positive"),
     CheckConstraint(
         "event_type IN ('result_accepted', 'result_replayed', "
-        "'result_conflict_rejected', 'result_stale_rejected')",
+        "'result_conflict_rejected', 'result_stale_rejected', "
+        "'result_recovered')",
         name="event_type_valid",
     ),
     CheckConstraint(
@@ -457,12 +458,16 @@ task_result_events = Table(
         name="result_fingerprint_valid",
     ),
     CheckConstraint(
-        "(result_kind = 'success' AND failure_kind IS NULL) OR "
+        "(event_type = 'result_recovered' AND "
+        "result_kind = 'retryable_failure' AND failure_kind = 'claim_expired') OR "
+        "(event_type IN ('result_accepted', 'result_replayed', "
+        "'result_conflict_rejected', 'result_stale_rejected') AND "
+        "((result_kind = 'success' AND failure_kind IS NULL) OR "
         "(result_kind = 'retryable_failure' AND failure_kind IN "
         "('handler_reported', 'handler_exception', 'execution_timeout')) OR "
         "(result_kind = 'permanent_failure' AND failure_kind = "
         "'handler_reported') OR "
-        "(result_kind = 'cancellation' AND failure_kind IS NULL)",
+        "(result_kind = 'cancellation' AND failure_kind IS NULL)))",
         name="result_shape_valid",
     ),
 )
@@ -555,6 +560,13 @@ Index(
     task_result_events.c.task_attempt_id,
     task_result_events.c.occurred_at,
     task_result_events.c.id,
+)
+Index(
+    "uq_task_result_events_recovered_generation",
+    task_result_events.c.task_attempt_id,
+    task_result_events.c.claim_generation,
+    unique=True,
+    postgresql_where=task_result_events.c.event_type == "result_recovered",
 )
 
 Index(
