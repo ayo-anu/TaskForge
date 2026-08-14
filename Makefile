@@ -47,7 +47,7 @@ retry-test:
 recovery-test:
 	@test "$${TASKFORGE_RUN_RECOVERY_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_RECOVERY_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_RECOVERY_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_RECOVERY_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_recovery_scanner.py tests/integration/test_recovery_transition.py
+	uv run pytest tests/integration/test_recovery_scanner.py tests/integration/test_recovery_transition.py tests/integration/test_stale_worker_recovery.py
 
 authentication-test:
 	@test "$${TASKFORGE_RUN_AUTHENTICATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_AUTHENTICATION_INTEGRATION=1 is required" >&2; exit 2)

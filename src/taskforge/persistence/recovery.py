@@ -1,4 +1,4 @@
-"""PostgreSQL candidate queries for read-only worker crash recovery."""
+"""PostgreSQL persistence for worker crash discovery and recovery."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ from taskforge.recovery.domain import (
     StaleWorkerSessionScanCursor,
 )
 from taskforge.recovery.persistence_ports import (
+    EndedStaleWorkerSession,
     ExpiredClaimRecoveryNoOp,
     ExpiredClaimRecoveryNoOpReason,
     ExpiredClaimRecoveryPersistenceInvariantViolation,
@@ -48,6 +49,10 @@ from taskforge.recovery.persistence_ports import (
     ExpiredClaimRecoveryPreparation,
     RecoveryScanPersistenceInvariantViolation,
     RecoveryScanPersistenceUnavailable,
+    StaleWorkerSessionRecoveryNoOpReason,
+    StaleWorkerSessionRecoveryPersistenceInvariantViolation,
+    StaleWorkerSessionRecoveryPersistenceUnavailable,
+    StaleWorkerSessionRecoveryResult,
 )
 from taskforge.retries.domain import RetryEventType, RetryNotScheduledReason
 from taskforge.retries.persistence_ports import NewScheduledRetryAttempt
@@ -170,6 +175,101 @@ class SQLAlchemyExpiredClaimRecoveryRepository:
 
     def recovery_transaction(self) -> SQLAlchemyExpiredClaimRecoveryTransaction:
         return SQLAlchemyExpiredClaimRecoveryTransaction(self._sessions)
+
+
+class SQLAlchemyStaleWorkerSessionRecoveryRepository:
+    """End one still-stale session after locking current heartbeat authority."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def end_stale_session(
+        self,
+        candidate: StaleWorkerSessionCandidate,
+        *,
+        stale_after_seconds: int,
+    ) -> StaleWorkerSessionRecoveryResult:
+        try:
+            async with self._sessions.begin() as session:
+                worker_session = (
+                    await session.execute(
+                        select(
+                            worker_sessions.c.id,
+                            worker_sessions.c.worker_identity_id,
+                            worker_sessions.c.ended_at,
+                        )
+                        .where(
+                            worker_sessions.c.id == candidate.worker_session_id,
+                            worker_sessions.c.worker_identity_id
+                            == candidate.worker_identity_id,
+                        )
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if worker_session is None:
+                    raise StaleWorkerSessionRecoveryPersistenceInvariantViolation
+                if worker_session.ended_at is not None:
+                    return StaleWorkerSessionRecoveryNoOpReason.SESSION_ALREADY_ENDED
+
+                health = (
+                    await session.execute(
+                        select(
+                            worker_session_health.c.last_sequence,
+                            worker_session_health.c.last_seen_at,
+                            worker_session_health.c.accepting_work,
+                        )
+                        .where(
+                            worker_session_health.c.worker_session_id
+                            == candidate.worker_session_id
+                        )
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if health is None:
+                    raise StaleWorkerSessionRecoveryPersistenceInvariantViolation
+                if (
+                    health.last_sequence != candidate.last_sequence
+                    or health.last_seen_at != candidate.last_seen_at
+                    or health.accepting_work != candidate.accepting_work
+                ):
+                    return StaleWorkerSessionRecoveryNoOpReason.CANDIDATE_REFRESHED
+
+                ended_at = await session.scalar(select(func.statement_timestamp()))
+                if not isinstance(ended_at, datetime):
+                    raise StaleWorkerSessionRecoveryPersistenceInvariantViolation
+                stale_before = await session.scalar(
+                    select(
+                        ended_at
+                        - func.make_interval(0, 0, 0, 0, 0, 0, stale_after_seconds)
+                    )
+                )
+                if not isinstance(stale_before, datetime):
+                    raise StaleWorkerSessionRecoveryPersistenceInvariantViolation
+                if health.last_seen_at > stale_before:
+                    return StaleWorkerSessionRecoveryNoOpReason.CANDIDATE_REFRESHED
+
+                ended = (
+                    await session.execute(
+                        update(worker_sessions)
+                        .where(
+                            worker_sessions.c.id == candidate.worker_session_id,
+                            worker_sessions.c.worker_identity_id
+                            == candidate.worker_identity_id,
+                            worker_sessions.c.ended_at.is_(None),
+                        )
+                        .values(ended_at=ended_at)
+                        .returning(worker_sessions.c.ended_at)
+                    )
+                ).one_or_none()
+                if ended is None or ended.ended_at != ended_at:
+                    raise StaleWorkerSessionRecoveryPersistenceInvariantViolation
+                return EndedStaleWorkerSession(ended_at)
+        except StaleWorkerSessionRecoveryPersistenceInvariantViolation:
+            raise
+        except IntegrityError as error:
+            raise StaleWorkerSessionRecoveryPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise StaleWorkerSessionRecoveryPersistenceUnavailable from error
 
 
 class SQLAlchemyExpiredClaimRecoveryTransaction:

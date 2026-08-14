@@ -1,8 +1,9 @@
-"""Persistence boundary for read-only crash-recovery candidate discovery."""
+"""Persistence boundaries for crash-recovery discovery and transitions."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from types import TracebackType
 from typing import Protocol
@@ -12,6 +13,7 @@ from taskforge.recovery.domain import (
     ExpiredClaimCandidatePage,
     ExpiredClaimScanCursor,
     PreparedExpiredClaimRecovery,
+    StaleWorkerSessionCandidate,
     StaleWorkerSessionCandidatePage,
     StaleWorkerSessionScanCursor,
 )
@@ -100,3 +102,35 @@ class ExpiredClaimRecoveryTransactionContext(Protocol):
 
 class ExpiredClaimRecoveryRepository(Protocol):
     def recovery_transaction(self) -> ExpiredClaimRecoveryTransactionContext: ...
+
+
+class StaleWorkerSessionRecoveryPersistenceInvariantViolation(Exception):
+    """Durable worker-session recovery facts violate an invariant."""
+
+
+class StaleWorkerSessionRecoveryPersistenceUnavailable(Exception):
+    """Worker-session recovery persistence is operationally unavailable."""
+
+
+class StaleWorkerSessionRecoveryNoOpReason(StrEnum):
+    CANDIDATE_REFRESHED = "candidate_refreshed"
+    SESSION_ALREADY_ENDED = "session_already_ended"
+
+
+@dataclass(frozen=True)
+class EndedStaleWorkerSession:
+    ended_at: datetime
+
+
+StaleWorkerSessionRecoveryResult = (
+    EndedStaleWorkerSession | StaleWorkerSessionRecoveryNoOpReason
+)
+
+
+class StaleWorkerSessionRecoveryRepository(Protocol):
+    async def end_stale_session(
+        self,
+        candidate: StaleWorkerSessionCandidate,
+        *,
+        stale_after_seconds: int,
+    ) -> StaleWorkerSessionRecoveryResult: ...

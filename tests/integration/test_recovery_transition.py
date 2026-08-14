@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
@@ -17,16 +18,26 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import IssuedTaskClaim, TaskClaimResultAuthority
 from taskforge.claims.service import TaskClaimService
-from taskforge.dispatch.envelope import DispatchEnvelope
+from taskforge.dispatch.envelope import (
+    DispatchEnvelope,
+    create_dispatch_envelope,
+    dispatch_envelope_to_mapping,
+)
 from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
 from taskforge.persistence.database import build_session_factory
 from taskforge.persistence.recovery import (
     SQLAlchemyExpiredClaimRecoveryRepository,
 )
+from taskforge.persistence.retries import SQLAlchemyRetryTransitionRepository
+from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.persistence.task_results import SQLAlchemyTaskResultRepository
 from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
     PreparedExpiredClaimRecovery,
+)
+from taskforge.recovery.progression import (
+    ExpiredClaimRecoveryProgressionService,
+    ExpiredClaimRecoveryProgressionUnavailable,
 )
 from taskforge.recovery.service import (
     ExpiredClaimRecoveryOutcome,
@@ -35,6 +46,9 @@ from taskforge.recovery.service import (
 )
 from taskforge.retries.domain import RetryNotScheduledReason
 from taskforge.retries.persistence_ports import NewScheduledRetryAttempt
+from taskforge.retries.scanner import DueRetryScanner
+from taskforge.runs.domain import WorkflowRunStatus
+from taskforge.runs.service import WorkflowRunService
 from taskforge.worker.result_submission import (
     TaskResultConflict,
     TaskResultSubmissionRequest,
@@ -52,6 +66,7 @@ from tests.integration.postgresql import (
     temporary_database,
 )
 from tests.integration.test_recovery_scanner import add_claim, add_session
+from tests.integration.test_retry_scanner import registry
 from tests.integration.test_task_claim_acquisition import (
     WorkerFacts,
     add_dispatched_task,
@@ -75,6 +90,7 @@ async def recoverable_candidate(
     maximum_attempts: int | None = 3,
     task_status: str = "running",
     run_status: str = "running",
+    initial_delay_seconds: int = 7,
 ) -> ExpiredClaimCandidate:
     now = await connection.fetchval("SELECT statement_timestamp()")
     assert isinstance(now, datetime)
@@ -84,7 +100,7 @@ async def recoverable_candidate(
         workflow_policy = (
             '{"retry_policy":{"maximum_attempts":'
             f"{maximum_attempts},"
-            '"initial_delay_seconds":7,"multiplier":2,'
+            f'"initial_delay_seconds":{initial_delay_seconds},"multiplier":2,'
             '"maximum_delay_seconds":60}}'
         )
     facts = await add_claim(
@@ -96,11 +112,30 @@ async def recoverable_candidate(
         workflow_policy=workflow_policy,
     )
     dispatch_id = uuid4()
+    task = await connection.fetchrow(
+        "SELECT tr.workflow_run_id, tr.step_identifier FROM task_runs tr "
+        "WHERE tr.id = $1",
+        facts.task_run_id,
+    )
+    assert task is not None
+    predecessor = create_dispatch_envelope(
+        dispatch_id=dispatch_id,
+        task_attempt_id=facts.attempt_id,
+        task_run_id=facts.task_run_id,
+        workflow_run_id=task["workflow_run_id"],
+        attempt_number=1,
+        task_type="test.task",
+        required_capability="test-capability",
+        task_payload={},
+        references={},
+    )
     await connection.execute(
         "INSERT INTO task_dispatch_outbox (id, task_attempt_id, route, payload) "
-        "VALUES ($1, $2, 'capability.test', '{}'::jsonb)",
+        "VALUES ($1, $2, $3, $4::jsonb)",
         dispatch_id,
         facts.attempt_id,
+        predecessor.route,
+        json.dumps(dispatch_envelope_to_mapping(predecessor)),
     )
     observed_at = await connection.fetchval("SELECT statement_timestamp()")
     assert isinstance(observed_at, datetime)
@@ -226,6 +261,13 @@ async def exercise_recovery(database_url: URL) -> None:
         ),
         issuer,
         lease_seconds=60,
+    )
+    run_service = WorkflowRunService(
+        SQLAlchemyWorkflowRunRepository(build_session_factory(engine))
+    )
+    progression = ExpiredClaimRecoveryProgressionService(service, run_service)
+    due_scanner = DueRetryScanner(
+        SQLAlchemyRetryTransitionRepository(build_session_factory(engine)), registry()
     )
     try:
         retryable = await recoverable_candidate(connection)
@@ -504,6 +546,132 @@ async def exercise_recovery(database_url: URL) -> None:
             "DROP TRIGGER trg_inject_recovery_failure ON task_retry_events"
         )
         await connection.execute("DROP FUNCTION reject_recovery_retry_event()")
+
+        due = await recoverable_candidate(connection, initial_delay_seconds=0)
+        scheduled = await progression.recover_and_progress(due)
+        assert scheduled.recovery.outcome is ExpiredClaimRecoveryOutcome.RETRY_SCHEDULED
+        assert scheduled.reconciliation is None
+        dispatched = await asyncio.gather(
+            due_scanner.scan_due_retries(batch_size=1),
+            due_scanner.scan_due_retries(batch_size=1),
+        )
+        assert sum(item.dispatched for item in dispatched) == 1
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_attempts WHERE task_run_id = $1",
+                due.task_run_id,
+            )
+            == 2
+        )
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_dispatch_outbox o JOIN task_attempts a "
+                "ON a.id = o.task_attempt_id WHERE a.task_run_id = $1 "
+                "AND a.attempt_number = 2",
+                due.task_run_id,
+            )
+            == 1
+        )
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_retry_events WHERE task_run_id = $1",
+                due.task_run_id,
+            )
+            == 2
+        )
+
+        cancelled = await recoverable_candidate(connection, initial_delay_seconds=0)
+        assert (
+            await service.recover_expired_claim(cancelled)
+        ).outcome is ExpiredClaimRecoveryOutcome.RETRY_SCHEDULED
+        await connection.execute(
+            "UPDATE workflow_runs SET status = 'cancelling' WHERE id = $1",
+            cancelled.workflow_run_id,
+        )
+        cancellation_scan = await due_scanner.scan_due_retries(batch_size=1)
+        assert cancelled.task_attempt_id not in cancellation_scan.dispatched_attempt_ids
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_dispatch_outbox o JOIN task_attempts a "
+                "ON a.id = o.task_attempt_id WHERE a.task_run_id = $1 "
+                "AND a.attempt_number = 2",
+                cancelled.task_run_id,
+            )
+            == 0
+        )
+
+        failed = await recoverable_candidate(connection, maximum_attempts=1)
+        progressed = await progression.recover_and_progress(failed)
+        assert (
+            progressed.recovery.outcome is ExpiredClaimRecoveryOutcome.FAILED_EXHAUSTED
+        )
+        assert progressed.reconciliation is not None
+        assert progressed.reconciliation.final_status is WorkflowRunStatus.FAILED
+
+        no_policy_progression = await recoverable_candidate(
+            connection, maximum_attempts=None
+        )
+        no_policy_progressed = await progression.recover_and_progress(
+            no_policy_progression
+        )
+        assert (
+            no_policy_progressed.recovery.outcome
+            is ExpiredClaimRecoveryOutcome.FAILED_NO_POLICY
+        )
+        assert no_policy_progressed.reconciliation is not None
+        assert (
+            no_policy_progressed.reconciliation.final_status is WorkflowRunStatus.FAILED
+        )
+
+        progression_failure = await recoverable_candidate(
+            connection, maximum_attempts=1
+        )
+        await connection.execute(
+            "CREATE FUNCTION reject_recovery_progression() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION "
+            "'injected progression failure'; END $$"
+        )
+        await connection.execute(
+            "CREATE TRIGGER trg_inject_progression_failure BEFORE UPDATE ON "
+            "workflow_runs FOR EACH ROW EXECUTE FUNCTION "
+            "reject_recovery_progression()"
+        )
+        with pytest.raises(ExpiredClaimRecoveryProgressionUnavailable) as captured:
+            await progression.recover_and_progress(progression_failure)
+        assert (
+            captured.value.recovery_receipt.outcome
+            is ExpiredClaimRecoveryOutcome.FAILED_EXHAUSTED
+        )
+        assert (
+            await connection.fetchval(
+                "SELECT status::text FROM task_runs WHERE id = $1",
+                progression_failure.task_run_id,
+            )
+            == "failed"
+        )
+        assert (
+            await connection.fetchval(
+                "SELECT status::text FROM workflow_runs WHERE id = $1",
+                progression_failure.workflow_run_id,
+            )
+            == "running"
+        )
+        await connection.execute(
+            "DROP TRIGGER trg_inject_progression_failure ON workflow_runs"
+        )
+        await connection.execute("DROP FUNCTION reject_recovery_progression()")
+        replayed = await progression.recover_and_progress(progression_failure)
+        assert (
+            replayed.recovery.outcome is ExpiredClaimRecoveryOutcome.ALREADY_RECOVERED
+        )
+        assert replayed.reconciliation is not None
+        assert replayed.reconciliation.final_status is WorkflowRunStatus.FAILED
+        repeated = await progression.recover_and_progress(progression_failure)
+        assert (
+            repeated.recovery.outcome is ExpiredClaimRecoveryOutcome.ALREADY_RECOVERED
+        )
+        assert repeated.reconciliation is not None
+        assert repeated.reconciliation.workflow_transition_count == 0
     finally:
         await engine.dispose()
         await connection.close()

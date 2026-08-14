@@ -10,13 +10,18 @@ from uuid import UUID, uuid4
 from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
     PreparedExpiredClaimRecovery,
+    StaleWorkerSessionCandidate,
 )
 from taskforge.recovery.persistence_ports import (
+    EndedStaleWorkerSession,
     ExpiredClaimRecoveryNoOp,
     ExpiredClaimRecoveryPersistenceInvariantViolation,
     ExpiredClaimRecoveryPersistenceUnavailable,
     ExpiredClaimRecoveryRepository,
     ExpiredClaimRecoveryTransaction,
+    StaleWorkerSessionRecoveryPersistenceInvariantViolation,
+    StaleWorkerSessionRecoveryPersistenceUnavailable,
+    StaleWorkerSessionRecoveryRepository,
 )
 from taskforge.retries.domain import (
     InvalidPersistedRetryPolicy,
@@ -140,4 +145,57 @@ class ExpiredClaimRecoveryService:
             prepared.task_attempt_id,
             prepared.task_run_id,
             prepared.recovered_at,
+        )
+
+
+class StaleWorkerSessionRecoveryOutcome(StrEnum):
+    SESSION_ENDED = "session_ended"
+    CANDIDATE_REFRESHED = "candidate_refreshed"
+    SESSION_ALREADY_ENDED = "session_already_ended"
+
+
+class StaleWorkerSessionRecoveryInvariantError(Exception):
+    """Durable worker-session recovery state is inconsistent."""
+
+
+class StaleWorkerSessionRecoveryServiceUnavailable(Exception):
+    """Worker-session recovery persistence is unavailable."""
+
+
+@dataclass(frozen=True)
+class StaleWorkerSessionRecoveryReceipt:
+    outcome: StaleWorkerSessionRecoveryOutcome
+    worker_session_id: UUID
+    ended_at: datetime | None = None
+
+
+class StaleWorkerSessionRecoveryService:
+    def __init__(self, repository: StaleWorkerSessionRecoveryRepository) -> None:
+        self._repository = repository
+
+    async def end_stale_session(
+        self,
+        candidate: StaleWorkerSessionCandidate,
+        *,
+        stale_after_seconds: int,
+    ) -> StaleWorkerSessionRecoveryReceipt:
+        if type(stale_after_seconds) is not int or not 1 <= stale_after_seconds <= 3600:
+            raise ValueError("stale-session recovery threshold is out of range")
+        try:
+            result = await self._repository.end_stale_session(
+                candidate, stale_after_seconds=stale_after_seconds
+            )
+        except StaleWorkerSessionRecoveryPersistenceInvariantViolation as error:
+            raise StaleWorkerSessionRecoveryInvariantError from error
+        except StaleWorkerSessionRecoveryPersistenceUnavailable as error:
+            raise StaleWorkerSessionRecoveryServiceUnavailable from error
+        if isinstance(result, EndedStaleWorkerSession):
+            return StaleWorkerSessionRecoveryReceipt(
+                StaleWorkerSessionRecoveryOutcome.SESSION_ENDED,
+                candidate.worker_session_id,
+                result.ended_at,
+            )
+        return StaleWorkerSessionRecoveryReceipt(
+            StaleWorkerSessionRecoveryOutcome(result.value),
+            candidate.worker_session_id,
         )
