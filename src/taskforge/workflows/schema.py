@@ -21,6 +21,28 @@ from taskforge.persistence.metadata import metadata
 
 WORKFLOW_DEFINITION_STATUSES = ("draft", "enabled", "disabled", "archived")
 
+_RETRY_POLICY_CHECK = (
+    "execution_policy IS NULL OR NOT (execution_policy ? 'retry_policy') OR ("
+    "jsonb_typeof(execution_policy -> 'retry_policy') = 'object' "
+    "AND (NOT (execution_policy -> 'retry_policy' ? 'maximum_attempts') OR ("
+    "jsonb_typeof(execution_policy -> 'retry_policy' -> 'maximum_attempts') "
+    "= 'number' AND (execution_policy -> 'retry_policy' ->> "
+    "'maximum_attempts') ~ '^[0-9]+$' AND (execution_policy -> "
+    "'retry_policy' ->> 'maximum_attempts')::numeric >= 1)) "
+    "AND (NOT (execution_policy -> 'retry_policy' ? 'initial_delay_seconds') OR ("
+    "jsonb_typeof(execution_policy -> 'retry_policy' -> "
+    "'initial_delay_seconds') = 'number' AND (execution_policy -> "
+    "'retry_policy' ->> 'initial_delay_seconds') ~ '^[0-9]+$')) "
+    "AND (NOT (execution_policy -> 'retry_policy' ? 'multiplier') OR ("
+    "jsonb_typeof(execution_policy -> 'retry_policy' -> 'multiplier') = "
+    "'number' AND (execution_policy -> 'retry_policy' ->> "
+    "'multiplier')::numeric >= 1)) "
+    "AND (NOT (execution_policy -> 'retry_policy' ? 'maximum_delay_seconds') OR ("
+    "jsonb_typeof(execution_policy -> 'retry_policy' -> "
+    "'maximum_delay_seconds') = 'number' AND (execution_policy -> "
+    "'retry_policy' ->> 'maximum_delay_seconds') ~ '^[0-9]+$')))"
+)
+
 workflow_definition_status = Enum(
     *WORKFLOW_DEFINITION_STATUSES,
     name="workflow_definition_status",
@@ -80,6 +102,7 @@ workflow_definitions = Table(
         "BETWEEN 1 AND 31536000)",
         name="execution_timeout_seconds_valid",
     ),
+    CheckConstraint(_RETRY_POLICY_CHECK, name="retry_policy_valid"),
 )
 
 Index(
@@ -142,6 +165,7 @@ workflow_draft_steps = Table(
         "BETWEEN 1 AND 31536000)",
         name="execution_timeout_seconds_valid",
     ),
+    CheckConstraint(_RETRY_POLICY_CHECK, name="retry_policy_valid"),
 )
 
 workflow_draft_dependencies = Table(
@@ -238,6 +262,9 @@ workflow_versions = Table(
         name="execution_timeout_seconds_valid",
         postgresql_not_valid=True,
     ),
+    CheckConstraint(
+        _RETRY_POLICY_CHECK, name="retry_policy_valid", postgresql_not_valid=True
+    ),
 )
 
 workflow_version_steps = Table(
@@ -282,6 +309,9 @@ workflow_version_steps = Table(
         "BETWEEN 1 AND 31536000)",
         name="execution_timeout_seconds_valid",
         postgresql_not_valid=True,
+    ),
+    CheckConstraint(
+        _RETRY_POLICY_CHECK, name="retry_policy_valid", postgresql_not_valid=True
     ),
 )
 

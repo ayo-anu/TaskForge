@@ -24,6 +24,8 @@ def test_task_attempt_identity_numbering_and_ownership_are_constrained() -> None
     assert tuple(task_attempts.primary_key.columns.keys()) == ("id",)
     assert isinstance(task_attempts.c.id.type, UUID)
     assert isinstance(task_attempts.c.attempt_number.type, Integer)
+    assert task_attempts.c.next_eligible_at.nullable is True
+    assert task_attempts.c.next_eligible_at.server_default is None
     assert task_attempts.c.task_run_id.nullable is False
     assert task_attempts.c.attempt_number.nullable is False
     assert task_attempts.c.created_at.nullable is False
@@ -33,7 +35,19 @@ def test_task_attempt_identity_numbering_and_ownership_are_constrained() -> None
         (("task_run_id",), ("task_runs.id",), "RESTRICT", "RESTRICT")
     }
     assert _check_texts(task_attempts) == {"attempt_number > 0"}
-    assert task_attempts.indexes == set()
+
+
+def test_attempt_eligibility_has_only_the_due_scan_index() -> None:
+    assert len(task_attempts.indexes) == 1
+    index = next(iter(task_attempts.indexes))
+    assert isinstance(index, Index)
+    assert index.name == "ix_task_attempts_scheduled_next_eligible_at_id"
+    assert tuple(column.name for column in index.columns) == (
+        "next_eligible_at",
+        "id",
+    )
+    predicate = index.dialect_options["postgresql"]["where"]
+    assert str(predicate) == "task_attempts.next_eligible_at IS NOT NULL"
 
 
 def test_dispatch_identity_payload_and_attempt_ownership_are_constrained() -> None:

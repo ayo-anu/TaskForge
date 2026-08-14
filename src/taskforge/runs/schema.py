@@ -224,6 +224,7 @@ task_attempts = Table(
         nullable=False,
     ),
     Column("attempt_number", Integer, nullable=False),
+    Column("next_eligible_at", DateTime(timezone=True), nullable=True),
     Column(
         "created_at",
         DateTime(timezone=True),
@@ -239,6 +240,13 @@ task_attempts = Table(
         "attempt_number > 0",
         name="attempt_number_positive",
     ),
+)
+
+Index(
+    "ix_task_attempts_scheduled_next_eligible_at_id",
+    task_attempts.c.next_eligible_at,
+    task_attempts.c.id,
+    postgresql_where=task_attempts.c.next_eligible_at.is_not(None),
 )
 
 task_attempt_results = Table(

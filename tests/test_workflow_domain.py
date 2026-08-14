@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -22,6 +23,7 @@ from taskforge.workflows.domain import (
     WorkflowVersionDependency,
     WorkflowVersionSnapshot,
     WorkflowVersionStep,
+    _validate_retry_policy,
     availability_requires_published_version,
     change_workflow_availability,
     create_draft_dependency,
@@ -34,6 +36,7 @@ from taskforge.workflows.domain import (
 )
 from taskforge.workflows.task_types import (
     JSONMapping,
+    JSONValue,
     TaskTypeDefinition,
     TaskTypeRegistry,
     WorkflowValidationError,
@@ -98,6 +101,72 @@ def test_policy_reports_deadline_and_timeout_issues_independently() -> None:
         "invalid_deadline_seconds",
         "invalid_execution_timeout_seconds",
     ]
+
+
+def retry_policy(**overrides: object) -> dict[str, object]:
+    policy: dict[str, object] = {
+        "maximum_attempts": 3,
+        "initial_delay_seconds": 10,
+        "multiplier": 2,
+        "maximum_delay_seconds": 300,
+    }
+    policy.update(overrides)
+    return policy
+
+
+def test_retry_policy_accepts_the_complete_persisted_contract() -> None:
+    policy = {"retry_policy": retry_policy(maximum_attempts=1, multiplier=1.5)}
+    validated, issues = validate_execution_policy(policy)
+    assert issues == ()
+    assert validated == policy
+
+
+@pytest.mark.parametrize("multiplier", (float("inf"), float("-inf"), float("nan")))
+def test_retry_policy_rejects_non_finite_multipliers(multiplier: float) -> None:
+    issues = _validate_retry_policy(
+        cast(JSONValue, retry_policy(multiplier=multiplier)), ("retry_policy",)
+    )
+    assert [issue.code for issue in issues] == ["invalid_retry_multiplier"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "code"),
+    (
+        ({"maximum_attempts": 0}, "invalid_retry_maximum_attempts"),
+        ({"maximum_attempts": True}, "invalid_retry_maximum_attempts"),
+        ({"initial_delay_seconds": -1}, "invalid_retry_initial_delay_seconds"),
+        ({"initial_delay_seconds": 1.5}, "invalid_retry_initial_delay_seconds"),
+        ({"multiplier": 0.5}, "invalid_retry_multiplier"),
+        ({"multiplier": True}, "invalid_retry_multiplier"),
+        ({"maximum_delay_seconds": -1}, "invalid_retry_maximum_delay_seconds"),
+        ({"maximum_delay_seconds": 1.5}, "invalid_retry_maximum_delay_seconds"),
+        (
+            {"initial_delay_seconds": 11, "maximum_delay_seconds": 10},
+            "invalid_retry_delay_order",
+        ),
+    ),
+)
+def test_retry_policy_rejects_invalid_values(
+    overrides: dict[str, object], code: str
+) -> None:
+    _, issues = validate_execution_policy({"retry_policy": retry_policy(**overrides)})
+    assert code in [issue.code for issue in issues]
+
+
+def test_retry_policy_requires_exactly_the_supported_fields() -> None:
+    missing = retry_policy()
+    del missing["maximum_attempts"]
+    _, missing_issues = validate_execution_policy({"retry_policy": missing})
+    _, extra_issues = validate_execution_policy(
+        {"retry_policy": retry_policy(jitter=True)}
+    )
+    assert "invalid_retry_policy_fields" in [issue.code for issue in missing_issues]
+    assert "invalid_retry_policy_fields" in [issue.code for issue in extra_issues]
+
+
+def test_retry_policy_must_be_an_object() -> None:
+    _, issues = validate_execution_policy({"retry_policy": []})
+    assert [issue.code for issue in issues] == ["invalid_retry_policy"]
 
 
 @dataclass(frozen=True)
