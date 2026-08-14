@@ -153,12 +153,12 @@ async def assert_run_schema_catalog(
         "dispatched",
         "claimed",
         "running",
-        "retry_pending",
         "retry_scheduled",
         "succeeded",
         "failed",
         "skipped",
         "cancelled",
+        "retry_pending",
     ]
     assert await connection.fetchval(
         "SELECT EXISTS (SELECT FROM pg_proc p JOIN pg_namespace n "

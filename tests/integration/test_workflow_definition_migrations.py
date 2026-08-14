@@ -609,7 +609,7 @@ async def inspect_upgraded_workflow_schema(database_url: URL) -> None:
             )
         restricted_workflow_id = await insert_workflow(connection, principal_id)
         await insert_version(connection, restricted_workflow_id, 1)
-        with pytest.raises(asyncpg.RestrictViolationError):
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
             await connection.execute(
                 "DELETE FROM workflow_definitions WHERE id = $1",
                 restricted_workflow_id,
