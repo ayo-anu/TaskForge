@@ -42,7 +42,7 @@ renewal-test:
 retry-test:
 	@test "$${TASKFORGE_RUN_RETRY_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_RETRY_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_RETRY_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_RETRY_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_retry_transition.py
+	uv run pytest tests/integration/test_retry_transition.py tests/integration/test_retry_scanner.py
 
 authentication-test:
 	@test "$${TASKFORGE_RUN_AUTHENTICATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_AUTHENTICATION_INTEGRATION=1 is required" >&2; exit 2)

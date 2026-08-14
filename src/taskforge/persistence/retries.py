@@ -8,17 +8,22 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import exists, func, insert, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.retries.persistence_ports import (
+    DueRetryPersistenceInvariantViolation,
+    DueRetryPersistenceUnavailable,
+    DueRetryPreparation,
     ExistingScheduledRetry,
     NewScheduledRetryAttempt,
+    PreparedDueRetryDispatch,
     PreparedRetryTransition,
     RetryTransitionPersistenceInvariantViolation,
     RetryTransitionPersistenceUnavailable,
     RetryTransitionPreparation,
+    SkippedDueRetryCandidate,
 )
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
 from taskforge.runs.schema import (
@@ -39,6 +44,9 @@ class SQLAlchemyRetryTransitionRepository:
 
     def transition_transaction(self) -> SQLAlchemyRetryTransitionTransaction:
         return SQLAlchemyRetryTransitionTransaction(self._sessions)
+
+    def due_dispatch_transaction(self) -> SQLAlchemyDueRetryDispatchTransaction:
+        return SQLAlchemyDueRetryDispatchTransaction(self._sessions)
 
 
 class SQLAlchemyRetryTransitionTransaction:
@@ -335,3 +343,287 @@ class SQLAlchemyRetryTransitionTransaction:
         if self._context is None:
             raise RuntimeError("retry transition transaction is not active")
         return self._context
+
+
+class SQLAlchemyDueRetryDispatchTransaction:
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+        self._context: AbstractAsyncContextManager[AsyncSession] | None = None
+        self._session: AsyncSession | None = None
+
+    async def __aenter__(self) -> SQLAlchemyDueRetryDispatchTransaction:
+        context = self._sessions.begin()
+        self._context = context
+        try:
+            self._session = await context.__aenter__()
+        except DBAPIError as error:
+            self._context = None
+            raise DueRetryPersistenceUnavailable from error
+        return self
+
+    async def __aexit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        context, self._context = self._required_context(), None
+        self._session = None
+        try:
+            await context.__aexit__(exception_type, exception, traceback)
+        except IntegrityError as error:
+            raise DueRetryPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise DueRetryPersistenceUnavailable from error
+
+    async def prepare_next_due(self) -> DueRetryPreparation:
+        session = self._required_session()
+        try:
+            candidate = (
+                await session.execute(_next_due_retry_workflow_lock_statement())
+            ).one_or_none()
+            if candidate is None:
+                return None
+            task = (
+                await session.execute(
+                    select(
+                        task_runs.c.id,
+                        task_runs.c.workflow_run_id,
+                        task_runs.c.workflow_version_id,
+                        task_runs.c.step_identifier,
+                        task_runs.c.status,
+                        task_runs.c.deadline_at,
+                        task_runs.c.execution_timeout_seconds,
+                    )
+                    .where(
+                        task_runs.c.id == candidate.task_run_id,
+                        task_runs.c.workflow_run_id == candidate.workflow_run_id,
+                    )
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if task is None:
+                raise DueRetryPersistenceInvariantViolation
+            if task.status != TaskRunStatus.RETRY_SCHEDULED.value:
+                return SkippedDueRetryCandidate(candidate.task_attempt_id)
+            if task.workflow_version_id != candidate.workflow_version_id:
+                raise DueRetryPersistenceInvariantViolation
+
+            attempt = (
+                await session.execute(
+                    select(
+                        task_attempts.c.id,
+                        task_attempts.c.task_run_id,
+                        task_attempts.c.attempt_number,
+                        task_attempts.c.next_eligible_at,
+                    )
+                    .where(
+                        task_attempts.c.id == candidate.task_attempt_id,
+                        task_attempts.c.task_run_id == task.id,
+                    )
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if attempt is None:
+                raise DueRetryPersistenceInvariantViolation
+            latest_attempt_number = await session.scalar(
+                select(func.max(task_attempts.c.attempt_number)).where(
+                    task_attempts.c.task_run_id == task.id
+                )
+            )
+            if (
+                attempt.attempt_number <= 1
+                or attempt.next_eligible_at is None
+                or latest_attempt_number != attempt.attempt_number
+            ):
+                raise DueRetryPersistenceInvariantViolation
+            due = await session.scalar(
+                select(attempt.next_eligible_at <= func.statement_timestamp())
+            )
+            if not due:
+                return SkippedDueRetryCandidate(attempt.id)
+
+            execution_state = (
+                await session.execute(
+                    select(
+                        exists(
+                            select(1).where(
+                                task_dispatch_outbox.c.task_attempt_id == attempt.id
+                            )
+                        ).label("has_outbox"),
+                        exists(
+                            select(1).where(
+                                task_attempt_claims.c.task_attempt_id == attempt.id
+                            )
+                        ).label("has_claim"),
+                        exists(
+                            select(1).where(
+                                task_attempt_results.c.task_attempt_id == attempt.id
+                            )
+                        ).label("has_result"),
+                    )
+                )
+            ).one()
+            if any(execution_state):
+                raise DueRetryPersistenceInvariantViolation
+
+            predecessor = (
+                await session.execute(
+                    select(
+                        task_attempts.c.id,
+                        task_attempts.c.attempt_number,
+                        task_attempt_results.c.result_kind,
+                        task_attempt_results.c.dispatch_id,
+                        task_dispatch_outbox.c.route,
+                        task_dispatch_outbox.c.payload,
+                    )
+                    .select_from(
+                        task_attempts.join(
+                            task_attempt_results,
+                            task_attempt_results.c.task_attempt_id
+                            == task_attempts.c.id,
+                        ).join(
+                            task_dispatch_outbox,
+                            task_dispatch_outbox.c.id
+                            == task_attempt_results.c.dispatch_id,
+                        )
+                    )
+                    .where(
+                        task_attempts.c.task_run_id == task.id,
+                        task_attempts.c.attempt_number == attempt.attempt_number - 1,
+                        task_dispatch_outbox.c.task_attempt_id == task_attempts.c.id,
+                    )
+                )
+            ).one_or_none()
+            if (
+                predecessor is None
+                or predecessor.result_kind
+                != TaskExecutionResultKind.RETRYABLE_FAILURE.value
+            ):
+                raise DueRetryPersistenceInvariantViolation
+
+            snapshot = (
+                await session.execute(
+                    select(
+                        workflow_version_steps.c.task_type,
+                        workflow_version_steps.c.parameters,
+                    ).where(
+                        workflow_version_steps.c.workflow_version_id
+                        == task.workflow_version_id,
+                        workflow_version_steps.c.step_identifier
+                        == task.step_identifier,
+                    )
+                )
+            ).one_or_none()
+            if snapshot is None:
+                raise DueRetryPersistenceInvariantViolation
+            return PreparedDueRetryDispatch(
+                candidate.workflow_run_id,
+                task.id,
+                task.workflow_version_id,
+                task.step_identifier,
+                attempt.id,
+                attempt.attempt_number,
+                attempt.next_eligible_at,
+                snapshot.task_type,
+                deepcopy(snapshot.parameters),
+                task.deadline_at,
+                task.execution_timeout_seconds,
+                predecessor.id,
+                predecessor.attempt_number,
+                predecessor.dispatch_id,
+                predecessor.route,
+                deepcopy(predecessor.payload),
+            )
+        except DueRetryPersistenceInvariantViolation:
+            raise
+        except DBAPIError as error:
+            raise DueRetryPersistenceUnavailable from error
+
+    async def persist_dispatch(
+        self,
+        prepared: PreparedDueRetryDispatch,
+        outbox_id: UUID,
+        route: str,
+        payload: dict[str, object],
+    ) -> None:
+        session = self._required_session()
+        try:
+            await session.execute(
+                insert(task_dispatch_outbox).values(
+                    id=outbox_id,
+                    task_attempt_id=prepared.task_attempt_id,
+                    route=route,
+                    payload=payload,
+                )
+            )
+            transitioned = (
+                await session.execute(
+                    update(task_runs)
+                    .where(
+                        task_runs.c.id == prepared.task_run_id,
+                        task_runs.c.workflow_run_id == prepared.workflow_run_id,
+                        task_runs.c.status == TaskRunStatus.RETRY_SCHEDULED.value,
+                    )
+                    .values(
+                        status=TaskRunStatus.DISPATCHED.value,
+                        updated_at=func.current_timestamp(),
+                    )
+                    .returning(task_runs.c.id)
+                )
+            ).one_or_none()
+        except IntegrityError as error:
+            raise DueRetryPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise DueRetryPersistenceUnavailable from error
+        if transitioned is None:
+            raise DueRetryPersistenceInvariantViolation
+
+    def _required_session(self) -> AsyncSession:
+        if self._session is None:
+            raise RuntimeError("due retry dispatch transaction is not active")
+        return self._session
+
+    def _required_context(self) -> AbstractAsyncContextManager[AsyncSession]:
+        if self._context is None:
+            raise RuntimeError("due retry dispatch transaction is not active")
+        return self._context
+
+
+def _next_due_retry_workflow_lock_statement() -> Any:
+    later_attempt = task_attempts.alias("later_retry_attempt")
+    later_exists = exists(
+        select(1).where(
+            later_attempt.c.task_run_id == task_attempts.c.task_run_id,
+            later_attempt.c.attempt_number > task_attempts.c.attempt_number,
+        )
+    )
+    return (
+        select(
+            workflow_runs.c.id.label("workflow_run_id"),
+            workflow_runs.c.workflow_version_id,
+            task_runs.c.id.label("task_run_id"),
+            task_attempts.c.id.label("task_attempt_id"),
+            task_attempts.c.next_eligible_at,
+        )
+        .select_from(
+            task_attempts.join(
+                task_runs, task_runs.c.id == task_attempts.c.task_run_id
+            ).join(
+                workflow_runs,
+                workflow_runs.c.id == task_runs.c.workflow_run_id,
+            )
+        )
+        .where(
+            task_runs.c.status == TaskRunStatus.RETRY_SCHEDULED.value,
+            workflow_runs.c.status.in_(
+                (WorkflowRunStatus.PENDING.value, WorkflowRunStatus.RUNNING.value)
+            ),
+            task_attempts.c.next_eligible_at.is_not(None),
+            task_attempts.c.next_eligible_at <= func.statement_timestamp(),
+            ~later_exists,
+        )
+        .order_by(task_attempts.c.next_eligible_at, task_attempts.c.id)
+        .limit(1)
+        .with_for_update(of=workflow_runs, skip_locked=True)
+    )

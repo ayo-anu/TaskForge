@@ -15,6 +15,13 @@ from taskforge.retries.domain import (
     resolve_persisted_retry_policy,
     validate_retry_policy_configuration,
 )
+from taskforge.retries.scanner import (
+    MAX_DUE_RETRY_BATCH_SIZE,
+    DueRetryScanInvariantError,
+    DueRetryScanner,
+    DueRetryScanResult,
+    DueRetryScanServiceUnavailable,
+)
 from taskforge.retries.service import (
     RetryTransitionInvariantError,
     RetryTransitionOutcome,
@@ -26,7 +33,12 @@ from taskforge.retries.service import (
 __all__ = [
     "MAX_CONFIGURED_RETRY_ATTEMPTS",
     "MAX_CONFIGURED_RETRY_DELAY_SECONDS",
+    "MAX_DUE_RETRY_BATCH_SIZE",
     "MAX_PERSISTED_ATTEMPT_NUMBER",
+    "DueRetryScanInvariantError",
+    "DueRetryScanResult",
+    "DueRetryScanServiceUnavailable",
+    "DueRetryScanner",
     "InvalidPersistedRetryPolicy",
     "RetryCalculationError",
     "RetryDecision",
