@@ -6,9 +6,9 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from math import isfinite
 from uuid import UUID
 
+from taskforge.retries.domain import validate_retry_policy_configuration
 from taskforge.workflows.dag_validation import (
     DAGEdge,
     DAGValidationResult,
@@ -28,17 +28,6 @@ MAX_WORKFLOW_DESCRIPTION_LENGTH = 4096
 MAX_IDENTIFIER_LENGTH = 128
 MAX_TASK_DEADLINE_SECONDS = 31_536_000
 MAX_TASK_EXECUTION_TIMEOUT_SECONDS = 31_536_000
-
-# A later effective-policy consumer will select the complete step object over the
-# complete workflow object; individual retry fields are intentionally not merged.
-RETRY_POLICY_FIELDS = frozenset(
-    {
-        "maximum_attempts",
-        "initial_delay_seconds",
-        "multiplier",
-        "maximum_delay_seconds",
-    }
-)
 
 _STEP_IDENTIFIER = re.compile(r"\A[a-z][a-z0-9_-]{0,127}\Z")
 _TASK_TYPE_NAME = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
@@ -523,76 +512,11 @@ def _validate_retry_policy(
     value: JSONValue,
     path: tuple[str | int, ...],
 ) -> tuple[WorkflowValidationIssue, ...]:
-    if not isinstance(value, dict):
-        return (
-            WorkflowValidationIssue(
-                "invalid_retry_policy", path, "Retry policy must be an object."
-            ),
-        )
-    issues: list[WorkflowValidationIssue] = []
-    keys = set(value)
-    if keys != RETRY_POLICY_FIELDS:
-        issues.append(
-            WorkflowValidationIssue(
-                "invalid_retry_policy_fields",
-                path,
-                "Retry policy must contain exactly the supported fields.",
-            )
-        )
-    maximum_attempts = value.get("maximum_attempts")
-    if type(maximum_attempts) is not int or maximum_attempts < 1:
-        issues.append(
-            WorkflowValidationIssue(
-                "invalid_retry_maximum_attempts",
-                (*path, "maximum_attempts"),
-                "Maximum attempts must be a positive integer including attempt 1.",
-            )
-        )
-    initial_delay = value.get("initial_delay_seconds")
-    if type(initial_delay) is not int or initial_delay < 0:
-        issues.append(
-            WorkflowValidationIssue(
-                "invalid_retry_initial_delay_seconds",
-                (*path, "initial_delay_seconds"),
-                "Initial retry delay must be a non-negative integer.",
-            )
-        )
-    multiplier = value.get("multiplier")
-    invalid_multiplier = True
-    if isinstance(multiplier, (int, float)) and not isinstance(multiplier, bool):
-        invalid_multiplier = not isfinite(multiplier) or multiplier < 1
-    if invalid_multiplier:
-        issues.append(
-            WorkflowValidationIssue(
-                "invalid_retry_multiplier",
-                (*path, "multiplier"),
-                "Retry multiplier must be a finite number of at least one.",
-            )
-        )
-    maximum_delay = value.get("maximum_delay_seconds")
-    if type(maximum_delay) is not int or maximum_delay < 0:
-        issues.append(
-            WorkflowValidationIssue(
-                "invalid_retry_maximum_delay_seconds",
-                (*path, "maximum_delay_seconds"),
-                "Maximum retry delay must be a non-negative integer.",
-            )
-        )
-    if (
-        type(initial_delay) is int
-        and initial_delay >= 0
-        and type(maximum_delay) is int
-        and maximum_delay >= 0
-        and maximum_delay < initial_delay
-    ):
-        issues.append(
-            WorkflowValidationIssue(
-                "invalid_retry_delay_order",
-                (*path, "maximum_delay_seconds"),
-                "Maximum retry delay cannot be less than the initial delay.",
-            )
-        )
-    return tuple(issues)
+    _, issues = validate_retry_policy_configuration(value)
+    return tuple(
+        WorkflowValidationIssue(issue.code, (*path, *issue.path), issue.message)
+        for issue in issues
+    )
 
 
 def resolve_deadline_seconds(
