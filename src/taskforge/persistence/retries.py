@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
 from copy import deepcopy
+from datetime import datetime
 from types import TracebackType
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import exists, func, insert, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.retries.domain import RetryEventType, RetryNotScheduledReason
 from taskforge.retries.persistence_ports import (
     DueRetryPersistenceInvariantViolation,
     DueRetryPersistenceUnavailable,
@@ -31,6 +33,7 @@ from taskforge.runs.schema import (
     task_attempt_results,
     task_attempts,
     task_dispatch_outbox,
+    task_retry_events,
     task_runs,
     workflow_runs,
 )
@@ -177,8 +180,19 @@ class SQLAlchemyRetryTransitionTransaction:
             raise RetryTransitionPersistenceUnavailable from error
         if transitioned is None:
             raise RetryTransitionPersistenceInvariantViolation
+        await self._append_retry_event(
+            prepared.task_run_id,
+            RetryEventType.RETRY_SCHEDULED,
+            failed_attempt_number=prepared.failed_attempt_number,
+            retry_attempt_number=attempt.attempt_number,
+            next_eligible_at=attempt.next_eligible_at,
+        )
 
-    async def fail_retry(self, prepared: PreparedRetryTransition) -> None:
+    async def fail_retry(
+        self,
+        prepared: PreparedRetryTransition,
+        reason: RetryNotScheduledReason,
+    ) -> None:
         try:
             transitioned = (
                 await self._required_session().execute(
@@ -198,6 +212,41 @@ class SQLAlchemyRetryTransitionTransaction:
             raise RetryTransitionPersistenceUnavailable from error
         if transitioned is None:
             raise RetryTransitionPersistenceInvariantViolation
+        await self._append_retry_event(
+            prepared.task_run_id,
+            RetryEventType.RETRY_NOT_SCHEDULED,
+            failed_attempt_number=prepared.failed_attempt_number,
+            decision_reason=reason,
+        )
+
+    async def _append_retry_event(
+        self,
+        task_run_id: UUID,
+        event_type: RetryEventType,
+        *,
+        failed_attempt_number: int | None = None,
+        retry_attempt_number: int | None = None,
+        next_eligible_at: datetime | None = None,
+        decision_reason: RetryNotScheduledReason | None = None,
+    ) -> None:
+        try:
+            await self._required_session().execute(
+                insert(task_retry_events).values(
+                    id=uuid4(),
+                    task_run_id=task_run_id,
+                    event_type=event_type.value,
+                    failed_attempt_number=failed_attempt_number,
+                    retry_attempt_number=retry_attempt_number,
+                    next_eligible_at=next_eligible_at,
+                    decision_reason=(
+                        decision_reason.value if decision_reason is not None else None
+                    ),
+                )
+            )
+        except IntegrityError as error:
+            raise RetryTransitionPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise RetryTransitionPersistenceUnavailable from error
 
     async def _pending_transition(self, task: Any) -> PreparedRetryTransition:
         session = self._required_session()
@@ -578,6 +627,19 @@ class SQLAlchemyDueRetryDispatchTransaction:
             raise DueRetryPersistenceUnavailable from error
         if transitioned is None:
             raise DueRetryPersistenceInvariantViolation
+        try:
+            await session.execute(
+                insert(task_retry_events).values(
+                    id=uuid4(),
+                    task_run_id=prepared.task_run_id,
+                    event_type=RetryEventType.RETRY_DISPATCHED.value,
+                    retry_attempt_number=prepared.attempt_number,
+                )
+            )
+        except IntegrityError as error:
+            raise DueRetryPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise DueRetryPersistenceUnavailable from error
 
     def _required_session(self) -> AsyncSession:
         if self._session is None:

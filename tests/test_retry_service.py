@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from taskforge.retries.domain import RetryNotScheduledReason
 from taskforge.retries.persistence_ports import (
     ExistingScheduledRetry,
     NewScheduledRetryAttempt,
@@ -67,7 +68,9 @@ class FakeTransaction:
     scheduled: list[tuple[PreparedRetryTransition, NewScheduledRetryAttempt]] = field(
         default_factory=list
     )
-    failed: list[PreparedRetryTransition] = field(default_factory=list)
+    failed: list[tuple[PreparedRetryTransition, RetryNotScheduledReason]] = field(
+        default_factory=list
+    )
     exited_with: type[BaseException] | object | None = field(default="not-exited")
 
     async def __aenter__(self) -> FakeTransaction:
@@ -97,10 +100,14 @@ class FakeTransaction:
             raise self.failure
         self.scheduled.append((transition, attempt))
 
-    async def fail_retry(self, transition: PreparedRetryTransition) -> None:
+    async def fail_retry(
+        self,
+        transition: PreparedRetryTransition,
+        reason: RetryNotScheduledReason,
+    ) -> None:
         if self.failure is not None:
             raise self.failure
-        self.failed.append(transition)
+        self.failed.append((transition, reason))
 
 
 @dataclass(frozen=True)
@@ -163,7 +170,7 @@ def test_no_policy_fails_without_creating_attempt() -> None:
     receipt = run(transaction)
 
     assert receipt.outcome is RetryTransitionOutcome.FAILED_NO_POLICY
-    assert transaction.failed == [transition]
+    assert transaction.failed == [(transition, RetryNotScheduledReason.NO_POLICY)]
     assert transaction.scheduled == []
 
 
@@ -176,7 +183,7 @@ def test_exhausted_policy_fails_without_creating_attempt() -> None:
     receipt = run(transaction)
 
     assert receipt.outcome is RetryTransitionOutcome.FAILED_EXHAUSTED
-    assert transaction.failed == [transition]
+    assert transaction.failed == [(transition, RetryNotScheduledReason.EXHAUSTED)]
     assert transaction.scheduled == []
 
 

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, localcontext
 from enum import StrEnum
 from math import isfinite
+from uuid import UUID
+
+from taskforge.worker.results import TaskExecutionFailureKind
 
 type JSONValue = (
     bool | int | float | str | list[JSONValue] | dict[str, JSONValue] | None
@@ -59,6 +62,59 @@ class RetryDecisionKind(StrEnum):
     NO_POLICY = "no_policy"
     EXHAUSTED = "exhausted"
     RETRY_ALLOWED = "retry_allowed"
+
+
+class RetryEventType(StrEnum):
+    RETRY_SCHEDULED = "retry_scheduled"
+    RETRY_DISPATCHED = "retry_dispatched"
+    RETRY_NOT_SCHEDULED = "retry_not_scheduled"
+
+
+class RetryNotScheduledReason(StrEnum):
+    NO_POLICY = "no_policy"
+    EXHAUSTED = "exhausted"
+
+
+@dataclass(frozen=True)
+class RetryEventCursor:
+    task_run_id: UUID
+    occurred_at: datetime
+    event_id: UUID
+
+    def __post_init__(self) -> None:
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("retry event cursor timestamp must be timezone-aware")
+        object.__setattr__(self, "occurred_at", self.occurred_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class InspectedRetryEvent:
+    id: UUID
+    workflow_run_id: UUID
+    task_run_id: UUID
+    event_type: RetryEventType
+    failed_attempt_id: UUID | None
+    failed_attempt_number: int | None
+    retry_attempt_id: UUID | None
+    retry_attempt_number: int | None
+    next_eligible_at: datetime | None
+    decision_reason: RetryNotScheduledReason | None
+    failure_kind: TaskExecutionFailureKind | None
+    occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        for field in ("next_eligible_at", "occurred_at"):
+            value = getattr(self, field)
+            if value is not None:
+                if value.tzinfo is None or value.utcoffset() is None:
+                    raise ValueError("retry event timestamps must be timezone-aware")
+                object.__setattr__(self, field, value.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class InspectedRetryEventPage:
+    items: tuple[InspectedRetryEvent, ...]
+    next_cursor: RetryEventCursor | None
 
 
 @dataclass(frozen=True)

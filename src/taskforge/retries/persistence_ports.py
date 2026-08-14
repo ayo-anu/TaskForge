@@ -8,7 +8,7 @@ from types import TracebackType
 from typing import Protocol
 from uuid import UUID
 
-from taskforge.retries.domain import JSONMapping
+from taskforge.retries.domain import JSONMapping, RetryNotScheduledReason
 
 
 class RetryTransitionPersistenceInvariantViolation(Exception):
@@ -102,7 +102,11 @@ class RetryTransitionTransaction(Protocol):
         attempt: NewScheduledRetryAttempt,
     ) -> None: ...
 
-    async def fail_retry(self, prepared: PreparedRetryTransition) -> None: ...
+    async def fail_retry(
+        self,
+        prepared: PreparedRetryTransition,
+        reason: RetryNotScheduledReason,
+    ) -> None: ...
 
 
 class RetryTransitionTransactionContext(Protocol):

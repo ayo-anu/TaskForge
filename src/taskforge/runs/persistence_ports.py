@@ -8,6 +8,7 @@ from types import TracebackType
 from typing import Protocol
 from uuid import UUID
 
+from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
@@ -27,6 +28,10 @@ from taskforge.workflows.domain import WorkflowDefinitionStatus
 
 class WorkflowRunPersistenceUnavailable(Exception):
     """Workflow run target persistence is operationally unavailable."""
+
+
+class WorkflowRunInspectionInvariantViolation(Exception):
+    """Durable workflow-run inspection facts are inconsistent."""
 
 
 class WorkflowRunRecordConflict(Exception):
@@ -180,3 +185,14 @@ class WorkflowRunRepository(Protocol):
         selection: WorkflowVersionSelection,
     ) -> WorkflowVersionResolutionRecord | None:
         """Resolve availability and version without locking the definition row."""
+
+
+class RetryEventInspectionRepository(Protocol):
+    async def list_retry_events(
+        self,
+        task_run_id: UUID,
+        owner_principal_id: UUID,
+        *,
+        limit: int,
+        cursor: RetryEventCursor | None,
+    ) -> InspectedRetryEventPage | None: ...

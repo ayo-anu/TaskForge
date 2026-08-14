@@ -19,12 +19,22 @@ from sqlalchemy import (
     or_,
     select,
     true,
+    tuple_,
     update,
 )
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.retries.domain import (
+    InspectedRetryEvent,
+    InspectedRetryEventPage,
+    InvalidPersistedRetryPolicy,
+    RetryEventCursor,
+    RetryEventType,
+    RetryNotScheduledReason,
+    resolve_persisted_retry_policy,
+)
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
@@ -50,16 +60,24 @@ from taskforge.runs.persistence_ports import (
     IdempotentCreationPreparation,
     PreparedWorkflowRunCreation,
     WorkflowRunIdempotencyRecordConflict,
+    WorkflowRunInspectionInvariantViolation,
     WorkflowRunPersistenceUnavailable,
     WorkflowRunRecordConflict,
     WorkflowRunTimestamps,
     WorkflowVersionResolutionRecord,
 )
 from taskforge.runs.schema import (
+    task_attempt_results,
+    task_attempts,
+    task_retry_events,
     task_runs,
     workflow_run_idempotency,
     workflow_run_inputs,
     workflow_runs,
+)
+from taskforge.worker.results import (
+    TaskExecutionFailureKind,
+    TaskExecutionResultKind,
 )
 from taskforge.workflows.domain import (
     WorkflowDefinitionStatus,
@@ -153,6 +171,43 @@ class SQLAlchemyWorkflowRunRepository:
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
         return _inspected_task_run(row) if row is not None else None
+
+    async def list_retry_events(
+        self,
+        task_run_id: UUID,
+        owner_principal_id: UUID,
+        *,
+        limit: int,
+        cursor: RetryEventCursor | None,
+    ) -> InspectedRetryEventPage | None:
+        try:
+            async with self._sessions() as session, session.begin():
+                if not await session.scalar(
+                    _owner_scoped_task_exists_statement(task_run_id, owner_principal_id)
+                ):
+                    return None
+                rows = (
+                    await session.execute(
+                        _retry_event_history_statement(
+                            task_run_id,
+                            owner_principal_id,
+                            limit=limit,
+                            cursor=cursor,
+                        )
+                    )
+                ).all()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        page_rows = rows[:limit]
+        try:
+            items = tuple(_inspected_retry_event(row) for row in page_rows)
+        except (TypeError, ValueError) as error:
+            raise WorkflowRunInspectionInvariantViolation from error
+        next_cursor = None
+        if len(rows) > limit and items:
+            last = items[-1]
+            next_cursor = RetryEventCursor(last.task_run_id, last.occurred_at, last.id)
+        return InspectedRetryEventPage(items, next_cursor)
 
     async def transition_runnable_tasks(
         self,
@@ -680,8 +735,48 @@ def _owner_scoped_run_exists_statement(
     )
 
 
-def _task_run_columns() -> tuple[Any, ...]:
-    return (
+def _task_run_projection() -> tuple[tuple[Any, ...], Any]:
+    attempt_aggregates = (
+        select(
+            task_attempts.c.task_run_id,
+            func.count(task_attempts.c.id).label("attempt_count"),
+            func.min(task_attempts.c.attempt_number).label("minimum_attempt_number"),
+            func.max(task_attempts.c.attempt_number).label("maximum_attempt_number"),
+        )
+        .group_by(task_attempts.c.task_run_id)
+        .subquery("task_attempt_aggregates")
+    )
+    ranked_attempts = select(
+        task_attempts.c.task_run_id,
+        task_attempts.c.next_eligible_at,
+        func.row_number()
+        .over(
+            partition_by=task_attempts.c.task_run_id,
+            order_by=task_attempts.c.attempt_number.desc(),
+        )
+        .label("attempt_rank"),
+    ).subquery("ranked_task_attempts")
+    ranked_failures = (
+        select(
+            task_attempts.c.task_run_id,
+            task_attempt_results.c.failure_kind,
+            func.row_number()
+            .over(
+                partition_by=task_attempts.c.task_run_id,
+                order_by=task_attempts.c.attempt_number.desc(),
+            )
+            .label("failure_rank"),
+        )
+        .select_from(
+            task_attempts.join(
+                task_attempt_results,
+                task_attempt_results.c.task_attempt_id == task_attempts.c.id,
+            )
+        )
+        .where(task_attempt_results.c.failure_kind.is_not(None))
+        .subquery("ranked_task_failures")
+    )
+    columns = (
         task_runs.c.id,
         task_runs.c.workflow_run_id,
         task_runs.c.workflow_version_id,
@@ -700,24 +795,65 @@ def _task_run_columns() -> tuple[Any, ...]:
             ),
             else_=None,
         ).label("failure_reason"),
+        func.coalesce(attempt_aggregates.c.attempt_count, 0).label("attempt_count"),
+        attempt_aggregates.c.minimum_attempt_number,
+        attempt_aggregates.c.maximum_attempt_number,
+        ranked_attempts.c.next_eligible_at.label("retry_eligible_at"),
+        ranked_failures.c.failure_kind.label("latest_failure_kind"),
+        workflow_versions.c.execution_policy.label("workflow_execution_policy"),
+        workflow_version_steps.c.execution_policy.label("step_execution_policy"),
     )
+    relation = (
+        task_runs.join(
+            workflow_runs,
+            workflow_runs.c.id == task_runs.c.workflow_run_id,
+        )
+        .join(
+            workflow_definitions,
+            workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
+        )
+        .join(
+            workflow_versions,
+            workflow_versions.c.id == task_runs.c.workflow_version_id,
+        )
+        .join(
+            workflow_version_steps,
+            and_(
+                workflow_version_steps.c.workflow_version_id
+                == task_runs.c.workflow_version_id,
+                workflow_version_steps.c.step_identifier == task_runs.c.step_identifier,
+            ),
+        )
+        .outerjoin(
+            attempt_aggregates,
+            attempt_aggregates.c.task_run_id == task_runs.c.id,
+        )
+        .outerjoin(
+            ranked_attempts,
+            and_(
+                ranked_attempts.c.task_run_id == task_runs.c.id,
+                ranked_attempts.c.attempt_rank == 1,
+            ),
+        )
+        .outerjoin(
+            ranked_failures,
+            and_(
+                ranked_failures.c.task_run_id == task_runs.c.id,
+                ranked_failures.c.failure_rank == 1,
+            ),
+        )
+    )
+    return columns, relation
 
 
 def _task_run_list_statement(
     run_id: UUID,
     owner_principal_id: UUID,
 ) -> Select[Any]:
+    columns, relation = _task_run_projection()
     return (
-        select(*_task_run_columns())
-        .select_from(
-            task_runs.join(
-                workflow_runs,
-                workflow_runs.c.id == task_runs.c.workflow_run_id,
-            ).join(
-                workflow_definitions,
-                workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
-            )
-        )
+        select(*columns)
+        .select_from(relation)
         .where(
             task_runs.c.workflow_run_id == run_id,
             workflow_definitions.c.owner_principal_id == owner_principal_id,
@@ -730,8 +866,23 @@ def _task_run_inspection_statement(
     task_run_id: UUID,
     owner_principal_id: UUID,
 ) -> Select[Any]:
+    columns, relation = _task_run_projection()
     return (
-        select(*_task_run_columns())
+        select(*columns)
+        .select_from(relation)
+        .where(
+            task_runs.c.id == task_run_id,
+            workflow_definitions.c.owner_principal_id == owner_principal_id,
+        )
+    )
+
+
+def _owner_scoped_task_exists_statement(
+    task_run_id: UUID,
+    owner_principal_id: UUID,
+) -> Select[Any]:
+    return (
+        select(task_runs.c.id)
         .select_from(
             task_runs.join(
                 workflow_runs,
@@ -746,6 +897,79 @@ def _task_run_inspection_statement(
             workflow_definitions.c.owner_principal_id == owner_principal_id,
         )
     )
+
+
+def _retry_event_history_statement(
+    task_run_id: UUID,
+    owner_principal_id: UUID,
+    *,
+    limit: int,
+    cursor: RetryEventCursor | None,
+) -> Select[Any]:
+    failed_attempt = task_attempts.alias("retry_event_failed_attempt")
+    retry_attempt = task_attempts.alias("retry_event_retry_attempt")
+    statement = (
+        select(
+            task_retry_events.c.id,
+            task_runs.c.workflow_run_id,
+            task_retry_events.c.task_run_id,
+            task_retry_events.c.event_type,
+            failed_attempt.c.id.label("failed_attempt_id"),
+            task_retry_events.c.failed_attempt_number,
+            retry_attempt.c.id.label("retry_attempt_id"),
+            task_retry_events.c.retry_attempt_number,
+            task_retry_events.c.next_eligible_at,
+            task_retry_events.c.decision_reason,
+            task_attempt_results.c.result_kind,
+            task_attempt_results.c.failure_kind,
+            task_retry_events.c.occurred_at,
+        )
+        .select_from(
+            task_retry_events.join(
+                task_runs, task_runs.c.id == task_retry_events.c.task_run_id
+            )
+            .join(
+                workflow_runs,
+                workflow_runs.c.id == task_runs.c.workflow_run_id,
+            )
+            .join(
+                workflow_definitions,
+                workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
+            )
+            .outerjoin(
+                failed_attempt,
+                and_(
+                    failed_attempt.c.task_run_id == task_retry_events.c.task_run_id,
+                    failed_attempt.c.attempt_number
+                    == task_retry_events.c.failed_attempt_number,
+                ),
+            )
+            .outerjoin(
+                retry_attempt,
+                and_(
+                    retry_attempt.c.task_run_id == task_retry_events.c.task_run_id,
+                    retry_attempt.c.attempt_number
+                    == task_retry_events.c.retry_attempt_number,
+                ),
+            )
+            .outerjoin(
+                task_attempt_results,
+                task_attempt_results.c.task_attempt_id == failed_attempt.c.id,
+            )
+        )
+        .where(
+            task_retry_events.c.task_run_id == task_run_id,
+            workflow_definitions.c.owner_principal_id == owner_principal_id,
+        )
+    )
+    if cursor is not None:
+        statement = statement.where(
+            tuple_(task_retry_events.c.occurred_at, task_retry_events.c.id)
+            < (cursor.occurred_at, cursor.event_id)
+        )
+    return statement.order_by(
+        task_retry_events.c.occurred_at.desc(), task_retry_events.c.id.desc()
+    ).limit(limit + 1)
 
 
 def _runnable_transition_statement(workflow_run_id: UUID) -> Any:
@@ -1051,6 +1275,27 @@ def _inspected_run(row: Row[Any]) -> InspectedWorkflowRun:
 
 
 def _inspected_task_run(row: Row[Any]) -> InspectedTaskRun:
+    attempt_count = row.attempt_count
+    if attempt_count == 0:
+        if (
+            row.minimum_attempt_number is not None
+            or row.maximum_attempt_number is not None
+        ):
+            raise WorkflowRunInspectionInvariantViolation
+    elif row.minimum_attempt_number != 1 or row.maximum_attempt_number != attempt_count:
+        raise WorkflowRunInspectionInvariantViolation
+    try:
+        policy = resolve_persisted_retry_policy(
+            row.workflow_execution_policy,
+            row.step_execution_policy,
+        )
+        latest_failure_kind = (
+            TaskExecutionFailureKind(row.latest_failure_kind)
+            if row.latest_failure_kind is not None
+            else None
+        )
+    except (InvalidPersistedRetryPolicy, TypeError, ValueError) as error:
+        raise WorkflowRunInspectionInvariantViolation from error
     return InspectedTaskRun(
         id=row.id,
         workflow_run_id=row.workflow_run_id,
@@ -1064,6 +1309,46 @@ def _inspected_task_run(row: Row[Any]) -> InspectedTaskRun:
             if row.failure_reason is not None
             else None
         ),
+        attempt_count=attempt_count,
+        retry_attempt_count=max(attempt_count - 1, 0),
+        maximum_attempts=(policy.maximum_attempts if policy is not None else None),
+        retry_eligible_at=row.retry_eligible_at,
+        latest_failure_kind=latest_failure_kind,
+    )
+
+
+def _inspected_retry_event(row: Row[Any]) -> InspectedRetryEvent:
+    event_type = RetryEventType(row.event_type)
+    if event_type in (
+        RetryEventType.RETRY_SCHEDULED,
+        RetryEventType.RETRY_NOT_SCHEDULED,
+    ) and (
+        row.failed_attempt_id is None
+        or row.result_kind != TaskExecutionResultKind.RETRYABLE_FAILURE.value
+        or row.failure_kind is None
+    ):
+        raise WorkflowRunInspectionInvariantViolation
+    return InspectedRetryEvent(
+        id=row.id,
+        workflow_run_id=row.workflow_run_id,
+        task_run_id=row.task_run_id,
+        event_type=event_type,
+        failed_attempt_id=row.failed_attempt_id,
+        failed_attempt_number=row.failed_attempt_number,
+        retry_attempt_id=row.retry_attempt_id,
+        retry_attempt_number=row.retry_attempt_number,
+        next_eligible_at=row.next_eligible_at,
+        decision_reason=(
+            RetryNotScheduledReason(row.decision_reason)
+            if row.decision_reason is not None
+            else None
+        ),
+        failure_kind=(
+            TaskExecutionFailureKind(row.failure_kind)
+            if row.failure_kind is not None
+            else None
+        ),
+        occurred_at=row.occurred_at,
     )
 
 

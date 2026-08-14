@@ -466,6 +466,89 @@ task_result_events = Table(
     ),
 )
 
+task_retry_events = Table(
+    "task_retry_events",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("task_run_id", UUID(as_uuid=True), nullable=False),
+    Column("event_type", String(32), nullable=False),
+    Column("failed_attempt_number", Integer, nullable=True),
+    Column("retry_attempt_number", Integer, nullable=True),
+    Column("next_eligible_at", DateTime(timezone=True), nullable=True),
+    Column("decision_reason", String(32), nullable=True),
+    Column(
+        "occurred_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("statement_timestamp()"),
+    ),
+    ForeignKeyConstraint(
+        ("task_run_id",),
+        ("task_runs.id",),
+        name="fk_task_retry_events_task_run_id_task_runs",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ("task_run_id", "failed_attempt_number"),
+        ("task_attempts.task_run_id", "task_attempts.attempt_number"),
+        name="fk_task_retry_events_failed_attempt",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ("task_run_id", "retry_attempt_number"),
+        ("task_attempts.task_run_id", "task_attempts.attempt_number"),
+        name="fk_task_retry_events_retry_attempt",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    CheckConstraint(
+        "event_type IN ('retry_scheduled', 'retry_dispatched', 'retry_not_scheduled')",
+        name="event_type_valid",
+    ),
+    CheckConstraint(
+        "(event_type = 'retry_scheduled' AND failed_attempt_number IS NOT NULL "
+        "AND retry_attempt_number = failed_attempt_number + 1 "
+        "AND next_eligible_at IS NOT NULL AND decision_reason IS NULL) OR "
+        "(event_type = 'retry_dispatched' AND failed_attempt_number IS NULL "
+        "AND retry_attempt_number > 1 AND next_eligible_at IS NULL "
+        "AND decision_reason IS NULL) OR "
+        "(event_type = 'retry_not_scheduled' AND failed_attempt_number IS NOT NULL "
+        "AND retry_attempt_number IS NULL AND next_eligible_at IS NULL "
+        "AND decision_reason IN ('no_policy', 'exhausted'))",
+        name="event_shape_valid",
+    ),
+)
+
+Index(
+    "uq_task_retry_events_scheduled_attempt",
+    task_retry_events.c.task_run_id,
+    task_retry_events.c.retry_attempt_number,
+    unique=True,
+    postgresql_where=task_retry_events.c.event_type == "retry_scheduled",
+)
+Index(
+    "uq_task_retry_events_dispatched_attempt",
+    task_retry_events.c.task_run_id,
+    task_retry_events.c.retry_attempt_number,
+    unique=True,
+    postgresql_where=task_retry_events.c.event_type == "retry_dispatched",
+)
+Index(
+    "uq_task_retry_events_not_scheduled_attempt",
+    task_retry_events.c.task_run_id,
+    task_retry_events.c.failed_attempt_number,
+    unique=True,
+    postgresql_where=task_retry_events.c.event_type == "retry_not_scheduled",
+)
+Index(
+    "ix_task_retry_events_task_run_id_occurred_at_id",
+    task_retry_events.c.task_run_id,
+    task_retry_events.c.occurred_at,
+    task_retry_events.c.id,
+)
+
 Index(
     "ix_task_result_events_task_attempt_id_occurred_at_id",
     task_result_events.c.task_attempt_id,

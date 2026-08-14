@@ -204,10 +204,25 @@ async def exercise_retry_transitions(database_url: URL) -> None:
         shape = await scheduled_shape(setup, workflow.task_run_id)
         assert len(shape) == 2
         assert shape[1][1:] == (2, scheduled.next_eligible_at, False, False, False)
+        assert tuple(
+            await setup.fetchrow(
+                "SELECT event_type, failed_attempt_number, retry_attempt_number, "
+                "next_eligible_at, decision_reason FROM task_retry_events "
+                "WHERE task_run_id = $1",
+                workflow.task_run_id,
+            )
+        ) == ("retry_scheduled", 1, 2, scheduled.next_eligible_at, None)
         replayed = await service.transition_retry(workflow.task_run_id)
         assert replayed.outcome is RetryTransitionOutcome.ALREADY_SCHEDULED
         assert replayed.scheduled_attempt_id == scheduled.scheduled_attempt_id
         assert len(await scheduled_shape(setup, workflow.task_run_id)) == 2
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_retry_events WHERE task_run_id = $1",
+                workflow.task_run_id,
+            )
+            == 1
+        )
 
         override = await add_retry_pending_task(
             setup,
@@ -243,6 +258,13 @@ async def exercise_retry_transitions(database_url: URL) -> None:
             == "failed"
         )
         assert len(await scheduled_shape(setup, no_policy.task_run_id)) == 1
+        assert (
+            await setup.fetchval(
+                "SELECT decision_reason FROM task_retry_events WHERE task_run_id = $1",
+                no_policy.task_run_id,
+            )
+            == "no_policy"
+        )
 
         exhausted = await add_retry_pending_task(
             setup,
@@ -254,6 +276,13 @@ async def exercise_retry_transitions(database_url: URL) -> None:
             await service.transition_retry(exhausted.task_run_id)
         ).outcome is RetryTransitionOutcome.NOT_ELIGIBLE
         assert len(await scheduled_shape(setup, exhausted.task_run_id)) == 1
+        assert (
+            await setup.fetchval(
+                "SELECT decision_reason FROM task_retry_events WHERE task_run_id = $1",
+                exhausted.task_run_id,
+            )
+            == "exhausted"
+        )
 
         invalid_result = await add_retry_pending_task(
             setup,
@@ -397,13 +426,12 @@ async def _exercise_rollback(
         setup, workflow_policy={"retry_policy": retry_policy()}
     )
     await setup.execute(
-        "CREATE FUNCTION reject_retry_scheduled() RETURNS trigger LANGUAGE plpgsql "
-        "AS $$ BEGIN IF NEW.status = 'retry_scheduled' THEN "
-        "RAISE EXCEPTION 'forced retry rollback'; END IF; RETURN NEW; END $$"
+        "CREATE FUNCTION reject_retry_event() RETURNS trigger LANGUAGE plpgsql "
+        "AS $$ BEGIN RAISE EXCEPTION 'forced retry event rollback'; END $$"
     )
     await setup.execute(
-        "CREATE TRIGGER reject_retry_scheduled_trigger BEFORE UPDATE ON task_runs "
-        "FOR EACH ROW EXECUTE FUNCTION reject_retry_scheduled()"
+        "CREATE TRIGGER reject_retry_event_trigger BEFORE INSERT ON task_retry_events "
+        "FOR EACH ROW EXECUTE FUNCTION reject_retry_event()"
     )
     try:
         with pytest.raises(RetryTransitionServiceUnavailable):
@@ -411,13 +439,22 @@ async def _exercise_rollback(
         assert len(await scheduled_shape(setup, facts.task_run_id)) == 1
         assert (
             await setup.fetchval(
+                "SELECT count(*) FROM task_retry_events WHERE task_run_id = $1",
+                facts.task_run_id,
+            )
+            == 0
+        )
+        assert (
+            await setup.fetchval(
                 "SELECT status::text FROM task_runs WHERE id = $1", facts.task_run_id
             )
             == "retry_pending"
         )
     finally:
-        await setup.execute("DROP TRIGGER reject_retry_scheduled_trigger ON task_runs")
-        await setup.execute("DROP FUNCTION reject_retry_scheduled()")
+        await setup.execute(
+            "DROP TRIGGER reject_retry_event_trigger ON task_retry_events"
+        )
+        await setup.execute("DROP FUNCTION reject_retry_event()")
 
 
 def test_real_postgresql_retry_transitions() -> None:

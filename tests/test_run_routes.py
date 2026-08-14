@@ -22,6 +22,12 @@ from taskforge.identity.credentials import (
     CredentialScope,
 )
 from taskforge.identity.ports import CredentialRecord
+from taskforge.retries.domain import (
+    InspectedRetryEvent,
+    InspectedRetryEventPage,
+    RetryEventCursor,
+    RetryEventType,
+)
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
     ExplicitWorkflowVersion,
@@ -45,6 +51,7 @@ from taskforge.runs.service import (
     WorkflowVersionUnavailable,
 )
 from taskforge.settings import Settings
+from taskforge.worker.results import TaskExecutionFailureKind
 from taskforge.workflows.domain import WorkflowDefinitionStatus
 from taskforge.workflows.task_types import TaskTypeRegistry
 
@@ -124,6 +131,31 @@ class RunServiceStub:
             TaskRunStatus.RUNNABLE,
             now,
             now,
+            attempt_count=2,
+            retry_attempt_count=1,
+            maximum_attempts=4,
+            retry_eligible_at=now,
+            latest_failure_kind=TaskExecutionFailureKind.HANDLER_EXCEPTION,
+        )
+        event_id, failed_id, retry_id = uuid4(), uuid4(), uuid4()
+        self.retry_page = InspectedRetryEventPage(
+            (
+                InspectedRetryEvent(
+                    event_id,
+                    self.run_id,
+                    self.task_id,
+                    RetryEventType.RETRY_SCHEDULED,
+                    failed_id,
+                    1,
+                    retry_id,
+                    2,
+                    now,
+                    None,
+                    TaskExecutionFailureKind.HANDLER_EXCEPTION,
+                    now,
+                ),
+            ),
+            RetryEventCursor(self.task_id, now, event_id),
         )
 
     def _raise(self) -> None:
@@ -196,6 +228,20 @@ class RunServiceStub:
         self.calls.append(("get_task", task_run_id, owner_principal_id))
         self._raise()
         return self.task
+
+    async def list_retry_events(
+        self,
+        task_run_id: UUID,
+        *,
+        owner_principal_id: UUID,
+        limit: int,
+        cursor: RetryEventCursor | None,
+    ) -> InspectedRetryEventPage:
+        self.calls.append(
+            ("list_retry_events", task_run_id, owner_principal_id, limit, cursor)
+        )
+        self._raise()
+        return self.retry_page
 
 
 class Runtime:
@@ -413,11 +459,80 @@ def test_run_and_task_inspection_are_owner_scoped_and_minimal() -> None:
     assert tasks.json()["items"][0]["failure_reason"] is None
     assert task.json()["failure_reason"] is None
     assert tasks.json()["items"][0]["step_identifier"] == "root"
+    assert (
+        task.json()
+        | {
+            "attempt_count": 2,
+            "retry_attempt_count": 1,
+            "maximum_attempts": 4,
+            "latest_failure_kind": "handler_exception",
+        }
+        == task.json()
+    )
     assert service.calls == [
         ("get_run", service.run_id, runtime.principal_id),
         ("list_tasks", service.run_id, runtime.principal_id),
         ("get_task", service.task_id, runtime.principal_id),
     ]
+
+
+def test_retry_history_is_owner_scoped_paginated_and_cursor_bound() -> None:
+    app, runtime, service = make_app(frozenset({Role.VIEWER.value}))
+    path = f"/api/v1/task-runs/{service.task_id}/retry-events"
+
+    first = request(app, "GET", path, runtime.api_credential)
+
+    assert first.status_code == 200
+    body = first.json()
+    assert body["items"][0]["event_type"] == "retry_scheduled"
+    assert body["items"][0]["failure_kind"] == "handler_exception"
+    assert "dispatch_id" not in body["items"][0]
+    assert body["page"]["limit"] == 50
+    cursor = body["page"]["next_cursor"]
+    assert cursor is not None
+
+    second = request(
+        app,
+        "GET",
+        path,
+        runtime.api_credential,
+        params={"cursor": cursor, "limit": 10},
+    )
+    wrong_task = request(
+        app,
+        "GET",
+        f"/api/v1/task-runs/{uuid4()}/retry-events",
+        runtime.api_credential,
+        params={"cursor": cursor},
+    )
+
+    assert second.status_code == 200
+    assert service.calls[-1][0] == "list_retry_events"
+    assert service.calls[-1][-1] is not None
+    assert wrong_task.status_code == 422
+    assert wrong_task.json()["error"]["details"][0]["code"] == "invalid_cursor"
+
+
+def test_retry_history_absent_and_cross_owner_tasks_share_not_found_contract() -> None:
+    app, runtime, service = make_app(frozenset({Role.VIEWER.value}))
+    service.error = TaskRunNotFound()
+
+    missing = request(
+        app,
+        "GET",
+        f"/api/v1/task-runs/{uuid4()}/retry-events",
+        runtime.api_credential,
+    )
+    hidden = request(
+        app,
+        "GET",
+        f"/api/v1/task-runs/{uuid4()}/retry-events",
+        runtime.api_credential,
+    )
+
+    assert missing.status_code == hidden.status_code == 404
+    for field in ("code", "message", "version"):
+        assert missing.json()["error"][field] == hidden.json()["error"][field]
 
 
 def test_unknown_and_cross_owner_inspection_share_not_found_contract() -> None:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from typing import cast
 from uuid import UUID, uuid4
 
+from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
     CreatedWorkflowRun,
@@ -31,8 +33,10 @@ from taskforge.runs.domain import (
 from taskforge.runs.persistence_ports import (
     ExistingIdempotentWorkflowRun,
     PreparedWorkflowRunCreation,
+    RetryEventInspectionRepository,
     WorkflowRunCreationTransaction,
     WorkflowRunIdempotencyRecordConflict,
+    WorkflowRunInspectionInvariantViolation,
     WorkflowRunPersistenceUnavailable,
     WorkflowRunRecordConflict,
     WorkflowRunRepository,
@@ -61,6 +65,10 @@ class WorkflowRunNotFound(Exception):
 
 class TaskRunNotFound(Exception):
     """A task run is absent from the requested owner's scope."""
+
+
+class WorkflowRunInspectionInvariantError(Exception):
+    """Durable workflow-run inspection facts are inconsistent."""
 
 
 class WorkflowRunService:
@@ -116,6 +124,8 @@ class WorkflowRunService:
     ) -> tuple[InspectedTaskRun, ...]:
         try:
             tasks = await self._repository.list_task_runs(run_id, owner_principal_id)
+        except WorkflowRunInspectionInvariantViolation as error:
+            raise WorkflowRunInspectionInvariantError from error
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
         if tasks is None:
@@ -130,11 +140,38 @@ class WorkflowRunService:
     ) -> InspectedTaskRun:
         try:
             task = await self._repository.get_task_run(task_run_id, owner_principal_id)
+        except WorkflowRunInspectionInvariantViolation as error:
+            raise WorkflowRunInspectionInvariantError from error
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
         if task is None:
             raise TaskRunNotFound
         return task
+
+    async def list_retry_events(
+        self,
+        task_run_id: UUID,
+        *,
+        owner_principal_id: UUID,
+        limit: int,
+        cursor: RetryEventCursor | None,
+    ) -> InspectedRetryEventPage:
+        try:
+            page = await cast(
+                RetryEventInspectionRepository, self._repository
+            ).list_retry_events(
+                task_run_id,
+                owner_principal_id,
+                limit=limit,
+                cursor=cursor,
+            )
+        except WorkflowRunInspectionInvariantViolation as error:
+            raise WorkflowRunInspectionInvariantError from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        if page is None:
+            raise TaskRunNotFound
+        return page
 
     async def transition_runnable_tasks(
         self,

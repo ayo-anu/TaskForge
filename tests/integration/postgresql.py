@@ -25,8 +25,9 @@ SAFE_DATABASE_NAME = re.compile(
     r"taskforge_claim_migration|taskforge_claim_event_mig|"
     r"taskforge_claim_acquisition|taskforge_claim_renewal|"
     r"taskforge_claim_events|taskforge_task_results|taskforge_result_migration|"
-    r"taskforge_retry_migration|taskforge_retry_transition|"
-    r"taskforge_retry_scanner)_[0-9a-f]{32}\Z"
+    r"taskforge_retry_migration|taskforge_retry_event_mig|"
+    r"taskforge_retry_transition|"
+    r"taskforge_retry_scanner|taskforge_retry_inspection)_[0-9a-f]{32}\Z"
 )
 
 

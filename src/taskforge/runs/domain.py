@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
+from taskforge.worker.results import TaskExecutionFailureKind
 from taskforge.workflows.domain import (
     MAX_TASK_DEADLINE_SECONDS,
     MAX_TASK_EXECUTION_TIMEOUT_SECONDS,
@@ -249,12 +250,32 @@ class InspectedTaskRun:
     created_at: datetime
     updated_at: datetime
     failure_reason: RunFailureReason | None = None
+    attempt_count: int = 0
+    retry_attempt_count: int = 0
+    maximum_attempts: int | None = None
+    retry_eligible_at: datetime | None = None
+    latest_failure_kind: TaskExecutionFailureKind | None = None
 
     def __post_init__(self) -> None:
         if self.created_at.tzinfo is None or self.updated_at.tzinfo is None:
             raise ValueError("task run timestamps must be timezone-aware")
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
         object.__setattr__(self, "updated_at", self.updated_at.astimezone(UTC))
+        if self.attempt_count < 0:
+            raise ValueError("attempt count must be non-negative")
+        if self.retry_attempt_count != max(self.attempt_count - 1, 0):
+            raise ValueError("retry attempt count must count allocated retry attempts")
+        if self.maximum_attempts is not None and self.maximum_attempts < 1:
+            raise ValueError("maximum attempts must include positive attempt 1")
+        if self.retry_eligible_at is not None:
+            if (
+                self.retry_eligible_at.tzinfo is None
+                or self.retry_eligible_at.utcoffset() is None
+            ):
+                raise ValueError("retry eligibility timestamp must be timezone-aware")
+            object.__setattr__(
+                self, "retry_eligible_at", self.retry_eligible_at.astimezone(UTC)
+            )
 
 
 @dataclass(frozen=True)

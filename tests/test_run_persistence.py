@@ -19,6 +19,7 @@ from taskforge.persistence.runs import (
     _definition_lock_statement,
     _dependency_failure_propagation_statement,
     _idempotent_run_statement,
+    _inspected_task_run,
     _is_idempotency_scope_conflict,
     _locked_version_statement,
     _owner_scoped_run_exists_statement,
@@ -45,6 +46,7 @@ from taskforge.runs.domain import (
 )
 from taskforge.runs.persistence_ports import (
     PreparedWorkflowRunCreation,
+    WorkflowRunInspectionInvariantViolation,
     WorkflowRunPersistenceUnavailable,
     WorkflowRunTimestamps,
 )
@@ -133,6 +135,51 @@ def test_run_and_task_inspection_sql_is_owner_scoped_read_only_and_ordered() -> 
         assert "CASE WHEN (task_runs.status =" in sql
         assert "AS failure_reason" in sql
         assert "workflow_version_dependencies" not in sql
+    for sql in (tasks, task):
+        assert sql.count("count(task_attempts.id)") == 1
+        assert sql.count("min(task_attempts.attempt_number)") == 1
+        assert sql.count("max(task_attempts.attempt_number)") == 1
+        assert "GROUP BY task_attempts.task_run_id" in sql
+        assert "AS task_attempt_aggregates" in sql
+        assert "AS ranked_task_attempts" in sql
+        assert "AS ranked_task_failures" in sql
+        assert sql.count("row_number() OVER") == 2
+        assert "workflow_versions.execution_policy" in sql
+        assert "workflow_version_steps.execution_policy" in sql
+        assert "WHERE task_attempts.task_run_id = task_runs.id" not in sql
+
+
+def test_task_inspection_requires_contiguous_attempt_allocation() -> None:
+    now = datetime.now(UTC)
+    values = {
+        "id": uuid4(),
+        "workflow_run_id": uuid4(),
+        "workflow_version_id": uuid4(),
+        "step_identifier": "root",
+        "status": "retry_scheduled",
+        "created_at": now,
+        "updated_at": now,
+        "failure_reason": None,
+        "attempt_count": 2,
+        "minimum_attempt_number": 1,
+        "maximum_attempt_number": 2,
+        "retry_eligible_at": now,
+        "latest_failure_kind": "handler_exception",
+        "workflow_execution_policy": None,
+        "step_execution_policy": None,
+    }
+    inspected = _inspected_task_run(SimpleNamespace(**values))  # type: ignore[arg-type]
+    assert inspected.attempt_count == 2
+    assert inspected.retry_attempt_count == 1
+
+    for changes in (
+        {"attempt_count": 0, "minimum_attempt_number": 1, "maximum_attempt_number": 1},
+        {"minimum_attempt_number": 2},
+        {"maximum_attempt_number": 3},
+    ):
+        with pytest.raises(WorkflowRunInspectionInvariantViolation):
+            corrupt: Any = SimpleNamespace(**(values | changes))
+            _inspected_task_run(corrupt)
 
 
 def test_runnable_transition_sql_owns_immutable_dependency_evaluation() -> None:

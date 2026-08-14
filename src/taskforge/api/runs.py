@@ -2,16 +2,35 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import base64
+import binascii
+import json
+from datetime import UTC, datetime
 from typing import Annotated, Any, Protocol, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from taskforge.api.authorization import require_permission
 from taskforge.api.errors import ErrorDetail, ErrorResponse, error_response
 from taskforge.identity.authorization import AuthorizationContext, Permission
+from taskforge.retries.domain import (
+    InspectedRetryEvent,
+    InspectedRetryEventPage,
+    RetryEventCursor,
+    RetryEventType,
+    RetryNotScheduledReason,
+)
 from taskforge.runs.domain import (
     CreatedWorkflowRun,
     ExplicitWorkflowVersion,
@@ -29,6 +48,7 @@ from taskforge.runs.domain import (
 )
 from taskforge.runs.service import (
     TaskRunNotFound,
+    WorkflowRunInspectionInvariantError,
     WorkflowRunNotFound,
     WorkflowRunPersistenceConflict,
     WorkflowRunService,
@@ -36,6 +56,7 @@ from taskforge.runs.service import (
     WorkflowRunTargetNotFound,
     WorkflowVersionUnavailable,
 )
+from taskforge.worker.results import TaskExecutionFailureKind
 from taskforge.workflows.task_types import JSONValue
 
 
@@ -71,10 +92,40 @@ class TaskRunResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     failure_reason: RunFailureReason | None
+    attempt_count: int
+    retry_attempt_count: int
+    maximum_attempts: int | None
+    retry_eligible_at: datetime | None
+    latest_failure_kind: TaskExecutionFailureKind | None
 
 
 class TaskRunListResponse(BaseModel):
     items: list[TaskRunResponse]
+
+
+class RetryEventResponse(BaseModel):
+    id: UUID
+    workflow_run_id: UUID
+    task_run_id: UUID
+    event_type: RetryEventType
+    failed_attempt_id: UUID | None
+    failed_attempt_number: int | None
+    retry_attempt_id: UUID | None
+    retry_attempt_number: int | None
+    next_eligible_at: datetime | None
+    decision_reason: RetryNotScheduledReason | None
+    failure_kind: TaskExecutionFailureKind | None
+    occurred_at: datetime
+
+
+class RetryEventPageMetadataResponse(BaseModel):
+    limit: int
+    next_cursor: str | None
+
+
+class RetryEventHistoryResponse(BaseModel):
+    items: list[RetryEventResponse]
+    page: RetryEventPageMetadataResponse
 
 
 class WorkflowRunRuntimeProtocol(Protocol):
@@ -82,6 +133,12 @@ class WorkflowRunRuntimeProtocol(Protocol):
 
 
 router = APIRouter(tags=["workflow-runs"])
+
+DEFAULT_RETRY_EVENT_PAGE_SIZE = 50
+MAX_RETRY_EVENT_PAGE_SIZE = 100
+MAX_RETRY_EVENT_CURSOR_LENGTH = 768
+MAX_RETRY_EVENT_CURSOR_BYTES = 512
+_RETRY_EVENT_CURSOR_VERSION = 1
 
 COMMON_RESPONSES: dict[int | str, dict[str, Any]] = {
     status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
@@ -184,6 +241,10 @@ async def get_workflow_run(
         )
     except WorkflowRunNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except WorkflowRunInspectionInvariantError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        ) from error
     except WorkflowRunServiceUnavailable as error:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
     return _workflow_run_response(run)
@@ -209,6 +270,10 @@ async def list_workflow_run_tasks(
         )
     except WorkflowRunNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except WorkflowRunInspectionInvariantError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        ) from error
     except WorkflowRunServiceUnavailable as error:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
     return TaskRunListResponse(items=[_task_run_response(task) for task in tasks])
@@ -234,9 +299,66 @@ async def get_task_run(
         )
     except TaskRunNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except WorkflowRunInspectionInvariantError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        ) from error
     except WorkflowRunServiceUnavailable as error:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
     return _task_run_response(task)
+
+
+@router.get(
+    "/api/v1/task-runs/{task_run_id}/retry-events",
+    response_model=RetryEventHistoryResponse,
+    responses=COMMON_RESPONSES,
+)
+async def list_task_retry_events(
+    task_run_id: UUID,
+    request: Request,
+    context: Annotated[
+        AuthorizationContext,
+        Depends(require_permission(Permission.VIEW)),
+    ],
+    limit: Annotated[int, Query(ge=1, le=MAX_RETRY_EVENT_PAGE_SIZE)] = (
+        DEFAULT_RETRY_EVENT_PAGE_SIZE
+    ),
+    cursor: Annotated[
+        str | None, Query(max_length=MAX_RETRY_EVENT_CURSOR_LENGTH)
+    ] = None,
+) -> RetryEventHistoryResponse | Response:
+    try:
+        decoded = _decode_retry_event_cursor(cursor, task_run_id) if cursor else None
+    except ValueError:
+        return error_response(
+            request,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            code="validation_failed",
+            message="The request is invalid.",
+            details=(
+                ErrorDetail(
+                    code="invalid_cursor",
+                    path=["query", "cursor"],
+                    message="Cursor is invalid.",
+                ),
+            ),
+        )
+    try:
+        page = await _runtime(request).workflow_run_service.list_retry_events(
+            task_run_id,
+            owner_principal_id=context.principal_id,
+            limit=limit,
+            cursor=decoded,
+        )
+    except TaskRunNotFound as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except WorkflowRunInspectionInvariantError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        ) from error
+    except WorkflowRunServiceUnavailable as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
+    return _retry_event_history_response(page, limit)
 
 
 def _runtime(request: Request) -> WorkflowRunRuntimeProtocol:
@@ -279,7 +401,102 @@ def _task_run_response(task: InspectedTaskRun) -> TaskRunResponse:
         created_at=task.created_at,
         updated_at=task.updated_at,
         failure_reason=task.failure_reason,
+        attempt_count=task.attempt_count,
+        retry_attempt_count=task.retry_attempt_count,
+        maximum_attempts=task.maximum_attempts,
+        retry_eligible_at=task.retry_eligible_at,
+        latest_failure_kind=task.latest_failure_kind,
     )
+
+
+def _retry_event_history_response(
+    page: InspectedRetryEventPage, limit: int
+) -> RetryEventHistoryResponse:
+    return RetryEventHistoryResponse(
+        items=[_retry_event_response(item) for item in page.items],
+        page=RetryEventPageMetadataResponse(
+            limit=limit,
+            next_cursor=(
+                _encode_retry_event_cursor(page.next_cursor)
+                if page.next_cursor is not None
+                else None
+            ),
+        ),
+    )
+
+
+def _retry_event_response(event: InspectedRetryEvent) -> RetryEventResponse:
+    return RetryEventResponse(
+        id=event.id,
+        workflow_run_id=event.workflow_run_id,
+        task_run_id=event.task_run_id,
+        event_type=event.event_type,
+        failed_attempt_id=event.failed_attempt_id,
+        failed_attempt_number=event.failed_attempt_number,
+        retry_attempt_id=event.retry_attempt_id,
+        retry_attempt_number=event.retry_attempt_number,
+        next_eligible_at=event.next_eligible_at,
+        decision_reason=event.decision_reason,
+        failure_kind=event.failure_kind,
+        occurred_at=event.occurred_at,
+    )
+
+
+def _encode_retry_event_cursor(cursor: RetryEventCursor) -> str:
+    payload = json.dumps(
+        {
+            "v": _RETRY_EVENT_CURSOR_VERSION,
+            "task_run_id": str(cursor.task_run_id),
+            "occurred_at": cursor.occurred_at.astimezone(UTC)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "event_id": str(cursor.event_id),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_retry_event_cursor(value: str, task_run_id: UUID) -> RetryEventCursor:
+    if not value or len(value) > MAX_RETRY_EVENT_CURSOR_LENGTH or not value.isascii():
+        raise ValueError("invalid cursor")
+    try:
+        decoded = base64.b64decode(
+            value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
+        )
+        if len(decoded) > MAX_RETRY_EVENT_CURSOR_BYTES:
+            raise ValueError("invalid cursor")
+        payload = json.loads(decoded)
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid cursor") from error
+    if not isinstance(payload, dict) or set(payload) != {
+        "v",
+        "task_run_id",
+        "occurred_at",
+        "event_id",
+    }:
+        raise ValueError("invalid cursor")
+    if type(payload["v"]) is not int or payload["v"] != _RETRY_EVENT_CURSOR_VERSION:
+        raise ValueError("invalid cursor")
+    if not all(
+        isinstance(payload[field], str)
+        for field in ("task_run_id", "occurred_at", "event_id")
+    ):
+        raise ValueError("invalid cursor")
+    try:
+        parsed_task_run_id = UUID(payload["task_run_id"])
+        occurred_at = datetime.fromisoformat(
+            payload["occurred_at"].replace("Z", "+00:00")
+        )
+        cursor = RetryEventCursor(
+            parsed_task_run_id, occurred_at, UUID(payload["event_id"])
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid cursor") from error
+    if cursor.task_run_id != task_run_id:
+        raise ValueError("invalid cursor")
+    return cursor
 
 
 def _input_validation_error(

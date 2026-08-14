@@ -11,6 +11,7 @@ from taskforge.retries.domain import (
     InvalidPersistedRetryPolicy,
     RetryCalculationError,
     RetryDecisionKind,
+    RetryNotScheduledReason,
     decide_retry,
     resolve_persisted_retry_policy,
 )
@@ -94,7 +95,12 @@ class RetryTransitionService:
                         attempt.next_eligible_at,
                     )
 
-                await transaction.fail_retry(prepared)
+                reason = (
+                    RetryNotScheduledReason.NO_POLICY
+                    if decision.kind is RetryDecisionKind.NO_POLICY
+                    else RetryNotScheduledReason.EXHAUSTED
+                )
+                await transaction.fail_retry(prepared, reason)
                 outcome = (
                     RetryTransitionOutcome.FAILED_NO_POLICY
                     if decision.kind is RetryDecisionKind.NO_POLICY

@@ -387,6 +387,14 @@ async def exercise_scanner(database_url: URL) -> None:
                 task.scheduled_attempt_id,
             )
             assert tuple(row) == ("dispatched", 2, task.next_eligible_at, 1)
+            assert tuple(
+                await setup.fetchrow(
+                    "SELECT event_type, failed_attempt_number, "
+                    "retry_attempt_number, next_eligible_at, decision_reason "
+                    "FROM task_retry_events WHERE task_run_id = $1",
+                    task.task_run_id,
+                )
+            ) == ("retry_dispatched", None, 2, None, None)
 
         await exercise_single_candidate_concurrency(setup, scanner, repository)
         await exercise_shared_workflow_skip_locked(setup, scanner, repository)
@@ -662,14 +670,14 @@ async def exercise_corruption_and_rollback(
         eligible_at=(now,),
     )
     await setup.execute(
-        "CREATE FUNCTION reject_retry_dispatch() RETURNS trigger LANGUAGE plpgsql "
-        "AS $$ BEGIN IF NEW.status = 'dispatched' AND "
-        "OLD.status = 'retry_scheduled' THEN RAISE EXCEPTION "
-        "'forced retry dispatch rollback'; END IF; RETURN NEW; END $$"
+        "CREATE FUNCTION reject_retry_dispatch_event() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION "
+        "'forced retry dispatch event rollback'; END $$"
     )
     await setup.execute(
-        "CREATE TRIGGER reject_retry_dispatch_trigger BEFORE UPDATE ON task_runs "
-        "FOR EACH ROW EXECUTE FUNCTION reject_retry_dispatch()"
+        "CREATE TRIGGER reject_retry_dispatch_event_trigger BEFORE INSERT ON "
+        "task_retry_events FOR EACH ROW EXECUTE FUNCTION "
+        "reject_retry_dispatch_event()"
     )
     try:
         with pytest.raises(DueRetryScanServiceUnavailable):
@@ -688,10 +696,19 @@ async def exercise_corruption_and_rollback(
             )
             == "retry_scheduled"
         )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_retry_events WHERE task_run_id = $1",
+                rollback.tasks[0].task_run_id,
+            )
+            == 0
+        )
         await assert_attempt_counts(setup, rollback)
     finally:
-        await setup.execute("DROP TRIGGER reject_retry_dispatch_trigger ON task_runs")
-        await setup.execute("DROP FUNCTION reject_retry_dispatch()")
+        await setup.execute(
+            "DROP TRIGGER reject_retry_dispatch_event_trigger ON task_retry_events"
+        )
+        await setup.execute("DROP FUNCTION reject_retry_dispatch_event()")
 
 
 def test_real_postgresql_due_retry_scanner() -> None:

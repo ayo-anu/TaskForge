@@ -19,6 +19,7 @@ from taskforge.runs.schema import (
     task_attempt_results,
     task_claim_events,
     task_result_events,
+    task_retry_events,
     task_runs,
     workflow_run_idempotency,
     workflow_run_inputs,
@@ -66,6 +67,7 @@ def test_shared_metadata_registers_run_dispatch_and_claim_foundation_tables() ->
         "task_claim_events",
         "task_attempt_results",
         "task_result_events",
+        "task_retry_events",
         "task_dispatch_outbox",
         "workflow_run_idempotency",
     } <= set(metadata.tables)
@@ -184,6 +186,41 @@ def test_idempotency_scope_is_bound_to_the_same_run_principal_and_workflow() -> 
     assert workflow_run_idempotency.c.created_at.server_default is not None
 
 
+def test_retry_events_use_task_scoped_attempt_foreign_keys_and_server_time() -> None:
+    assert tuple(task_retry_events.c.keys()) == (
+        "id",
+        "task_run_id",
+        "event_type",
+        "failed_attempt_number",
+        "retry_attempt_number",
+        "next_eligible_at",
+        "decision_reason",
+        "occurred_at",
+    )
+    assert foreign_key_shapes(task_retry_events) == {
+        (("task_run_id",), ("task_runs.id",)),
+        (
+            ("task_run_id", "failed_attempt_number"),
+            ("task_attempts.task_run_id", "task_attempts.attempt_number"),
+        ),
+        (
+            ("task_run_id", "retry_attempt_number"),
+            ("task_attempts.task_run_id", "task_attempts.attempt_number"),
+        ),
+    }
+    assert task_retry_events.c.occurred_at.server_default is not None
+    assert "retry_attempt_number = failed_attempt_number + 1" in " ".join(
+        check_texts(task_retry_events)
+    )
+    indexes = {index.name for index in task_retry_events.indexes}
+    assert indexes == {
+        "uq_task_retry_events_scheduled_attempt",
+        "uq_task_retry_events_dispatched_attempt",
+        "uq_task_retry_events_not_scheduled_attempt",
+        "ix_task_retry_events_task_run_id_occurred_at_id",
+    }
+
+
 def test_every_new_constraint_and_index_has_a_deterministic_name() -> None:
     for table in (
         workflow_runs,
@@ -192,6 +229,7 @@ def test_every_new_constraint_and_index_has_a_deterministic_name() -> None:
         task_claim_events,
         task_attempt_results,
         task_result_events,
+        task_retry_events,
         workflow_run_idempotency,
     ):
         assert all(constraint.name for constraint in table.constraints)
