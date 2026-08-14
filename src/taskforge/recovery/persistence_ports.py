@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import StrEnum
+from types import TracebackType
 from typing import Protocol
 
 from taskforge.recovery.domain import (
+    ExpiredClaimCandidate,
     ExpiredClaimCandidatePage,
     ExpiredClaimScanCursor,
+    PreparedExpiredClaimRecovery,
     StaleWorkerSessionCandidatePage,
     StaleWorkerSessionScanCursor,
 )
+from taskforge.retries.domain import RetryNotScheduledReason
+from taskforge.retries.persistence_ports import NewScheduledRetryAttempt
 
 
 class RecoveryScanPersistenceInvariantViolation(Exception):
@@ -32,3 +39,64 @@ class RecoveryCandidateRepository(Protocol):
         limit: int,
         cursor: StaleWorkerSessionScanCursor | None,
     ) -> StaleWorkerSessionCandidatePage: ...
+
+
+class ExpiredClaimRecoveryPersistenceInvariantViolation(Exception):
+    """Durable recovery state violates an established invariant."""
+
+
+class ExpiredClaimRecoveryPersistenceUnavailable(Exception):
+    """Expired-claim recovery persistence is operationally unavailable."""
+
+
+class ExpiredClaimRecoveryNoOpReason(StrEnum):
+    CANDIDATE_NO_LONGER_EXPIRED = "candidate_no_longer_expired"
+    CLAIM_ALREADY_TERMINATED = "claim_already_terminated"
+    ATTEMPT_NO_LONGER_LATEST = "attempt_no_longer_latest"
+    TASK_NOT_ELIGIBLE = "task_not_eligible"
+    WORKFLOW_NOT_ELIGIBLE = "workflow_not_eligible"
+    RESULT_ALREADY_ACCEPTED = "result_already_accepted"
+    ALREADY_RECOVERED = "already_recovered"
+
+
+@dataclass(frozen=True)
+class ExpiredClaimRecoveryNoOp:
+    reason: ExpiredClaimRecoveryNoOpReason
+
+
+ExpiredClaimRecoveryPreparation = (
+    PreparedExpiredClaimRecovery | ExpiredClaimRecoveryNoOp
+)
+
+
+class ExpiredClaimRecoveryTransaction(Protocol):
+    async def prepare_recovery(
+        self, candidate: ExpiredClaimCandidate
+    ) -> ExpiredClaimRecoveryPreparation: ...
+
+    async def schedule_retry(
+        self,
+        prepared: PreparedExpiredClaimRecovery,
+        attempt: NewScheduledRetryAttempt,
+    ) -> None: ...
+
+    async def exhaust(
+        self,
+        prepared: PreparedExpiredClaimRecovery,
+        reason: RetryNotScheduledReason,
+    ) -> None: ...
+
+
+class ExpiredClaimRecoveryTransactionContext(Protocol):
+    async def __aenter__(self) -> ExpiredClaimRecoveryTransaction: ...
+
+    async def __aexit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+
+class ExpiredClaimRecoveryRepository(Protocol):
+    def recovery_transaction(self) -> ExpiredClaimRecoveryTransactionContext: ...

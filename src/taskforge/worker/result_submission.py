@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -23,7 +22,11 @@ from taskforge.worker.result_persistence_ports import (
     TaskResultPersistenceUnavailable,
     TaskResultRepository,
 )
-from taskforge.worker.results import TaskExecutionResult, TaskExecutionResultKind
+from taskforge.worker.results import (
+    TaskExecutionResult,
+    TaskExecutionResultKind,
+    task_result_fingerprint,
+)
 from taskforge.workflows.task_types import (
     MAX_COLLECTION_ITEMS,
     MAX_PARAMETER_DEPTH,
@@ -34,7 +37,6 @@ from taskforge.workflows.task_types import (
 )
 
 MAX_TASK_RESULT_OUTPUT_BYTES = 16 * 1024
-_RESULT_FINGERPRINT_VERSION = 1
 
 
 class TaskResultSubmissionOutcome(StrEnum):
@@ -152,17 +154,11 @@ def prepare_task_result(
         output_bytes = _canonical_json(output)
         if len(output_bytes) > MAX_TASK_RESULT_OUTPUT_BYTES:
             raise TaskResultInvalidOutput("task result output is too large")
-    fingerprint_value: dict[str, JSONValue] = {
-        "version": _RESULT_FINGERPRINT_VERSION,
-        "result_kind": request.result.kind.value,
-        "failure_kind": (
-            request.result.failure_kind.value
-            if request.result.failure_kind is not None
-            else None
-        ),
-        "output": output,
-    }
-    fingerprint = hashlib.sha256(_canonical_json(fingerprint_value)).hexdigest()
+    fingerprint = task_result_fingerprint(
+        result_kind=request.result.kind,
+        failure_kind=request.result.failure_kind,
+        output=output,
+    )
     return PersistableTaskResult(
         request.dispatch_id,
         request.task_run_id,

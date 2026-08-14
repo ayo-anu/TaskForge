@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import AbstractAsyncContextManager
+from copy import deepcopy
 from datetime import datetime
+from types import TracebackType
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import (
     BigInteger,
@@ -14,14 +18,16 @@ from sqlalchemy import (
     and_,
     cast,
     func,
+    insert,
     literal,
     null,
     or_,
     select,
     union_all,
+    update,
 )
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Select
 
@@ -29,22 +35,39 @@ from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
     ExpiredClaimCandidatePage,
     ExpiredClaimScanCursor,
+    PreparedExpiredClaimRecovery,
     StaleWorkerSessionCandidate,
     StaleWorkerSessionCandidatePage,
     StaleWorkerSessionScanCursor,
 )
 from taskforge.recovery.persistence_ports import (
+    ExpiredClaimRecoveryNoOp,
+    ExpiredClaimRecoveryNoOpReason,
+    ExpiredClaimRecoveryPersistenceInvariantViolation,
+    ExpiredClaimRecoveryPersistenceUnavailable,
+    ExpiredClaimRecoveryPreparation,
     RecoveryScanPersistenceInvariantViolation,
     RecoveryScanPersistenceUnavailable,
 )
+from taskforge.retries.domain import RetryEventType, RetryNotScheduledReason
+from taskforge.retries.persistence_ports import NewScheduledRetryAttempt
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
 from taskforge.runs.schema import (
     task_attempt_claims,
+    task_attempt_results,
     task_attempts,
+    task_dispatch_outbox,
+    task_retry_events,
     task_runs,
     workflow_runs,
 )
+from taskforge.worker.results import (
+    TaskExecutionFailureKind,
+    TaskExecutionResultKind,
+    task_result_fingerprint,
+)
 from taskforge.worker.schema import worker_session_health, worker_sessions
+from taskforge.workflows.schema import workflow_version_steps, workflow_versions
 
 
 class SQLAlchemyRecoveryCandidateRepository:
@@ -139,6 +162,368 @@ class SQLAlchemyRecoveryCandidateRepository:
             raise RecoveryScanPersistenceInvariantViolation from error
         except DBAPIError as error:
             raise RecoveryScanPersistenceUnavailable from error
+
+
+class SQLAlchemyExpiredClaimRecoveryRepository:
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    def recovery_transaction(self) -> SQLAlchemyExpiredClaimRecoveryTransaction:
+        return SQLAlchemyExpiredClaimRecoveryTransaction(self._sessions)
+
+
+class SQLAlchemyExpiredClaimRecoveryTransaction:
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+        self._context: AbstractAsyncContextManager[AsyncSession] | None = None
+        self._session: AsyncSession | None = None
+
+    async def __aenter__(self) -> SQLAlchemyExpiredClaimRecoveryTransaction:
+        context = self._sessions.begin()
+        self._context = context
+        try:
+            self._session = await context.__aenter__()
+        except DBAPIError as error:
+            self._context = None
+            raise ExpiredClaimRecoveryPersistenceUnavailable from error
+        return self
+
+    async def __aexit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        context, self._context = self._required_context(), None
+        self._session = None
+        try:
+            await context.__aexit__(exception_type, exception, traceback)
+        except IntegrityError as error:
+            raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise ExpiredClaimRecoveryPersistenceUnavailable from error
+
+    async def prepare_recovery(
+        self, candidate: ExpiredClaimCandidate
+    ) -> ExpiredClaimRecoveryPreparation:
+        session = self._required_session()
+        try:
+            workflow = (
+                await session.execute(
+                    select(workflow_runs.c.id, workflow_runs.c.status)
+                    .where(workflow_runs.c.id == candidate.workflow_run_id)
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if workflow is None:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            task = (
+                await session.execute(
+                    select(
+                        task_runs.c.id,
+                        task_runs.c.workflow_run_id,
+                        task_runs.c.workflow_version_id,
+                        task_runs.c.step_identifier,
+                        task_runs.c.status,
+                    )
+                    .where(task_runs.c.id == candidate.task_run_id)
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if task is None or task.workflow_run_id != workflow.id:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            claim = (
+                await session.execute(
+                    select(
+                        task_attempt_claims.c.worker_session_id,
+                        task_attempt_claims.c.lease_expires_at,
+                        task_attempt_claims.c.terminated_at,
+                    )
+                    .where(
+                        task_attempt_claims.c.task_attempt_id
+                        == candidate.task_attempt_id,
+                        task_attempt_claims.c.generation == candidate.generation,
+                    )
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if claim is None:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+
+            accepted = (
+                await session.execute(
+                    select(
+                        task_attempt_results.c.failure_kind,
+                        task_attempt_results.c.claim_generation,
+                    ).where(
+                        task_attempt_results.c.task_attempt_id
+                        == candidate.task_attempt_id
+                    )
+                )
+            ).one_or_none()
+            if accepted is not None:
+                if (
+                    accepted.failure_kind
+                    == TaskExecutionFailureKind.CLAIM_EXPIRED.value
+                    and accepted.claim_generation == candidate.generation
+                    and claim.lease_expires_at == candidate.lease_expires_at
+                ):
+                    return ExpiredClaimRecoveryNoOp(
+                        ExpiredClaimRecoveryNoOpReason.ALREADY_RECOVERED
+                    )
+                return ExpiredClaimRecoveryNoOp(
+                    ExpiredClaimRecoveryNoOpReason.RESULT_ALREADY_ACCEPTED
+                )
+            if claim.terminated_at is not None:
+                return ExpiredClaimRecoveryNoOp(
+                    ExpiredClaimRecoveryNoOpReason.CLAIM_ALREADY_TERMINATED
+                )
+            if claim.lease_expires_at != candidate.lease_expires_at:
+                return ExpiredClaimRecoveryNoOp(
+                    ExpiredClaimRecoveryNoOpReason.CANDIDATE_NO_LONGER_EXPIRED
+                )
+            if claim.worker_session_id != candidate.worker_session_id:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+
+            attempt = (
+                await session.execute(
+                    select(
+                        task_attempts.c.task_run_id,
+                        task_attempts.c.attempt_number,
+                        task_dispatch_outbox.c.id.label("dispatch_id"),
+                    )
+                    .select_from(
+                        task_attempts.join(
+                            task_dispatch_outbox,
+                            task_dispatch_outbox.c.task_attempt_id
+                            == task_attempts.c.id,
+                        )
+                    )
+                    .where(task_attempts.c.id == candidate.task_attempt_id)
+                )
+            ).one_or_none()
+            if (
+                attempt is None
+                or attempt.task_run_id != candidate.task_run_id
+                or attempt.attempt_number != candidate.attempt_number
+            ):
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            latest = await session.scalar(
+                select(func.max(task_attempts.c.attempt_number)).where(
+                    task_attempts.c.task_run_id == candidate.task_run_id
+                )
+            )
+            if latest != candidate.attempt_number:
+                return ExpiredClaimRecoveryNoOp(
+                    ExpiredClaimRecoveryNoOpReason.ATTEMPT_NO_LONGER_LATEST
+                )
+            if workflow.status not in (
+                WorkflowRunStatus.PENDING.value,
+                WorkflowRunStatus.RUNNING.value,
+            ):
+                return ExpiredClaimRecoveryNoOp(
+                    ExpiredClaimRecoveryNoOpReason.WORKFLOW_NOT_ELIGIBLE
+                )
+            if task.status not in (
+                TaskRunStatus.CLAIMED.value,
+                TaskRunStatus.RUNNING.value,
+            ):
+                return ExpiredClaimRecoveryNoOp(
+                    ExpiredClaimRecoveryNoOpReason.TASK_NOT_ELIGIBLE
+                )
+            recovered_at = await session.scalar(select(func.statement_timestamp()))
+            if not isinstance(recovered_at, datetime):
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            if claim.lease_expires_at > recovered_at:
+                return ExpiredClaimRecoveryNoOp(
+                    ExpiredClaimRecoveryNoOpReason.CANDIDATE_NO_LONGER_EXPIRED
+                )
+            snapshot = (
+                await session.execute(
+                    select(
+                        workflow_versions.c.execution_policy.label("workflow_policy"),
+                        workflow_version_steps.c.execution_policy.label("step_policy"),
+                    )
+                    .select_from(
+                        workflow_versions.join(
+                            workflow_version_steps,
+                            workflow_version_steps.c.workflow_version_id
+                            == workflow_versions.c.id,
+                        )
+                    )
+                    .where(
+                        workflow_versions.c.id == task.workflow_version_id,
+                        workflow_version_steps.c.step_identifier
+                        == task.step_identifier,
+                    )
+                )
+            ).one_or_none()
+            if snapshot is None:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            return PreparedExpiredClaimRecovery(
+                candidate.task_attempt_id,
+                candidate.task_run_id,
+                candidate.workflow_run_id,
+                candidate.attempt_number,
+                candidate.generation,
+                attempt.dispatch_id,
+                claim.lease_expires_at,
+                recovered_at,
+                deepcopy(snapshot.workflow_policy),
+                deepcopy(snapshot.step_policy),
+            )
+        except ExpiredClaimRecoveryPersistenceInvariantViolation:
+            raise
+        except DBAPIError as error:
+            raise ExpiredClaimRecoveryPersistenceUnavailable from error
+
+    async def schedule_retry(
+        self,
+        prepared: PreparedExpiredClaimRecovery,
+        attempt: NewScheduledRetryAttempt,
+    ) -> None:
+        if attempt.attempt_number != prepared.attempt_number + 1:
+            raise ExpiredClaimRecoveryPersistenceInvariantViolation
+        await self._persist_orphan_outcome(prepared)
+        session = self._required_session()
+        try:
+            await session.execute(
+                insert(task_attempts).values(
+                    id=attempt.id,
+                    task_run_id=attempt.task_run_id,
+                    attempt_number=attempt.attempt_number,
+                    next_eligible_at=attempt.next_eligible_at,
+                )
+            )
+            transitioned = (
+                await session.execute(
+                    update(task_runs)
+                    .where(
+                        task_runs.c.id == prepared.task_run_id,
+                        task_runs.c.status.in_(
+                            (TaskRunStatus.CLAIMED.value, TaskRunStatus.RUNNING.value)
+                        ),
+                    )
+                    .values(
+                        status=TaskRunStatus.RETRY_SCHEDULED.value,
+                        updated_at=prepared.recovered_at,
+                    )
+                    .returning(task_runs.c.id)
+                )
+            ).one_or_none()
+            if transitioned is None:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            await session.execute(
+                insert(task_retry_events).values(
+                    id=uuid4(),
+                    task_run_id=prepared.task_run_id,
+                    event_type=RetryEventType.RETRY_SCHEDULED.value,
+                    failed_attempt_number=prepared.attempt_number,
+                    retry_attempt_number=attempt.attempt_number,
+                    next_eligible_at=attempt.next_eligible_at,
+                )
+            )
+        except IntegrityError as error:
+            raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise ExpiredClaimRecoveryPersistenceUnavailable from error
+
+    async def exhaust(
+        self,
+        prepared: PreparedExpiredClaimRecovery,
+        reason: RetryNotScheduledReason,
+    ) -> None:
+        await self._persist_orphan_outcome(prepared)
+        session = self._required_session()
+        try:
+            transitioned = (
+                await session.execute(
+                    update(task_runs)
+                    .where(
+                        task_runs.c.id == prepared.task_run_id,
+                        task_runs.c.status.in_(
+                            (TaskRunStatus.CLAIMED.value, TaskRunStatus.RUNNING.value)
+                        ),
+                    )
+                    .values(
+                        status=TaskRunStatus.FAILED.value,
+                        updated_at=prepared.recovered_at,
+                    )
+                    .returning(task_runs.c.id)
+                )
+            ).one_or_none()
+            if transitioned is None:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            await session.execute(
+                insert(task_retry_events).values(
+                    id=uuid4(),
+                    task_run_id=prepared.task_run_id,
+                    event_type=RetryEventType.RETRY_NOT_SCHEDULED.value,
+                    failed_attempt_number=prepared.attempt_number,
+                    decision_reason=reason.value,
+                )
+            )
+        except IntegrityError as error:
+            raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise ExpiredClaimRecoveryPersistenceUnavailable from error
+
+    async def _persist_orphan_outcome(
+        self, prepared: PreparedExpiredClaimRecovery
+    ) -> None:
+        fingerprint = task_result_fingerprint(
+            result_kind=TaskExecutionResultKind.RETRYABLE_FAILURE,
+            failure_kind=TaskExecutionFailureKind.CLAIM_EXPIRED,
+            output=None,
+        )
+        session = self._required_session()
+        try:
+            # The result FK requires the historical claim to remain present. The
+            # result is inserted before terminating that same immutable generation.
+            await session.execute(
+                insert(task_attempt_results).values(
+                    task_attempt_id=prepared.task_attempt_id,
+                    claim_generation=prepared.generation,
+                    dispatch_id=prepared.dispatch_id,
+                    result_kind=TaskExecutionResultKind.RETRYABLE_FAILURE.value,
+                    failure_kind=TaskExecutionFailureKind.CLAIM_EXPIRED.value,
+                    output=null(),
+                    result_fingerprint=fingerprint,
+                    completed_at=prepared.recovered_at,
+                )
+            )
+            terminated = (
+                await session.execute(
+                    update(task_attempt_claims)
+                    .where(
+                        task_attempt_claims.c.task_attempt_id
+                        == prepared.task_attempt_id,
+                        task_attempt_claims.c.generation == prepared.generation,
+                        task_attempt_claims.c.terminated_at.is_(None),
+                        task_attempt_claims.c.lease_expires_at
+                        == prepared.lease_expires_at,
+                        task_attempt_claims.c.lease_expires_at <= prepared.recovered_at,
+                    )
+                    .values(terminated_at=prepared.recovered_at)
+                    .returning(task_attempt_claims.c.task_attempt_id)
+                )
+            ).one_or_none()
+            if terminated is None:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+        except IntegrityError as error:
+            raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise ExpiredClaimRecoveryPersistenceUnavailable from error
+
+    def _required_session(self) -> AsyncSession:
+        if self._session is None:
+            raise RuntimeError("recovery transaction is not active")
+        return self._session
+
+    def _required_context(self) -> AbstractAsyncContextManager[AsyncSession]:
+        if self._context is None:
+            raise RuntimeError("recovery transaction is not active")
+        return self._context
 
 
 def _reference_expression(reference_time: datetime | None) -> Any:

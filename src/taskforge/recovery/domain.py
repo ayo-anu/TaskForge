@@ -8,6 +8,39 @@ from uuid import UUID
 
 MAX_RECOVERY_SCAN_BATCH_SIZE = 100
 
+type JSONValue = (
+    bool | int | float | str | list[JSONValue] | dict[str, JSONValue] | None
+)
+type JSONMapping = dict[str, JSONValue]
+
+
+@dataclass(frozen=True)
+class PreparedExpiredClaimRecovery:
+    task_attempt_id: UUID
+    task_run_id: UUID
+    workflow_run_id: UUID
+    attempt_number: int
+    generation: int
+    dispatch_id: UUID
+    lease_expires_at: datetime
+    recovered_at: datetime
+    workflow_execution_policy: JSONMapping | None
+    step_execution_policy: JSONMapping | None
+
+    def __post_init__(self) -> None:
+        if self.attempt_number <= 0 or self.generation <= 0:
+            raise ValueError("prepared recovery numbers must be positive")
+        lease_expires_at = _utc(self.lease_expires_at, field="prepared lease expiry")
+        recovered_at = _utc(self.recovered_at, field="recovery time")
+        if lease_expires_at > recovered_at:
+            raise ValueError("prepared claim must be expired")
+        object.__setattr__(self, "lease_expires_at", lease_expires_at)
+        object.__setattr__(
+            self,
+            "recovered_at",
+            recovered_at,
+        )
+
 
 def _utc(value: datetime, *, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:

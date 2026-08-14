@@ -27,7 +27,7 @@ migrations-check:
 migration-test:
 	@test "$${TASKFORGE_RUN_MIGRATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_MIGRATION_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_MIGRATION_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_MIGRATION_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_identity_migrations.py tests/integration/test_workflow_definition_migrations.py tests/integration/test_workflow_run_migrations.py tests/integration/test_task_dispatch_migrations.py tests/integration/test_task_claim_migrations.py tests/integration/test_task_claim_event_migrations.py tests/integration/test_retry_persistence_migrations.py tests/integration/test_retry_event_migrations.py
+	uv run pytest tests/integration/test_identity_migrations.py tests/integration/test_workflow_definition_migrations.py tests/integration/test_workflow_run_migrations.py tests/integration/test_task_dispatch_migrations.py tests/integration/test_task_claim_migrations.py tests/integration/test_task_claim_event_migrations.py tests/integration/test_retry_persistence_migrations.py tests/integration/test_retry_event_migrations.py tests/integration/test_recovery_migrations.py
 
 claim-test:
 	@test "$${TASKFORGE_RUN_CLAIM_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_CLAIM_INTEGRATION=1 is required" >&2; exit 2)
@@ -47,7 +47,7 @@ retry-test:
 recovery-test:
 	@test "$${TASKFORGE_RUN_RECOVERY_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_RECOVERY_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_RECOVERY_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_RECOVERY_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_recovery_scanner.py
+	uv run pytest tests/integration/test_recovery_scanner.py tests/integration/test_recovery_transition.py
 
 authentication-test:
 	@test "$${TASKFORGE_RUN_AUTHENTICATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_AUTHENTICATION_INTEGRATION=1 is required" >&2; exit 2)

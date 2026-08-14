@@ -304,7 +304,8 @@ task_attempt_results = Table(
     CheckConstraint(
         "(result_kind = 'success' AND failure_kind IS NULL) OR "
         "(result_kind = 'retryable_failure' AND failure_kind IN "
-        "('handler_reported', 'handler_exception', 'execution_timeout')) OR "
+        "('handler_reported', 'handler_exception', 'execution_timeout', "
+        "'claim_expired')) OR "
         "(result_kind = 'permanent_failure' AND failure_kind = "
         "'handler_reported') OR "
         "(result_kind = 'cancellation' AND failure_kind IS NULL)",

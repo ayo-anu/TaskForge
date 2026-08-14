@@ -97,6 +97,7 @@ async def add_claim(
     run_status: str = "running",
     terminated: bool = False,
     newer_attempt: bool = False,
+    workflow_policy: str | None = None,
 ) -> ClaimFacts:
     principal_id, workflow_id, version_id, workflow_run_id = (
         uuid4(),
@@ -121,10 +122,11 @@ async def add_claim(
     )
     await connection.execute(
         "INSERT INTO workflow_versions "
-        "(id, workflow_definition_id, version_number, name) "
-        "VALUES ($1, $2, 1, 'recovery-v1')",
+        "(id, workflow_definition_id, version_number, name, execution_policy) "
+        "VALUES ($1, $2, 1, 'recovery-v1', $3::jsonb)",
         version_id,
         workflow_id,
+        workflow_policy,
     )
     await connection.execute(
         "INSERT INTO workflow_version_steps "

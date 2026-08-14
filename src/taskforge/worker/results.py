@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from enum import StrEnum
+
+type JSONValue = (
+    bool | int | float | str | list[JSONValue] | dict[str, JSONValue] | None
+)
+_RESULT_FINGERPRINT_VERSION = 1
 
 
 class TaskExecutionResultKind(StrEnum):
@@ -17,6 +24,30 @@ class TaskExecutionFailureKind(StrEnum):
     HANDLER_REPORTED = "handler_reported"
     HANDLER_EXCEPTION = "handler_exception"
     EXECUTION_TIMEOUT = "execution_timeout"
+    CLAIM_EXPIRED = "claim_expired"
+
+
+def task_result_fingerprint(
+    *,
+    result_kind: TaskExecutionResultKind,
+    failure_kind: TaskExecutionFailureKind | None,
+    output: JSONValue,
+) -> str:
+    """Fingerprint canonical semantic result content, independent of authority."""
+    value = {
+        "version": _RESULT_FINGERPRINT_VERSION,
+        "result_kind": result_kind.value,
+        "failure_kind": failure_kind.value if failure_kind is not None else None,
+        "output": output,
+    }
+    encoded = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)

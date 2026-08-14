@@ -25,7 +25,12 @@ from taskforge.worker.result_submission import (
     TaskResultSubmissionService,
     prepare_task_result,
 )
-from taskforge.worker.results import TaskExecutionResult
+from taskforge.worker.results import (
+    TaskExecutionFailureKind,
+    TaskExecutionResult,
+    TaskExecutionResultKind,
+    task_result_fingerprint,
+)
 
 
 class Repository:
@@ -194,3 +199,14 @@ def test_success_none_and_distinct_output_content_are_fingerprinted() -> None:
     value_result = prepare_task_result(value_request)
     assert null_result.output is None
     assert null_result.result_fingerprint != value_result.result_fingerprint
+
+
+def test_submission_uses_shared_semantic_fingerprint_contract() -> None:
+    _, _, _, submission = request(TaskExecutionResult.retryable_handler_reported())
+    prepared = prepare_task_result(submission)
+
+    assert prepared.result_fingerprint == task_result_fingerprint(
+        result_kind=TaskExecutionResultKind.RETRYABLE_FAILURE,
+        failure_kind=TaskExecutionFailureKind.HANDLER_REPORTED,
+        output=None,
+    )
