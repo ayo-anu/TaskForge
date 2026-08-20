@@ -5,6 +5,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from taskforge.dead_letters.domain import (
+    CreatedDeadLetterRedrive,
     DeadLetterActionCursor,
     DeadLetterActionPage,
     DeadLetterCursor,
@@ -12,6 +13,7 @@ from taskforge.dead_letters.domain import (
     DeadLetterFilters,
     DeadLetterPage,
     DeadLetterStatus,
+    create_dead_letter_redrive_idempotency,
 )
 from taskforge.dead_letters.persistence_ports import DeadLetterRepository
 from taskforge.identity.authorization import OwnerFilter
@@ -95,6 +97,35 @@ class DeadLetterService:
             reason=reason,
             correlation_id=correlation_id,
         )
+
+    async def redrive(
+        self,
+        item_id: UUID,
+        owner_filter: OwnerFilter,
+        *,
+        operator_principal_id: UUID,
+        idempotency_key: object,
+        reason: str | None,
+        correlation_id: UUID,
+    ) -> CreatedDeadLetterRedrive:
+        normalized_reason = reason.strip() if reason is not None else None
+        idempotency = create_dead_letter_redrive_idempotency(
+            idempotency_key,
+            dead_letter_item_id=item_id,
+            requested_by_principal_id=operator_principal_id,
+            reason=normalized_reason,
+        )
+        result = await self._repository.redrive(
+            item_id,
+            owner_filter,
+            operator_principal_id=operator_principal_id,
+            idempotency=idempotency,
+            reason=normalized_reason,
+            correlation_id=correlation_id,
+        )
+        if result is None:
+            raise DeadLetterNotFound
+        return result
 
     async def _transition(
         self,

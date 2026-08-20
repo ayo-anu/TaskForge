@@ -193,6 +193,18 @@ dead_letter_redrive_requests = Table(
     ),
     Column("idempotency_key_digest", String(64), nullable=False),
     Column("request_fingerprint", String(64), nullable=False),
+    Column(
+        "target_workflow_run_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "workflow_runs.id",
+            name="fk_dead_letter_redrive_requests_target_run",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column("reason", Text, nullable=True),
     Column("correlation_id", UUID(as_uuid=True), nullable=True),
     Column(
         "requested_at",
@@ -206,6 +218,14 @@ dead_letter_redrive_requests = Table(
         "idempotency_key_digest",
         name="uq_dead_letter_redrive_requests_item_requester_key",
     ),
+    UniqueConstraint(
+        "dead_letter_item_id",
+        name="uq_dead_letter_redrive_requests_item",
+    ),
+    UniqueConstraint(
+        "target_workflow_run_id",
+        name="uq_dead_letter_redrive_requests_target_run",
+    ),
     CheckConstraint(
         "idempotency_key_digest ~ '^[0-9a-f]{64}$'",
         name="key_digest_valid",
@@ -213,6 +233,10 @@ dead_letter_redrive_requests = Table(
     CheckConstraint(
         "request_fingerprint ~ '^[0-9a-f]{64}$'",
         name="fingerprint_valid",
+    ),
+    CheckConstraint(
+        "reason IS NULL OR length(btrim(reason)) BETWEEN 1 AND 2000",
+        name="reason_valid",
     ),
 )
 Index(

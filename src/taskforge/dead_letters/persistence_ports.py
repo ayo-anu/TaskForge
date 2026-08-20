@@ -6,12 +6,14 @@ from typing import Protocol
 from uuid import UUID
 
 from taskforge.dead_letters.domain import (
+    CreatedDeadLetterRedrive,
     DeadLetterActionCursor,
     DeadLetterActionPage,
     DeadLetterCursor,
     DeadLetterDetail,
     DeadLetterFilters,
     DeadLetterPage,
+    DeadLetterRedriveIdempotency,
     DeadLetterStatus,
 )
 from taskforge.identity.authorization import OwnerFilter
@@ -27,6 +29,14 @@ class DeadLetterPersistenceInvariantViolation(Exception):
 
 class DeadLetterTransitionConflict(Exception):
     """The requested command is invalid for the current status."""
+
+
+class DeadLetterRedriveNotEligible(Exception):
+    """The item or its source execution is not eligible for a new redrive."""
+
+
+class DeadLetterRedriveLimitExceeded(Exception):
+    """The item already owns a successfully materialized redrive."""
 
 
 class DeadLetterRepository(Protocol):
@@ -62,3 +72,14 @@ class DeadLetterRepository(Protocol):
         reason: str | None,
         correlation_id: UUID,
     ) -> DeadLetterDetail | None: ...
+
+    async def redrive(
+        self,
+        item_id: UUID,
+        owner_filter: OwnerFilter,
+        *,
+        operator_principal_id: UUID,
+        idempotency: DeadLetterRedriveIdempotency,
+        reason: str | None,
+        correlation_id: UUID,
+    ) -> CreatedDeadLetterRedrive | None: ...

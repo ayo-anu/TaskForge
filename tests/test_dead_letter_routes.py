@@ -13,6 +13,7 @@ from taskforge.api.dead_letters import (
     _encode_item_cursor,
 )
 from taskforge.dead_letters.domain import (
+    CreatedDeadLetterRedrive,
     DeadLetterActionPage,
     DeadLetterCursor,
     DeadLetterDetail,
@@ -21,6 +22,7 @@ from taskforge.dead_letters.domain import (
     DeadLetterReason,
     DeadLetterStatus,
     DeadLetterSummary,
+    InvalidDeadLetterRedriveIdempotencyKey,
 )
 from taskforge.dead_letters.persistence_ports import DeadLetterTransitionConflict
 from taskforge.dead_letters.service import DeadLetterNotFound
@@ -55,6 +57,19 @@ class DeadLetterServiceStub:
             retry_decision_reason=None,
         )
         self.principal_id = principal_id
+        self.redrive_result = CreatedDeadLetterRedrive(
+            uuid4(),
+            self.summary.id,
+            self.summary.workflow_run_id,
+            self.summary.task_run_id,
+            self.summary.source_task_attempt_id,
+            uuid4(),
+            self.detail.workflow_definition_id,
+            self.detail.workflow_version_id,
+            principal_id,
+            None,
+            now,
+        )
 
     def _raise(self) -> None:
         if self.error:
@@ -99,6 +114,13 @@ class DeadLetterServiceStub:
         self.calls.append(("resolve", item_id, owner_filter, kwargs))
         self._raise()
         return self.detail
+
+    async def redrive(
+        self, item_id: UUID, owner_filter: OwnerFilter, **kwargs: Any
+    ) -> CreatedDeadLetterRedrive:
+        self.calls.append(("redrive", item_id, owner_filter, kwargs))
+        self._raise()
+        return self.redrive_result
 
 
 def dlq_app(roles: frozenset[str]) -> tuple[Any, Runtime, DeadLetterServiceStub]:
@@ -194,6 +216,67 @@ def test_admin_list_uses_unrestricted_scope() -> None:
     response = request(app, "GET", "/api/v1/dead-letters", runtime.api_credential)
     assert response.status_code == 200
     assert service.calls[0][1] == OwnerFilter.all_owners()
+
+
+def test_redrive_requires_operator_and_idempotency_key() -> None:
+    app, runtime, service = dlq_app(frozenset({Role.VIEWER.value}))
+    denied = request(
+        app,
+        "POST",
+        f"/api/v1/dead-letters/{service.summary.id}/redrive",
+        runtime.api_credential,
+        json={},
+        headers={"Idempotency-Key": "abcdefghijklmnop"},
+    )
+    assert denied.status_code == 403
+    assert not service.calls
+
+    app, runtime, service = dlq_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    service.error = InvalidDeadLetterRedriveIdempotencyKey()
+    missing = request(
+        app,
+        "POST",
+        f"/api/v1/dead-letters/{service.summary.id}/redrive",
+        runtime.api_credential,
+        json={},
+    )
+    assert missing.status_code == 422
+    assert service.calls[0][3]["idempotency_key"] is None
+
+
+def test_redrive_returns_lineage_location_and_owner_scope() -> None:
+    app, runtime, service = dlq_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/dead-letters/{service.summary.id}/redrive",
+        runtime.api_credential,
+        json={"reason": "  corrected configuration  "},
+        headers={"Idempotency-Key": "abcdefghijklmnop"},
+    )
+    assert response.status_code == 201
+    assert response.headers["Location"].endswith(
+        str(service.redrive_result.target_workflow_run_id)
+    )
+    call = service.calls[0]
+    assert call[2] == OwnerFilter.only(runtime.principal_id)
+    assert call[3]["reason"] == "corrected configuration"
+    assert call[3]["idempotency_key"] == "abcdefghijklmnop"
+    assert "idempotency" not in response.text
+
+
+def test_admin_redrive_uses_unrestricted_scope() -> None:
+    app, runtime, service = dlq_app(frozenset({Role.ADMINISTRATOR.value}))
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/dead-letters/{service.summary.id}/redrive",
+        runtime.api_credential,
+        json={},
+        headers={"Idempotency-Key": "abcdefghijklmnop"},
+    )
+    assert response.status_code == 201
+    assert service.calls[0][2] == OwnerFilter.all_owners()
 
 
 def test_cursor_binds_filters_but_not_principal() -> None:

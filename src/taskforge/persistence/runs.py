@@ -505,52 +505,13 @@ class SQLAlchemyWorkflowRunCreationTransaction:
             raise ValueError("prepared creation has no workflow version snapshot")
         session = self._required_session()
         try:
-            row = (
-                await session.execute(
-                    insert(workflow_runs)
-                    .values(
-                        id=run.id,
-                        workflow_definition_id=prepared.workflow_definition_id,
-                        workflow_version_id=snapshot.workflow_version_id,
-                        requested_by_principal_id=run.requested_by_principal_id,
-                        status=run.status.value,
-                    )
-                    .returning(
-                        workflow_runs.c.created_at,
-                        workflow_runs.c.updated_at,
-                    )
-                )
-            ).one()
-            await session.execute(
-                insert(workflow_run_inputs).values(
-                    workflow_run_id=run.id,
-                    payload=input_snapshot.payload,
-                    input_references=input_snapshot.input_references,
-                )
+            timestamps = await insert_complete_workflow_run(
+                session,
+                prepared,
+                run,
+                input_snapshot,
+                task_run_values,
             )
-            if task_run_values:
-                await session.execute(
-                    insert(task_runs),
-                    [
-                        {
-                            "id": task.id,
-                            "workflow_run_id": run.id,
-                            "workflow_version_id": snapshot.workflow_version_id,
-                            "step_identifier": task.step_identifier,
-                            "status": task.status.value,
-                            "deadline_at": (
-                                row.created_at
-                                + timedelta(seconds=task.deadline_seconds)
-                                if task.deadline_seconds is not None
-                                else None
-                            ),
-                            "execution_timeout_seconds": (
-                                task.execution_timeout_seconds
-                            ),
-                        }
-                        for task in task_run_values
-                    ],
-                )
             if idempotency is not None:
                 await session.execute(
                     insert(workflow_run_idempotency).values(
@@ -567,7 +528,7 @@ class SQLAlchemyWorkflowRunCreationTransaction:
             raise WorkflowRunRecordConflict from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
-        return WorkflowRunTimestamps(row.created_at, row.updated_at)
+        return timestamps
 
     async def commit(self) -> None:
         try:
@@ -599,6 +560,110 @@ def _locked_version_statement(
             workflow_versions.c.version_number == selection.version_number
         )
     return statement.order_by(workflow_versions.c.version_number.desc()).limit(1)
+
+
+async def load_exact_workflow_version_snapshot(
+    session: AsyncSession,
+    workflow_definition_id: UUID,
+    workflow_version_id: UUID,
+) -> WorkflowRunVersionSnapshot | None:
+    """Load one exact immutable version using the caller's transaction."""
+    version = (
+        await session.execute(
+            select(
+                workflow_versions.c.id,
+                workflow_versions.c.workflow_definition_id,
+                workflow_versions.c.version_number,
+                workflow_versions.c.execution_policy,
+            ).where(
+                workflow_versions.c.id == workflow_version_id,
+                workflow_versions.c.workflow_definition_id == workflow_definition_id,
+            )
+        )
+    ).one_or_none()
+    if version is None:
+        return None
+    steps = (
+        await session.execute(
+            select(
+                workflow_version_steps.c.step_identifier,
+                workflow_version_steps.c.execution_policy,
+            )
+            .where(workflow_version_steps.c.workflow_version_id == workflow_version_id)
+            .order_by(workflow_version_steps.c.step_identifier)
+        )
+    ).all()
+    dependencies = (
+        await session.execute(
+            select(
+                workflow_version_dependencies.c.predecessor_step_identifier,
+                workflow_version_dependencies.c.successor_step_identifier,
+            )
+            .where(
+                workflow_version_dependencies.c.workflow_version_id
+                == workflow_version_id
+            )
+            .order_by(
+                workflow_version_dependencies.c.predecessor_step_identifier,
+                workflow_version_dependencies.c.successor_step_identifier,
+            )
+        )
+    ).all()
+    return _creation_snapshot(version, steps, dependencies)
+
+
+async def insert_complete_workflow_run(
+    session: AsyncSession,
+    prepared: PreparedWorkflowRunCreation,
+    run: NewWorkflowRun,
+    input_snapshot: WorkflowRunInput,
+    task_run_values: tuple[NewTaskRun, ...],
+) -> WorkflowRunTimestamps:
+    """Insert one complete run graph without owning or committing the transaction."""
+    snapshot = prepared.snapshot
+    if snapshot is None:
+        raise ValueError("prepared creation has no workflow version snapshot")
+    row = (
+        await session.execute(
+            insert(workflow_runs)
+            .values(
+                id=run.id,
+                workflow_definition_id=prepared.workflow_definition_id,
+                workflow_version_id=snapshot.workflow_version_id,
+                requested_by_principal_id=run.requested_by_principal_id,
+                status=run.status.value,
+            )
+            .returning(workflow_runs.c.created_at, workflow_runs.c.updated_at)
+        )
+    ).one()
+    await session.execute(
+        insert(workflow_run_inputs).values(
+            workflow_run_id=run.id,
+            payload=input_snapshot.payload,
+            input_references=input_snapshot.input_references,
+        )
+    )
+    if task_run_values:
+        await session.execute(
+            insert(task_runs),
+            [
+                {
+                    "id": task.id,
+                    "workflow_run_id": run.id,
+                    "workflow_version_id": snapshot.workflow_version_id,
+                    "step_identifier": task.step_identifier,
+                    "status": task.status.value,
+                    "deadline_at": (
+                        row.created_at + timedelta(seconds=task.deadline_seconds)
+                        if task.deadline_seconds is not None
+                        else None
+                    ),
+                    "execution_timeout_seconds": task.execution_timeout_seconds,
+                }
+                for task in task_run_values
+            ],
+        )
+    return WorkflowRunTimestamps(row.created_at, row.updated_at)
 
 
 def _definition_lock_statement(

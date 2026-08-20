@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -25,6 +28,51 @@ class DeadLetterStatus(StrEnum):
 class DeadLetterActionType(StrEnum):
     ACKNOWLEDGED = "acknowledged"
     RESOLVED = "resolved"
+
+
+class InvalidDeadLetterRedriveIdempotencyKey(ValueError):
+    """A redrive idempotency key is not a bounded opaque token."""
+
+
+class DeadLetterRedriveIdempotencyConflict(Exception):
+    """A scoped redrive key was reused for a different request."""
+
+
+@dataclass(frozen=True, repr=False)
+class DeadLetterRedriveIdempotency:
+    key_digest: str
+    request_fingerprint: str
+
+    def __repr__(self) -> str:
+        return (
+            "DeadLetterRedriveIdempotency(key_digest=<redacted>, "
+            "request_fingerprint=<redacted>)"
+        )
+
+
+@dataclass(frozen=True)
+class DeadLetterRedriveSummary:
+    id: UUID
+    target_workflow_run_id: UUID
+    requested_by_principal_id: UUID
+    reason: str | None
+    requested_at: datetime
+    target_workflow_run_status: str
+
+
+@dataclass(frozen=True)
+class CreatedDeadLetterRedrive:
+    id: UUID
+    dead_letter_item_id: UUID
+    source_workflow_run_id: UUID
+    source_task_run_id: UUID
+    source_task_attempt_id: UUID
+    target_workflow_run_id: UUID
+    workflow_definition_id: UUID
+    workflow_version_id: UUID
+    requested_by_principal_id: UUID
+    reason: str | None
+    requested_at: datetime
 
 
 @dataclass(frozen=True)
@@ -95,6 +143,7 @@ class DeadLetterDetail(DeadLetterSummary):
     result_kind: TaskExecutionResultKind
     failure_kind: TaskExecutionFailureKind | None
     retry_decision_reason: RetryNotScheduledReason | None
+    redrive: DeadLetterRedriveSummary | None = None
 
 
 @dataclass(frozen=True)
@@ -120,3 +169,48 @@ class DeadLetterOperatorAction:
 class DeadLetterActionPage:
     items: tuple[DeadLetterOperatorAction, ...]
     next_cursor: DeadLetterActionCursor | None
+
+
+def create_dead_letter_redrive_idempotency(
+    key: object,
+    *,
+    dead_letter_item_id: UUID,
+    requested_by_principal_id: UUID,
+    reason: str | None,
+) -> DeadLetterRedriveIdempotency:
+    """Validate an opaque key and fingerprint one normalized redrive command."""
+    if (
+        not isinstance(key, str)
+        or not 16 <= len(key) <= 128
+        or any(not 0x21 <= ord(character) <= 0x7E for character in key)
+    ):
+        raise InvalidDeadLetterRedriveIdempotencyKey
+    normalized_reason = reason.strip() if reason is not None else None
+    normalized = {
+        "dead_letter_item_id": str(dead_letter_item_id),
+        "operation": "dead_letter_redrive",
+        "reason": normalized_reason,
+        "requested_by_principal_id": str(requested_by_principal_id),
+        "schema_version": 1,
+    }
+    encoded = json.dumps(
+        normalized,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return DeadLetterRedriveIdempotency(
+        key_digest=_sha256(b"taskforge:dead-letter-redrive-key:v1\0" + key.encode()),
+        request_fingerprint=_sha256(
+            b"taskforge:dead-letter-redrive-request:v1\0" + encoded
+        ),
+    )
+
+
+def redrive_fingerprints_match(left: str, right: str) -> bool:
+    return hmac.compare_digest(left, right)
+
+
+def _sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()

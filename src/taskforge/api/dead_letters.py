@@ -9,12 +9,22 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Protocol, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from taskforge.api.authorization import require_permission
 from taskforge.api.errors import ErrorDetail, ErrorResponse, error_response
 from taskforge.dead_letters.domain import (
+    CreatedDeadLetterRedrive,
     DeadLetterActionCursor,
     DeadLetterActionPage,
     DeadLetterActionType,
@@ -24,12 +34,16 @@ from taskforge.dead_letters.domain import (
     DeadLetterOperatorAction,
     DeadLetterPage,
     DeadLetterReason,
+    DeadLetterRedriveIdempotencyConflict,
     DeadLetterStatus,
     DeadLetterSummary,
+    InvalidDeadLetterRedriveIdempotencyKey,
 )
 from taskforge.dead_letters.persistence_ports import (
     DeadLetterPersistenceInvariantViolation,
     DeadLetterPersistenceUnavailable,
+    DeadLetterRedriveLimitExceeded,
+    DeadLetterRedriveNotEligible,
     DeadLetterTransitionConflict,
 )
 from taskforge.dead_letters.service import DeadLetterNotFound, DeadLetterService
@@ -61,6 +75,15 @@ class DeadLetterSummaryResponse(BaseModel):
     source_attempt_number: int
 
 
+class DeadLetterRedriveSummaryResponse(BaseModel):
+    id: UUID
+    target_workflow_run_id: UUID
+    requested_by_principal_id: UUID
+    reason: str | None
+    requested_at: datetime
+    target_workflow_run_status: str
+
+
 class DeadLetterDetailResponse(DeadLetterSummaryResponse):
     workflow_definition_id: UUID
     workflow_version_id: UUID
@@ -68,6 +91,7 @@ class DeadLetterDetailResponse(DeadLetterSummaryResponse):
     result_kind: TaskExecutionResultKind
     failure_kind: TaskExecutionFailureKind | None
     retry_decision_reason: RetryNotScheduledReason | None
+    redrive: DeadLetterRedriveSummaryResponse | None = None
 
 
 class DeadLetterListResponse(BaseModel):
@@ -114,6 +138,32 @@ class ResolveRequest(BaseModel):
         if not value.strip():
             raise ValueError("reason must not be blank")
         return value
+
+
+class RedriveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: Annotated[str | None, Field(max_length=2000)] = None
+
+    @field_validator("reason")
+    @classmethod
+    def reason_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("reason must not be blank")
+        return value.strip() if value is not None else None
+
+
+class DeadLetterRedriveResponse(BaseModel):
+    id: UUID
+    dead_letter_item_id: UUID
+    source_workflow_run_id: UUID
+    source_task_run_id: UUID
+    source_task_attempt_id: UUID
+    target_workflow_run_id: UUID
+    workflow_definition_id: UUID
+    workflow_version_id: UUID
+    requested_by_principal_id: UUID
+    reason: str | None
+    requested_at: datetime
 
 
 class DeadLetterRuntimeProtocol(Protocol):
@@ -269,6 +319,80 @@ async def resolve_dead_letter(
     return await _command(item_id, body.reason, True, request, context)
 
 
+@router.post(
+    "/{item_id}/redrive",
+    response_model=DeadLetterRedriveResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=COMMON_RESPONSES,
+)
+async def redrive_dead_letter(
+    item_id: UUID,
+    body: RedriveRequest,
+    request: Request,
+    response: Response,
+    context: Annotated[
+        AuthorizationContext, Depends(require_permission(Permission.OPERATE_WORKFLOW))
+    ],
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", max_length=128)
+    ] = None,
+) -> DeadLetterRedriveResponse | Response:
+    try:
+        redrive = await _runtime(request).dead_letter_service.redrive(
+            item_id,
+            context.owner_filter_for(Permission.OPERATE_WORKFLOW),
+            operator_principal_id=context.principal_id,
+            idempotency_key=idempotency_key,
+            reason=body.reason,
+            correlation_id=cast(UUID, request.state.request_id),
+        )
+    except InvalidDeadLetterRedriveIdempotencyKey:
+        return error_response(
+            request,
+            status_code=422,
+            code="validation_failed",
+            message="The request is invalid.",
+            details=(
+                ErrorDetail(
+                    code="invalid_idempotency_key",
+                    path=["header", "Idempotency-Key"],
+                    message="Idempotency-Key must be 16-128 printable ASCII characters.",
+                ),
+            ),
+        )
+    except DeadLetterNotFound as error:
+        raise HTTPException(status_code=404) from error
+    except DeadLetterRedriveIdempotencyConflict:
+        return error_response(
+            request,
+            status_code=409,
+            code="idempotency_conflict",
+            message="The idempotency key conflicts with an earlier request.",
+        )
+    except DeadLetterRedriveNotEligible:
+        return error_response(
+            request,
+            status_code=409,
+            code="dead_letter_not_redrivable",
+            message="The dead-letter item is not eligible for redrive.",
+        )
+    except DeadLetterRedriveLimitExceeded:
+        return error_response(
+            request,
+            status_code=409,
+            code="redrive_limit_exceeded",
+            message="The dead-letter item already has a redrive.",
+        )
+    except DeadLetterPersistenceInvariantViolation as error:
+        raise HTTPException(status_code=500) from error
+    except DeadLetterPersistenceUnavailable as error:
+        raise HTTPException(status_code=503) from error
+    response.headers["Location"] = (
+        f"/api/v1/workflow-runs/{redrive.target_workflow_run_id}"
+    )
+    return _redrive_response(redrive)
+
+
 async def _command(
     item_id: UUID,
     reason: str | None,
@@ -322,6 +446,10 @@ def _detail_response(item: DeadLetterDetail) -> DeadLetterDetailResponse:
 
 def _action_response(item: DeadLetterOperatorAction) -> DeadLetterActionResponse:
     return DeadLetterActionResponse(**item.__dict__)
+
+
+def _redrive_response(item: CreatedDeadLetterRedrive) -> DeadLetterRedriveResponse:
+    return DeadLetterRedriveResponse(**item.__dict__)
 
 
 def _list_response(
