@@ -9,6 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from taskforge.claims.service import TaskClaimInspectionService
+from taskforge.dead_letters.service import DeadLetterService
 from taskforge.identity.authentication import (
     APIAuthenticator,
     AuthenticatedAPIPrincipal,
@@ -31,6 +32,7 @@ from taskforge.persistence.authentication import (
 from taskforge.persistence.authorization import SQLAlchemyPrincipalRoleRepository
 from taskforge.persistence.claims import SQLAlchemyTaskClaimInspectionRepository
 from taskforge.persistence.database import build_async_engine, build_session_factory
+from taskforge.persistence.dead_letter_operations import SQLAlchemyDeadLetterRepository
 from taskforge.persistence.principals import SQLAlchemyPrincipalProfileRepository
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.persistence.workers import (
@@ -83,6 +85,7 @@ class AuthenticationRuntime:
         worker_inspection_service: WorkerInspectionService,
         worker_capability_service: WorkerCapabilityService,
         task_claim_inspection_service: TaskClaimInspectionService,
+        dead_letter_service: DeadLetterService,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
@@ -97,6 +100,7 @@ class AuthenticationRuntime:
         self.worker_inspection_service = worker_inspection_service
         self.worker_capability_service = worker_capability_service
         self.task_claim_inspection_service = task_claim_inspection_service
+        self.dead_letter_service = dead_letter_service
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -156,6 +160,7 @@ def build_authentication_runtime(
         task_claim_inspection_service=TaskClaimInspectionService(
             SQLAlchemyTaskClaimInspectionRepository(sessions)
         ),
+        dead_letter_service=DeadLetterService(SQLAlchemyDeadLetterRepository(sessions)),
     )
 
 

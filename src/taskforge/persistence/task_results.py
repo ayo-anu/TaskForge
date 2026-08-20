@@ -8,11 +8,11 @@ from sqlalchemy import func, insert, null, or_, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.dead_letters.domain import DeadLetterReason
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.schema import worker_credentials, worker_identities
 from taskforge.persistence.dead_letters import (
     DeadLetterPersistenceInvariantViolation,
-    DeadLetterReason,
     ensure_dead_letter,
 )
 from taskforge.runs.domain import TaskRunStatus

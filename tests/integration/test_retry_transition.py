@@ -17,11 +17,11 @@ from alembic.config import Config
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from taskforge.dead_letters.domain import DeadLetterReason
 from taskforge.persistence.database import build_session_factory
 from taskforge.persistence.dead_letters import (
     DeadLetterInsertOutcome,
     DeadLetterPersistenceInvariantViolation,
-    DeadLetterReason,
     ensure_dead_letter,
 )
 from taskforge.persistence.retries import SQLAlchemyRetryTransitionRepository

@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from taskforge.dead_letters.domain import DeadLetterReason
 from taskforge.dead_letters.schema import dead_letter_items, dead_letter_status
 from taskforge.runs.schema import (
     task_attempt_results,
@@ -17,11 +18,6 @@ from taskforge.runs.schema import (
     task_retry_events,
 )
 from taskforge.worker.results import TaskExecutionResultKind
-
-
-class DeadLetterReason(StrEnum):
-    PERMANENT_FAILURE = "permanent_failure"
-    RETRY_EXHAUSTED = "retry_exhausted"
 
 
 class DeadLetterInsertOutcome(StrEnum):

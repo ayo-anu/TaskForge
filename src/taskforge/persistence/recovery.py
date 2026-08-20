@@ -31,9 +31,9 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Select
 
+from taskforge.dead_letters.domain import DeadLetterReason
 from taskforge.persistence.dead_letters import (
     DeadLetterPersistenceInvariantViolation,
-    DeadLetterReason,
     ensure_dead_letter,
 )
 from taskforge.recovery.domain import (
