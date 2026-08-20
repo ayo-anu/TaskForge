@@ -106,6 +106,7 @@ async def add_dispatched_task(
     status: str = "dispatched",
     attempt_number: int = 1,
     persist_dispatch: bool = True,
+    workflow_policy: str | None = None,
 ) -> DispatchEnvelope:
     principal_id, workflow_id, version_id, run_id = (
         uuid4(),
@@ -128,9 +129,11 @@ async def add_dispatched_task(
     )
     await connection.execute(
         "INSERT INTO workflow_versions "
-        "(id, workflow_definition_id, version_number, name) VALUES ($1, $2, 1, 'v1')",
+        "(id, workflow_definition_id, version_number, name, execution_policy) "
+        "VALUES ($1, $2, 1, 'v1', $3::jsonb)",
         version_id,
         workflow_id,
+        workflow_policy,
     )
     await connection.execute(
         "INSERT INTO workflow_version_steps "
