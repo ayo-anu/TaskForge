@@ -236,6 +236,11 @@ task_attempts = Table(
         "attempt_number",
         name="uq_task_attempts_task_run_id_attempt_number",
     ),
+    UniqueConstraint(
+        "task_run_id",
+        "id",
+        name="uq_task_attempts_task_run_id_id",
+    ),
     CheckConstraint(
         "attempt_number > 0",
         name="attempt_number_positive",

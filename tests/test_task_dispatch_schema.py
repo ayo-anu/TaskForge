@@ -30,7 +30,10 @@ def test_task_attempt_identity_numbering_and_ownership_are_constrained() -> None
     assert task_attempts.c.attempt_number.nullable is False
     assert task_attempts.c.created_at.nullable is False
     assert task_attempts.c.created_at.server_default is not None
-    assert _unique_column_sets(task_attempts) == {("task_run_id", "attempt_number")}
+    assert _unique_column_sets(task_attempts) == {
+        ("task_run_id", "attempt_number"),
+        ("task_run_id", "id"),
+    }
     assert _foreign_key_shapes(task_attempts) == {
         (("task_run_id",), ("task_runs.id",), "RESTRICT", "RESTRICT")
     }
