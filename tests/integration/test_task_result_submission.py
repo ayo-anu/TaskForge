@@ -27,7 +27,7 @@ from taskforge.worker.result_submission import (
     TaskResultSubmissionRequest,
     TaskResultSubmissionService,
 )
-from taskforge.worker.results import TaskExecutionResult
+from taskforge.worker.results import TaskExecutionResult, TaskExecutionResultKind
 from tests.integration.postgresql import (
     asyncpg_dsn,
     migration_database_url,
@@ -236,6 +236,38 @@ async def exercise_results(database_url: URL) -> None:
                 expected_failure,
                 "running",
             )
+            dead_letter = await setup.fetchrow(
+                "SELECT d.task_run_id, d.source_task_attempt_id, d.reason, "
+                "s.status FROM dead_letter_items d JOIN dead_letter_status s "
+                "ON s.dead_letter_item_id = d.id "
+                "WHERE d.source_task_attempt_id = $1",
+                outcome_dispatch.task_attempt_id,
+            )
+            if normalized.kind is TaskExecutionResultKind.PERMANENT_FAILURE:
+                assert tuple(dead_letter) == (
+                    outcome_dispatch.task_run_id,
+                    outcome_dispatch.task_attempt_id,
+                    "permanent_failure",
+                    "open",
+                )
+                replayed = await result_service.submit_result(
+                    outcome_worker.authenticated,
+                    outcome_worker.session_id,
+                    submission(outcome_dispatch, outcome_claim, normalized),
+                )
+                assert (
+                    replayed.outcome is TaskResultSubmissionOutcome.REPLAYED_IDENTICAL
+                )
+                assert (
+                    await setup.fetchval(
+                        "SELECT count(*) FROM dead_letter_items "
+                        "WHERE source_task_attempt_id = $1",
+                        outcome_dispatch.task_attempt_id,
+                    )
+                    == 1
+                )
+            else:
+                assert dead_letter is None
 
         stale_worker, stale_dispatch, stale_claim = await claimed_running_task(
             setup, claim_service
@@ -375,6 +407,48 @@ async def exercise_results(database_url: URL) -> None:
             rollback_dispatch.task_attempt_id,
         )
         assert tuple(rollback_state) == ("running", None, False)
+        await setup.execute(
+            "DROP TRIGGER reject_result_event_trigger ON task_result_events"
+        )
+        await setup.execute("DROP FUNCTION reject_result_event()")
+
+        (
+            permanent_worker,
+            permanent_dispatch,
+            permanent_claim,
+        ) = await claimed_running_task(setup, claim_service)
+        await setup.execute(
+            "CREATE FUNCTION reject_dead_letter_status() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION "
+            "'forced dead-letter rollback'; END $$"
+        )
+        await setup.execute(
+            "CREATE TRIGGER reject_dead_letter_status_trigger BEFORE INSERT ON "
+            "dead_letter_status FOR EACH ROW EXECUTE FUNCTION "
+            "reject_dead_letter_status()"
+        )
+        with pytest.raises(TaskResultServiceUnavailable):
+            await result_service.submit_result(
+                permanent_worker.authenticated,
+                permanent_worker.session_id,
+                submission(
+                    permanent_dispatch,
+                    permanent_claim,
+                    TaskExecutionResult.permanent_failure(),
+                ),
+            )
+        assert tuple(
+            await setup.fetchrow(
+                "SELECT tr.status::text, c.terminated_at, "
+                "EXISTS (SELECT FROM task_attempt_results r WHERE "
+                "r.task_attempt_id = $1), EXISTS (SELECT FROM dead_letter_items d "
+                "WHERE d.source_task_attempt_id = $1) FROM task_runs tr "
+                "JOIN task_attempts a ON a.task_run_id = tr.id "
+                "JOIN task_attempt_claims c ON c.task_attempt_id = a.id "
+                "WHERE a.id = $1",
+                permanent_dispatch.task_attempt_id,
+            )
+        ) == ("running", None, False, False)
     finally:
         await setup.close()
         await engine.dispose()

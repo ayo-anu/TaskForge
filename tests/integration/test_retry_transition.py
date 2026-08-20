@@ -18,6 +18,12 @@ from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from taskforge.persistence.database import build_session_factory
+from taskforge.persistence.dead_letters import (
+    DeadLetterInsertOutcome,
+    DeadLetterPersistenceInvariantViolation,
+    DeadLetterReason,
+    ensure_dead_letter,
+)
 from taskforge.persistence.retries import SQLAlchemyRetryTransitionRepository
 from taskforge.retries.service import (
     RetryTransitionInvariantError,
@@ -189,9 +195,8 @@ async def exercise_retry_transitions(database_url: URL) -> None:
         ),
         pool_size=4,
     )
-    service = RetryTransitionService(
-        SQLAlchemyRetryTransitionRepository(build_session_factory(engine))
-    )
+    sessions = build_session_factory(engine)
+    service = RetryTransitionService(SQLAlchemyRetryTransitionRepository(sessions))
     try:
         workflow = await add_retry_pending_task(
             setup, workflow_policy={"retry_policy": retry_policy()}
@@ -216,6 +221,14 @@ async def exercise_retry_transitions(database_url: URL) -> None:
         assert replayed.outcome is RetryTransitionOutcome.ALREADY_SCHEDULED
         assert replayed.scheduled_attempt_id == scheduled.scheduled_attempt_id
         assert len(await scheduled_shape(setup, workflow.task_run_id)) == 2
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM dead_letter_items d JOIN task_attempts a "
+                "ON a.id = d.source_task_attempt_id WHERE a.task_run_id = $1",
+                workflow.task_run_id,
+            )
+            == 0
+        )
         assert (
             await setup.fetchval(
                 "SELECT count(*) FROM task_retry_events WHERE task_run_id = $1",
@@ -265,6 +278,14 @@ async def exercise_retry_transitions(database_url: URL) -> None:
             )
             == "no_policy"
         )
+        assert tuple(
+            await setup.fetchrow(
+                "SELECT d.reason, s.status FROM dead_letter_items d "
+                "JOIN dead_letter_status s ON s.dead_letter_item_id = d.id "
+                "WHERE d.source_task_attempt_id = $1",
+                no_policy.failed_attempt_id,
+            )
+        ) == ("retry_exhausted", "open")
 
         exhausted = await add_retry_pending_task(
             setup,
@@ -283,6 +304,39 @@ async def exercise_retry_transitions(database_url: URL) -> None:
             )
             == "exhausted"
         )
+        assert tuple(
+            await setup.fetchrow(
+                "SELECT d.task_run_id, d.source_task_attempt_id, d.reason, s.status "
+                "FROM dead_letter_items d JOIN dead_letter_status s "
+                "ON s.dead_letter_item_id = d.id "
+                "WHERE d.source_task_attempt_id = $1",
+                exhausted.failed_attempt_id,
+            )
+        ) == (
+            exhausted.task_run_id,
+            exhausted.failed_attempt_id,
+            "retry_exhausted",
+            "open",
+        )
+        async with sessions.begin() as session:
+            assert (
+                await ensure_dead_letter(
+                    session,
+                    item_id=uuid4(),
+                    task_run_id=exhausted.task_run_id,
+                    source_task_attempt_id=exhausted.failed_attempt_id,
+                    reason=DeadLetterReason.RETRY_EXHAUSTED,
+                )
+                is DeadLetterInsertOutcome.ALREADY_PRESENT
+            )
+            with pytest.raises(DeadLetterPersistenceInvariantViolation):
+                await ensure_dead_letter(
+                    session,
+                    item_id=uuid4(),
+                    task_run_id=exhausted.task_run_id,
+                    source_task_attempt_id=exhausted.failed_attempt_id,
+                    reason=DeadLetterReason.PERMANENT_FAILURE,
+                )
 
         invalid_result = await add_retry_pending_task(
             setup,
@@ -300,6 +354,15 @@ async def exercise_retry_transitions(database_url: URL) -> None:
             )
             == "retry_pending"
         )
+        async with sessions.begin() as session:
+            with pytest.raises(DeadLetterPersistenceInvariantViolation):
+                await ensure_dead_letter(
+                    session,
+                    item_id=uuid4(),
+                    task_run_id=invalid_result.task_run_id,
+                    source_task_attempt_id=invalid_result.failed_attempt_id,
+                    reason=DeadLetterReason.RETRY_EXHAUSTED,
+                )
 
         malformed = await add_retry_pending_task(
             setup,
@@ -337,7 +400,7 @@ async def _exercise_duplicate_race(
     service: RetryTransitionService,
 ) -> None:
     facts = await add_retry_pending_task(
-        setup, workflow_policy={"retry_policy": retry_policy()}
+        setup, workflow_policy={"retry_policy": retry_policy(maximum_attempts=1)}
     )
     blocker = await asyncpg.connect(asyncpg_dsn(database_url))
     observer = await asyncpg.connect(asyncpg_dsn(database_url))
@@ -357,10 +420,27 @@ async def _exercise_duplicate_race(
         await transaction.commit()
         results = await asyncio.gather(*pending)
         assert {result.outcome for result in results} == {
-            RetryTransitionOutcome.SCHEDULED,
-            RetryTransitionOutcome.ALREADY_SCHEDULED,
+            RetryTransitionOutcome.FAILED_EXHAUSTED,
+            RetryTransitionOutcome.NOT_ELIGIBLE,
         }
-        assert len(await scheduled_shape(setup, facts.task_run_id)) == 2
+        assert len(await scheduled_shape(setup, facts.task_run_id)) == 1
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM dead_letter_items "
+                "WHERE source_task_attempt_id = $1",
+                facts.failed_attempt_id,
+            )
+            == 1
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM dead_letter_status s JOIN dead_letter_items d "
+                "ON d.id = s.dead_letter_item_id "
+                "WHERE d.source_task_attempt_id = $1",
+                facts.failed_attempt_id,
+            )
+            == 1
+        )
     finally:
         if pending is not None:
             for task in pending:
@@ -455,6 +535,50 @@ async def _exercise_rollback(
             "DROP TRIGGER reject_retry_event_trigger ON task_retry_events"
         )
         await setup.execute("DROP FUNCTION reject_retry_event()")
+
+    exhausted = await add_retry_pending_task(
+        setup, workflow_policy={"retry_policy": retry_policy(maximum_attempts=1)}
+    )
+    await setup.execute(
+        "CREATE FUNCTION reject_retry_dead_letter_status() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION "
+        "'forced dead-letter status rollback'; END $$"
+    )
+    await setup.execute(
+        "CREATE TRIGGER reject_retry_dead_letter_status_trigger BEFORE INSERT ON "
+        "dead_letter_status FOR EACH ROW EXECUTE FUNCTION "
+        "reject_retry_dead_letter_status()"
+    )
+    try:
+        with pytest.raises(RetryTransitionServiceUnavailable):
+            await service.transition_retry(exhausted.task_run_id)
+        assert (
+            await setup.fetchval(
+                "SELECT status::text FROM task_runs WHERE id = $1",
+                exhausted.task_run_id,
+            )
+            == "retry_pending"
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_retry_events WHERE task_run_id = $1",
+                exhausted.task_run_id,
+            )
+            == 0
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM dead_letter_items "
+                "WHERE source_task_attempt_id = $1",
+                exhausted.failed_attempt_id,
+            )
+            == 0
+        )
+    finally:
+        await setup.execute(
+            "DROP TRIGGER reject_retry_dead_letter_status_trigger ON dead_letter_status"
+        )
+        await setup.execute("DROP FUNCTION reject_retry_dead_letter_status()")
 
 
 def test_real_postgresql_retry_transitions() -> None:

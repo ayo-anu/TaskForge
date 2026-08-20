@@ -10,6 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.schema import worker_credentials, worker_identities
+from taskforge.persistence.dead_letters import (
+    DeadLetterPersistenceInvariantViolation,
+    DeadLetterReason,
+    ensure_dead_letter,
+)
 from taskforge.runs.domain import TaskRunStatus
 from taskforge.runs.schema import (
     task_attempt_claims,
@@ -289,6 +294,17 @@ class SQLAlchemyTaskResultRepository:
                 await _append_event(
                     session, worker_session_id, result, "result_accepted"
                 )
+                if result.result_kind is TaskExecutionResultKind.PERMANENT_FAILURE:
+                    try:
+                        await ensure_dead_letter(
+                            session,
+                            item_id=uuid4(),
+                            task_run_id=result.task_run_id,
+                            source_task_attempt_id=result.task_attempt_id,
+                            reason=DeadLetterReason.PERMANENT_FAILURE,
+                        )
+                    except DeadLetterPersistenceInvariantViolation as error:
+                        raise TaskResultPersistenceInvariantViolation from error
                 return PersistedTaskResult(
                     PersistedTaskResultOutcome.ACCEPTED, result.task_attempt_id
                 )

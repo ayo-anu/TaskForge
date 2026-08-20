@@ -31,6 +31,11 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Select
 
+from taskforge.persistence.dead_letters import (
+    DeadLetterPersistenceInvariantViolation,
+    DeadLetterReason,
+    ensure_dead_letter,
+)
 from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
     ExpiredClaimCandidatePage,
@@ -585,6 +590,15 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                     decision_reason=reason.value,
                 )
             )
+            await ensure_dead_letter(
+                session,
+                item_id=uuid4(),
+                task_run_id=prepared.task_run_id,
+                source_task_attempt_id=prepared.task_attempt_id,
+                reason=DeadLetterReason.RETRY_EXHAUSTED,
+            )
+        except DeadLetterPersistenceInvariantViolation as error:
+            raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
         except IntegrityError as error:
             raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
         except DBAPIError as error:

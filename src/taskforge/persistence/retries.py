@@ -13,6 +13,11 @@ from sqlalchemy import exists, func, insert, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.persistence.dead_letters import (
+    DeadLetterPersistenceInvariantViolation,
+    DeadLetterReason,
+    ensure_dead_letter,
+)
 from taskforge.retries.domain import RetryEventType, RetryNotScheduledReason
 from taskforge.retries.persistence_ports import (
     DueRetryPersistenceInvariantViolation,
@@ -218,6 +223,20 @@ class SQLAlchemyRetryTransitionTransaction:
             failed_attempt_number=prepared.failed_attempt_number,
             decision_reason=reason,
         )
+        try:
+            await ensure_dead_letter(
+                self._required_session(),
+                item_id=uuid4(),
+                task_run_id=prepared.task_run_id,
+                source_task_attempt_id=prepared.failed_attempt_id,
+                reason=DeadLetterReason.RETRY_EXHAUSTED,
+            )
+        except DeadLetterPersistenceInvariantViolation as error:
+            raise RetryTransitionPersistenceInvariantViolation from error
+        except IntegrityError as error:
+            raise RetryTransitionPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise RetryTransitionPersistenceUnavailable from error
 
     async def _append_retry_event(
         self,

@@ -881,6 +881,41 @@ async def exercise_recovery(database_url: URL) -> None:
         )
         await connection.execute("DROP FUNCTION reject_recovery_retry_event()")
 
+        dead_letter_rollback = await recoverable_candidate(
+            connection, maximum_attempts=1
+        )
+        await connection.execute(
+            "CREATE FUNCTION reject_recovery_dead_letter_status() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION "
+            "'injected dead-letter status failure'; END $$"
+        )
+        await connection.execute(
+            "CREATE TRIGGER trg_inject_recovery_dead_letter_status BEFORE INSERT ON "
+            "dead_letter_status FOR EACH ROW EXECUTE FUNCTION "
+            "reject_recovery_dead_letter_status()"
+        )
+        with pytest.raises(ExpiredClaimRecoveryServiceUnavailable):
+            await service.recover_expired_claim(dead_letter_rollback)
+        assert (await shape(connection, dead_letter_rollback)) == (
+            "running",
+            None,
+            None,
+            None,
+            1,
+            1,
+            None,
+            0,
+        )
+        assert not await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM dead_letter_items "
+            "WHERE source_task_attempt_id = $1)",
+            dead_letter_rollback.task_attempt_id,
+        )
+        await connection.execute(
+            "DROP TRIGGER trg_inject_recovery_dead_letter_status ON dead_letter_status"
+        )
+        await connection.execute("DROP FUNCTION reject_recovery_dead_letter_status()")
+
         due = await recoverable_candidate(connection, initial_delay_seconds=0)
         scheduled = await progression.recover_and_progress(due)
         assert scheduled.recovery.outcome is ExpiredClaimRecoveryOutcome.RETRY_SCHEDULED
@@ -913,6 +948,11 @@ async def exercise_recovery(database_url: URL) -> None:
             )
             == 2
         )
+        assert not await connection.fetchval(
+            "SELECT EXISTS (SELECT FROM dead_letter_items d JOIN task_attempts a "
+            "ON a.id = d.source_task_attempt_id WHERE a.task_run_id = $1)",
+            due.task_run_id,
+        )
 
         cancelled = await recoverable_candidate(connection, initial_delay_seconds=0)
         assert (
@@ -941,6 +981,14 @@ async def exercise_recovery(database_url: URL) -> None:
         )
         assert progressed.reconciliation is not None
         assert progressed.reconciliation.final_status is WorkflowRunStatus.FAILED
+        assert tuple(
+            await connection.fetchrow(
+                "SELECT d.task_run_id, d.reason, s.status FROM dead_letter_items d "
+                "JOIN dead_letter_status s ON s.dead_letter_item_id = d.id "
+                "WHERE d.source_task_attempt_id = $1",
+                failed.task_attempt_id,
+            )
+        ) == (failed.task_run_id, "retry_exhausted", "open")
 
         no_policy_progression = await recoverable_candidate(
             connection, maximum_attempts=None
@@ -956,6 +1004,22 @@ async def exercise_recovery(database_url: URL) -> None:
         assert (
             no_policy_progressed.reconciliation.final_status is WorkflowRunStatus.FAILED
         )
+        assert (
+            await connection.fetchval(
+                "SELECT decision_reason FROM task_retry_events "
+                "WHERE task_run_id = $1 AND event_type = 'retry_not_scheduled'",
+                no_policy_progression.task_run_id,
+            )
+            == "no_policy"
+        )
+        assert tuple(
+            await connection.fetchrow(
+                "SELECT d.reason, s.status FROM dead_letter_items d "
+                "JOIN dead_letter_status s ON s.dead_letter_item_id = d.id "
+                "WHERE d.source_task_attempt_id = $1",
+                no_policy_progression.task_attempt_id,
+            )
+        ) == ("retry_exhausted", "open")
 
         progression_failure = await recoverable_candidate(
             connection, maximum_attempts=1
