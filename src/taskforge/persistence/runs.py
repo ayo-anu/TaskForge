@@ -39,6 +39,7 @@ from taskforge.retries.domain import (
 )
 from taskforge.runs.domain import (
     AcceptedWorkflowRunCancellation,
+    CancellationPropagationResult,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
@@ -166,6 +167,11 @@ class SQLAlchemyWorkflowRunRepository:
                             if status is WorkflowRunStatus.CANCELLING
                             else PersistedCancellationOutcome.ALREADY_CANCELLED
                         )
+                    if (
+                        outcome is PersistedCancellationOutcome.EXACT_RETRY
+                        and status is WorkflowRunStatus.CANCELLING
+                    ):
+                        await _suppress_unstarted_task_rows(session, workflow_run_id)
                     return PersistedWorkflowRunCancellation(
                         workflow_run_id, outcome, status, canonical
                     )
@@ -216,6 +222,7 @@ class SQLAlchemyWorkflowRunRepository:
                 ).one_or_none()
                 if transitioned is None:
                     raise WorkflowRunCancellationPersistenceInvariantViolation
+                await _suppress_unstarted_task_rows(session, workflow_run_id)
                 return PersistedWorkflowRunCancellation(
                     workflow_run_id,
                     PersistedCancellationOutcome.NEWLY_ACCEPTED,
@@ -228,6 +235,45 @@ class SQLAlchemyWorkflowRunRepository:
             raise WorkflowRunCancellationPersistenceInvariantViolation from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
+
+    async def suppress_unstarted_tasks(
+        self,
+        workflow_run_id: UUID,
+    ) -> CancellationPropagationResult:
+        """Cancel pre-dispatch task states under one workflow-run lock."""
+        try:
+            async with self._sessions.begin() as session:
+                locked = (
+                    await session.execute(
+                        _workflow_run_evaluation_lock_statement(workflow_run_id)
+                    )
+                ).one_or_none()
+                if locked is None:
+                    return CancellationPropagationResult(
+                        workflow_run_id, False, None, (), ()
+                    )
+                try:
+                    status = WorkflowRunStatus(locked.status)
+                except ValueError as error:
+                    raise WorkflowRunCancellationPersistenceInvariantViolation from error
+                rows = (
+                    await _suppress_unstarted_task_rows(session, workflow_run_id)
+                    if status is WorkflowRunStatus.CANCELLING
+                    else ()
+                )
+        except WorkflowRunCancellationPersistenceInvariantViolation:
+            raise
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+
+        ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
+        return CancellationPropagationResult(
+            workflow_run_id,
+            True,
+            status,
+            tuple(row.id for row in ordered),
+            tuple(row.step_identifier for row in ordered),
+        )
 
     async def find_idempotent_run(
         self,
@@ -985,6 +1031,10 @@ def _task_run_projection() -> tuple[tuple[Any, ...], Any]:
                 task_runs.c.status == TaskRunStatus.SKIPPED.value,
                 RunFailureReason.DEPENDENCY_FAILED.value,
             ),
+            (
+                task_runs.c.status == TaskRunStatus.CANCELLED.value,
+                RunFailureReason.CANCELLATION_REQUESTED.value,
+            ),
             else_=None,
         ).label("failure_reason"),
         func.coalesce(attempt_aggregates.c.attempt_count, 0).label("attempt_count"),
@@ -1309,6 +1359,38 @@ def _workflow_run_to_cancelling_statement(
             updated_at=requested_at,
         )
         .returning(workflow_runs.c.status)
+    )
+
+
+async def _suppress_unstarted_task_rows(
+    session: AsyncSession,
+    workflow_run_id: UUID,
+) -> Sequence[Row[Any]]:
+    """Cancel every pre-dispatch task while the caller holds the run lock."""
+    return (
+        await session.execute(_unstarted_task_suppression_statement(workflow_run_id))
+    ).all()
+
+
+def _unstarted_task_suppression_statement(workflow_run_id: UUID) -> Any:
+    return (
+        update(task_runs)
+        .where(
+            task_runs.c.workflow_run_id == workflow_run_id,
+            task_runs.c.status.in_(
+                (
+                    TaskRunStatus.BLOCKED.value,
+                    TaskRunStatus.RUNNABLE.value,
+                    TaskRunStatus.RETRY_PENDING.value,
+                    TaskRunStatus.RETRY_SCHEDULED.value,
+                )
+            ),
+        )
+        .values(
+            status=TaskRunStatus.CANCELLED.value,
+            updated_at=func.statement_timestamp(),
+        )
+        .returning(task_runs.c.id, task_runs.c.step_identifier)
     )
 
 

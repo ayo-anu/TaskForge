@@ -9,6 +9,7 @@ from taskforge.identity.authorization import OwnerFilter
 from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
+    CancellationPropagationResult,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     InspectedTaskRun,
@@ -239,6 +240,18 @@ class WorkflowRunService:
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
 
+    async def suppress_unstarted_tasks(
+        self,
+        workflow_run_id: UUID,
+    ) -> CancellationPropagationResult:
+        """Cancel pre-dispatch task states under the workflow progression lock."""
+        try:
+            return await self._repository.suppress_unstarted_tasks(workflow_run_id)
+        except WorkflowRunCancellationPersistenceInvariantViolation as error:
+            raise WorkflowRunCancellationInvariantError from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+
     async def propagate_dependency_failures(
         self,
         workflow_run_id: UUID,
@@ -263,30 +276,47 @@ class WorkflowRunService:
         self,
         workflow_run_id: UUID,
     ) -> WorkflowRunReconciliationResult:
-        """Boundedly compose the three authoritative progression operations."""
+        """Boundedly compose cancellation-first authoritative progression."""
         runnable_count = 0
         skipped_count = 0
         workflow_transition_count = 0
+        cancelled_count = 0
         last_status: WorkflowRunStatus | None = None
-        inactive_statuses = (
-            WorkflowRunStatus.CANCELLING,
+        terminal_statuses = (
             WorkflowRunStatus.SUCCEEDED,
             WorkflowRunStatus.FAILED,
             WorkflowRunStatus.CANCELLED,
         )
 
         for iteration in range(1, MAX_WORKFLOW_RECONCILIATION_ITERATIONS + 1):
-            # A terminal/cancelling status observed by the prior iteration must
-            # never begin another Task 1 -> Task 2 -> Task 3 cycle.
-            if last_status in inactive_statuses:
-                assert last_status is not None
+            cancellation = await self.suppress_unstarted_tasks(workflow_run_id)
+            cancelled_count += cancellation.cancelled_count
+            if not cancellation.found:
                 return WorkflowRunReconciliationResult(
                     workflow_run_id,
-                    True,
-                    iteration - 1,
+                    False,
+                    iteration,
                     runnable_count,
                     skipped_count,
                     workflow_transition_count,
+                    cancelled_count,
+                    None,
+                    False,
+                    False,
+                )
+            assert cancellation.workflow_status is not None
+            last_status = cancellation.workflow_status
+            if last_status is WorkflowRunStatus.CANCELLING or last_status in (
+                terminal_statuses
+            ):
+                return WorkflowRunReconciliationResult(
+                    workflow_run_id,
+                    True,
+                    iteration,
+                    runnable_count,
+                    skipped_count,
+                    workflow_transition_count,
+                    cancelled_count,
                     last_status,
                     True,
                     False,
@@ -307,6 +337,7 @@ class WorkflowRunService:
                     runnable_count,
                     skipped_count,
                     workflow_transition_count,
+                    cancelled_count,
                     None,
                     False,
                     False,
@@ -314,7 +345,7 @@ class WorkflowRunService:
 
             assert workflow.resulting_status is not None
             last_status = workflow.resulting_status
-            if last_status in inactive_statuses:
+            if last_status in terminal_statuses:
                 return WorkflowRunReconciliationResult(
                     workflow_run_id,
                     True,
@@ -322,13 +353,31 @@ class WorkflowRunService:
                     runnable_count,
                     skipped_count,
                     workflow_transition_count,
+                    cancelled_count,
                     last_status,
                     True,
                     False,
                 )
 
+            if last_status is WorkflowRunStatus.CANCELLING:
+                if iteration == MAX_WORKFLOW_RECONCILIATION_ITERATIONS:
+                    return WorkflowRunReconciliationResult(
+                        workflow_run_id,
+                        True,
+                        iteration,
+                        runnable_count,
+                        skipped_count,
+                        workflow_transition_count,
+                        cancelled_count,
+                        last_status,
+                        True,
+                        False,
+                    )
+                continue
+
             iteration_made_progress = (
-                runnable.made_progress
+                cancellation.made_progress
+                or runnable.made_progress
                 or skipped.made_progress
                 or workflow.made_progress
             )
@@ -340,6 +389,7 @@ class WorkflowRunService:
                     runnable_count,
                     skipped_count,
                     workflow_transition_count,
+                    cancelled_count,
                     last_status,
                     True,
                     False,
@@ -353,6 +403,7 @@ class WorkflowRunService:
             runnable_count,
             skipped_count,
             workflow_transition_count,
+            cancelled_count,
             last_status,
             False,
             True,

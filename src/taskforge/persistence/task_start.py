@@ -55,21 +55,38 @@ class SQLAlchemyTaskStartRepository:
                 await _lock_session(
                     session, authenticated_worker.worker_identity_id, worker_session_id
                 )
+                workflow = (
+                    await session.execute(
+                        select(workflow_runs.c.status)
+                        .select_from(
+                            workflow_runs.join(
+                                task_runs,
+                                task_runs.c.workflow_run_id == workflow_runs.c.id,
+                            ).join(
+                                task_attempts,
+                                task_attempts.c.task_run_id == task_runs.c.id,
+                            )
+                        )
+                        .where(
+                            task_runs.c.id == task_run_id,
+                            task_attempts.c.id == task_attempt_id,
+                        )
+                        .with_for_update(of=workflow_runs)
+                    )
+                ).one_or_none()
+                if workflow is None:
+                    raise TaskStartInvariantViolation
                 task = (
                     await session.execute(
                         select(
                             task_runs.c.id,
                             task_runs.c.status,
                             task_attempts.c.attempt_number,
-                            workflow_runs.c.status.label("workflow_run_status"),
                         )
                         .select_from(
                             task_attempts.join(
                                 task_runs,
                                 task_runs.c.id == task_attempts.c.task_run_id,
-                            ).join(
-                                workflow_runs,
-                                workflow_runs.c.id == task_runs.c.workflow_run_id,
                             )
                         )
                         .where(
@@ -81,7 +98,7 @@ class SQLAlchemyTaskStartRepository:
                 ).one_or_none()
                 if task is None:
                     raise TaskStartInvariantViolation
-                workflow_status = WorkflowRunStatus(task.workflow_run_status)
+                workflow_status = WorkflowRunStatus(workflow.status)
                 if workflow_status in (
                     WorkflowRunStatus.SUCCEEDED,
                     WorkflowRunStatus.FAILED,
@@ -129,6 +146,8 @@ class SQLAlchemyTaskStartRepository:
                     return PersistedTaskStart(False, workflow_status)
                 if task.status != TaskRunStatus.CLAIMED.value:
                     raise TaskStartInvariantViolation
+                if workflow_status is WorkflowRunStatus.CANCELLING:
+                    raise TaskStartClaimStale
                 transitioned = (
                     await session.execute(
                         update(task_runs)

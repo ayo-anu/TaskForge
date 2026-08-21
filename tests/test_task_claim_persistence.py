@@ -19,6 +19,7 @@ from taskforge.claims.domain import (
 )
 from taskforge.claims.persistence_ports import (
     TaskClaimAuthorityRejected,
+    TaskClaimNotEligible,
     TaskClaimRenewalRecovered,
     TaskClaimSessionInactive,
 )
@@ -209,6 +210,7 @@ def test_repository_orchestrates_new_acquisition_in_one_context() -> None:
             SimpleNamespace(id=worker.worker_identity_id),
             SimpleNamespace(id=worker.credential_id),
             SimpleNamespace(ended_at=None),
+            SimpleNamespace(status="running"),
             SimpleNamespace(
                 id=envelope.task_run_id,
                 workflow_run_id=envelope.workflow_run_id,
@@ -269,6 +271,7 @@ def test_repository_replays_without_new_assignment_reads_or_mutations() -> None:
             SimpleNamespace(id=worker.worker_identity_id),
             SimpleNamespace(id=worker.credential_id),
             SimpleNamespace(ended_at=None),
+            SimpleNamespace(status="running"),
             SimpleNamespace(status="claimed"),
             durable,
             current,
@@ -286,11 +289,47 @@ def test_repository_replays_without_new_assignment_reads_or_mutations() -> None:
 
     assert result.outcome is TaskClaimOutcome.REPLAYED_EXPIRED
     assert result.claim.generation == 4
-    assert len(session.statements) == 8
+    assert len(session.statements) == 9
     assert not any(
         isinstance(statement, Insert) and statement.table.name == "task_claim_events"
         for statement in session.statements
     )
+
+
+def test_repository_rejects_new_claim_when_workflow_is_cancelling() -> None:
+    worker, session_id, envelope = claim_fixture()
+    durable = SimpleNamespace(
+        route=envelope.route,
+        payload=dispatch_envelope_to_mapping(envelope),
+        attempt_number=1,
+        task_type="test.task",
+    )
+    session = FakeSession(
+        [
+            SimpleNamespace(id=worker.worker_identity_id),
+            SimpleNamespace(id=worker.credential_id),
+            SimpleNamespace(ended_at=None),
+            SimpleNamespace(status="cancelling"),
+            SimpleNamespace(
+                id=envelope.task_run_id,
+                workflow_run_id=envelope.workflow_run_id,
+                workflow_version_id=uuid4(),
+                step_identifier="step",
+                status="dispatched",
+            ),
+            durable,
+            None,
+        ],
+        [1],
+    )
+
+    with pytest.raises(TaskClaimNotEligible):
+        asyncio.run(
+            SQLAlchemyTaskClaimRepository(
+                cast(async_sessionmaker[AsyncSession], FakeSessions(session)),
+                worker_stale_after_seconds=30,
+            ).acquire_claim(worker, session_id, envelope, lease_seconds=60)
+        )
 
 
 def test_repository_rejects_invalid_policy_and_disabled_authority() -> None:

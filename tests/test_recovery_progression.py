@@ -83,6 +83,7 @@ def reconciliation(value: ExpiredClaimCandidate) -> WorkflowRunReconciliationRes
         0,
         0,
         1,
+        0,
         WorkflowRunStatus.FAILED,
         True,
         False,

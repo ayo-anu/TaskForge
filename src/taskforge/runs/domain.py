@@ -107,6 +107,7 @@ class RunFailureReason(StrEnum):
 
     TASK_FAILED = "task_failed"
     DEPENDENCY_FAILED = "dependency_failed"
+    CANCELLATION_REQUESTED = "cancellation_requested"
 
 
 @dataclass(frozen=True)
@@ -355,6 +356,41 @@ class DependencyFailurePropagationResult:
 
 
 @dataclass(frozen=True)
+class CancellationPropagationResult:
+    """The immutable outcome of one unstarted-task cancellation pass."""
+
+    workflow_run_id: UUID
+    found: bool
+    workflow_status: WorkflowRunStatus | None
+    cancelled_task_ids: tuple[UUID, ...]
+    cancelled_step_identifiers: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.found is (self.workflow_status is None):
+            raise ValueError("cancellation propagation presence and status disagree")
+        if len(self.cancelled_task_ids) != len(self.cancelled_step_identifiers):
+            raise ValueError("cancelled task identities must remain paired")
+        if len(set(self.cancelled_task_ids)) != len(self.cancelled_task_ids):
+            raise ValueError("cancelled task identifiers must be unique")
+        if len(set(self.cancelled_step_identifiers)) != len(
+            self.cancelled_step_identifiers
+        ):
+            raise ValueError("cancelled step identifiers must be unique")
+        if self.workflow_status is not WorkflowRunStatus.CANCELLING and (
+            self.cancelled_task_ids or self.cancelled_step_identifiers
+        ):
+            raise ValueError("only a cancelling workflow may suppress task runs")
+
+    @property
+    def cancelled_count(self) -> int:
+        return len(self.cancelled_task_ids)
+
+    @property
+    def made_progress(self) -> bool:
+        return self.cancelled_count > 0
+
+
+@dataclass(frozen=True)
 class WorkflowRunEvaluationResult:
     """The immutable outcome of one workflow-run state evaluation."""
 
@@ -396,6 +432,7 @@ class WorkflowRunReconciliationResult:
     runnable_transition_count: int
     skipped_transition_count: int
     workflow_transition_count: int
+    cancelled_transition_count: int
     final_status: WorkflowRunStatus | None
     quiescent: bool
     bound_reached: bool
@@ -407,6 +444,7 @@ class WorkflowRunReconciliationResult:
             self.runnable_transition_count,
             self.skipped_transition_count,
             self.workflow_transition_count,
+            self.cancelled_transition_count,
         )
         if any(count < 0 for count in counts):
             raise ValueError("reconciliation transition counts cannot be negative")

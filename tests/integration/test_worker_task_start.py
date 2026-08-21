@@ -32,7 +32,12 @@ from taskforge.worker.result_submission import (
     TaskResultSubmissionOutcome,
     TaskResultSubmissionReceipt,
 )
-from taskforge.worker.start import TaskStartOutcome, TaskStartRequest, TaskStartService
+from taskforge.worker.start import (
+    TaskStartOutcome,
+    TaskStartRejected,
+    TaskStartRequest,
+    TaskStartService,
+)
 from taskforge.workflows.task_types import (
     JSONMapping,
     TaskTypeDefinition,
@@ -123,6 +128,32 @@ async def exercise(database_url: URL) -> None:
         )
         replay = await claim_service.claim_task(
             worker.authenticated, worker.session_id, dispatch
+        )
+
+        cancelling_dispatch = await add_dispatched_task(setup)
+        cancelling_claim = await claim_service.claim_task(
+            worker.authenticated, worker.session_id, cancelling_dispatch
+        )
+        await setup.execute(
+            "UPDATE workflow_runs SET status = 'cancelling' WHERE id = $1",
+            cancelling_dispatch.workflow_run_id,
+        )
+        with pytest.raises(TaskStartRejected):
+            await start_service.start_task(
+                worker.authenticated,
+                worker.session_id,
+                TaskStartRequest(
+                    cancelling_dispatch.task_run_id,
+                    cancelling_dispatch.task_attempt_id,
+                    cancelling_claim.claim.generation,
+                ),
+            )
+        assert (
+            await setup.fetchval(
+                "SELECT status::text FROM task_runs WHERE id = $1",
+                cancelling_dispatch.task_run_id,
+            )
+            == "claimed"
         )
         assert replay.outcome is TaskClaimOutcome.REPLAYED_ACTIVE
         assert replay.claim.generation == issued.claim.generation

@@ -48,7 +48,7 @@ from taskforge.dispatch.envelope import (
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.authorization import OwnerFilter
 from taskforge.identity.schema import worker_credentials, worker_identities
-from taskforge.runs.domain import TaskRunStatus
+from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
 from taskforge.runs.schema import (
     task_attempt_claims,
     task_attempt_results,
@@ -114,6 +114,16 @@ class SQLAlchemyTaskClaimRepository:
                 await _lock_active_session(
                     session, authenticated_worker.worker_identity_id, worker_session_id
                 )
+                workflow = (
+                    await session.execute(
+                        select(workflow_runs.c.status)
+                        .where(workflow_runs.c.id == dispatch.workflow_run_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if workflow is None:
+                    raise TaskClaimDispatchRejected
+                workflow_status = workflow.status
                 task = (
                     await session.execute(
                         select(
@@ -231,6 +241,11 @@ class SQLAlchemyTaskClaimRepository:
                     ):
                         raise TaskClaimNotEligible
                     raise TaskClaimInvariantViolation
+                if workflow_status not in (
+                    WorkflowRunStatus.PENDING.value,
+                    WorkflowRunStatus.RUNNING.value,
+                ):
+                    raise TaskClaimNotEligible
 
                 health = (
                     await session.execute(

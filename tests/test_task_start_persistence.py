@@ -72,7 +72,7 @@ def repository(session: FakeSession) -> SQLAlchemyTaskStartRepository:
 
 def facts(
     status: str = "claimed", workflow_run_status: str = "running"
-) -> tuple[AuthenticatedWorker, UUID, UUID, UUID, object, datetime]:
+) -> tuple[AuthenticatedWorker, UUID, UUID, UUID, SimpleNamespace, datetime]:
     worker = AuthenticatedWorker(uuid4(), uuid4())
     session_id, task_run_id, attempt_id = uuid4(), uuid4(), uuid4()
     expiry = datetime.now(UTC) + timedelta(seconds=60)
@@ -98,6 +98,7 @@ def test_repository_commits_guarded_claimed_to_running_transition() -> None:
             SimpleNamespace(id=worker.worker_identity_id),
             SimpleNamespace(id=worker.credential_id),
             SimpleNamespace(ended_at=None),
+            SimpleNamespace(status=task.workflow_run_status),
             task,
             claim,
             SimpleNamespace(id=task_run_id),
@@ -127,6 +128,7 @@ def test_repository_replays_running_without_mutation() -> None:
             SimpleNamespace(id=worker.worker_identity_id),
             SimpleNamespace(id=worker.credential_id),
             SimpleNamespace(ended_at=None),
+            SimpleNamespace(status=task.workflow_run_status),
             task,
             claim,
         ],
@@ -138,6 +140,34 @@ def test_repository_replays_running_without_mutation() -> None:
     )
 
     assert not started.started
+    assert not any(isinstance(value, Update) for value in session.statements)
+
+
+def test_repository_rejects_new_start_when_workflow_is_cancelling() -> None:
+    worker, session_id, task_run_id, attempt_id, task, expiry = facts(
+        workflow_run_status="cancelling"
+    )
+    claim = SimpleNamespace(
+        generation=2, worker_session_id=session_id, lease_expires_at=expiry
+    )
+    session = FakeSession(
+        [
+            SimpleNamespace(id=worker.worker_identity_id),
+            SimpleNamespace(id=worker.credential_id),
+            SimpleNamespace(ended_at=None),
+            SimpleNamespace(status="cancelling"),
+            task,
+            claim,
+        ],
+        [1, False],
+    )
+
+    with pytest.raises(TaskStartClaimStale):
+        asyncio.run(
+            repository(session).start_task(
+                worker, session_id, task_run_id, attempt_id, 2
+            )
+        )
     assert not any(isinstance(value, Update) for value in session.statements)
 
 
@@ -153,6 +183,7 @@ def test_repository_fails_closed_for_terminal_workflow_at_start_boundary(
             SimpleNamespace(id=worker.worker_identity_id),
             SimpleNamespace(id=worker.credential_id),
             SimpleNamespace(ended_at=None),
+            SimpleNamespace(status=task.workflow_run_status),
             task,
         ],
         [1],
@@ -216,6 +247,7 @@ def test_repository_fails_closed_for_stale_claim_or_invalid_state(
             SimpleNamespace(id=worker.worker_identity_id),
             SimpleNamespace(id=worker.credential_id),
             SimpleNamespace(ended_at=None),
+            SimpleNamespace(status=task.workflow_run_status),
             task,
             claim,
         ],

@@ -13,6 +13,7 @@ from taskforge.identity.authorization import OwnerFilter
 from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     AcceptedWorkflowRunCancellation,
+    CancellationPropagationResult,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     InspectedTaskRun,
@@ -198,6 +199,12 @@ class WorkflowRunRepository(Protocol):
         workflow_run_id: UUID,
     ) -> RunnableTransitionResult:
         """Evaluate immutable dependencies and persist blocked-to-runnable moves."""
+
+    async def suppress_unstarted_tasks(
+        self,
+        workflow_run_id: UUID,
+    ) -> CancellationPropagationResult:
+        """Cancel every pre-dispatch task when its workflow is cancelling."""
 
     async def propagate_dependency_failures(
         self,

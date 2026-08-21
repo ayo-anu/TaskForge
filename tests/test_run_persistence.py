@@ -29,6 +29,7 @@ from taskforge.persistence.runs import (
     _running_terminal_transition_statement,
     _task_run_inspection_statement,
     _task_run_list_statement,
+    _unstarted_task_suppression_statement,
     _version_resolution_statement,
     _workflow_run_evaluation_lock_statement,
 )
@@ -51,6 +52,23 @@ from taskforge.runs.persistence_ports import (
     WorkflowRunTimestamps,
 )
 from taskforge.workflows.domain import WorkflowDefinitionStatus
+
+
+def test_unstarted_cancellation_statement_has_exact_pre_dispatch_boundary() -> None:
+    sql = str(
+        _unstarted_task_suppression_statement(uuid4()).compile(
+            dialect=postgresql.dialect(),  # type: ignore[no-untyped-call]
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert (
+        "status IN ('blocked', 'runnable', 'retry_pending', 'retry_scheduled')" in sql
+    )
+    assert "status='cancelled'" in sql
+    assert "statement_timestamp()" in sql
+    for preserved in ("dispatched", "claimed", "running", "succeeded", "failed"):
+        assert f"'{preserved}'" not in sql
 
 
 def normalized_sql(statement: object) -> str:

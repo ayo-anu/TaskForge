@@ -314,6 +314,27 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
         TaskClaimResultAuthorityIssuer(b"claim-acquisition-integration-secret"),
         lease_seconds=60,
     )
+
+    cancellation_worker = await add_worker(setup)
+    cancelling_dispatch = await add_dispatched_task(setup)
+    await setup.execute(
+        "UPDATE workflow_runs SET status = 'cancelling' WHERE id = $1",
+        cancelling_dispatch.workflow_run_id,
+    )
+    with pytest.raises(TaskClaimRejected) as rejected:
+        await service.claim_task(
+            cancellation_worker.authenticated,
+            cancellation_worker.session_id,
+            cancelling_dispatch,
+        )
+    assert rejected.value.reason is TaskClaimRejectionReason.OBSOLETE_TASK
+    assert (
+        await setup.fetchval(
+            "SELECT status::text FROM task_runs WHERE id = $1",
+            cancelling_dispatch.task_run_id,
+        )
+        == "dispatched"
+    )
     try:
         first_worker = await add_worker(setup)
         second_worker = await add_worker(setup)

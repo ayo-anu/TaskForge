@@ -7,6 +7,7 @@ import pytest
 
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
+    CancellationPropagationResult,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
@@ -127,6 +128,7 @@ def test_inspection_failure_reasons_are_small_typed_and_immutable() -> None:
     assert tuple(RunFailureReason) == (
         RunFailureReason.TASK_FAILED,
         RunFailureReason.DEPENDENCY_FAILED,
+        RunFailureReason.CANCELLATION_REQUESTED,
     )
     assert run.failure_reason is RunFailureReason.TASK_FAILED
     assert task.failure_reason is RunFailureReason.DEPENDENCY_FAILED
@@ -190,6 +192,39 @@ def test_dependency_failure_result_rejects_unpaired_or_duplicate_identities() ->
         DependencyFailurePropagationResult(uuid4(), (uuid4(), uuid4()), ("one", "one"))
 
 
+def test_cancellation_propagation_result_records_only_cancelling_progress() -> None:
+    run_id, task_id = uuid4(), uuid4()
+    result = CancellationPropagationResult(
+        run_id, True, WorkflowRunStatus.CANCELLING, (task_id,), ("queued",)
+    )
+
+    assert result.cancelled_count == 1
+    assert result.made_progress
+    assert not CancellationPropagationResult(
+        run_id, True, WorkflowRunStatus.RUNNING, (), ()
+    ).made_progress
+    assert not CancellationPropagationResult(run_id, False, None, (), ()).found
+
+
+@pytest.mark.parametrize(
+    ("found", "status", "task_ids", "steps"),
+    (
+        (False, WorkflowRunStatus.CANCELLING, (), ()),
+        (True, None, (), ()),
+        (True, WorkflowRunStatus.RUNNING, (uuid4(),), ("queued",)),
+        (True, WorkflowRunStatus.CANCELLING, (uuid4(),), ()),
+    ),
+)
+def test_cancellation_propagation_result_rejects_inconsistent_outcomes(
+    found: bool,
+    status: WorkflowRunStatus | None,
+    task_ids: tuple[UUID, ...],
+    steps: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        CancellationPropagationResult(uuid4(), found, status, task_ids, steps)
+
+
 def test_workflow_run_evaluation_result_distinguishes_transition_and_no_op() -> None:
     run_id = uuid4()
     transitioned = WorkflowRunEvaluationResult(
@@ -244,6 +279,7 @@ def reconciliation_result(
         "runnable_transition_count": 0,
         "skipped_transition_count": 0,
         "workflow_transition_count": 0,
+        "cancelled_transition_count": 0,
         "final_status": WorkflowRunStatus.RUNNING,
         "quiescent": True,
         "bound_reached": False,
@@ -280,6 +316,7 @@ def test_reconciliation_result_supports_quiescence_bound_and_missing_outcomes() 
         {"runnable_transition_count": -1},
         {"skipped_transition_count": -1},
         {"workflow_transition_count": 2},
+        {"cancelled_transition_count": -1},
         {"found": False},
         {"final_status": None},
         {"quiescent": True, "bound_reached": True},
