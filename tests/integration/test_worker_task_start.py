@@ -45,6 +45,8 @@ from taskforge.workflows.task_types import (
     WorkflowValidationIssue,
 )
 from tests.integration.postgresql import (
+    ExpectedStatusExecutionEvent,
+    assert_status_execution_events,
     asyncpg_dsn,
     migration_database_url,
     temporary_database,
@@ -125,6 +127,18 @@ async def exercise(database_url: URL) -> None:
                 dispatch.task_run_id,
             )
             == "running"
+        )
+        await assert_status_execution_events(
+            setup,
+            dispatch.workflow_run_id,
+            (
+                ExpectedStatusExecutionEvent(
+                    dispatch.task_run_id, "dispatched", "claimed"
+                ),
+                ExpectedStatusExecutionEvent(
+                    dispatch.task_run_id, "claimed", "running"
+                ),
+            ),
         )
         replay = await claim_service.claim_task(
             worker.authenticated, worker.session_id, dispatch

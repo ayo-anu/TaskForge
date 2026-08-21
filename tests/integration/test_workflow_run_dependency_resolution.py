@@ -22,7 +22,11 @@ from taskforge.runs.domain import (
     WorkflowRunStatus,
     create_workflow_run_input,
 )
-from taskforge.runs.schema import task_runs, workflow_runs
+from taskforge.runs.schema import (
+    task_runs,
+    workflow_run_execution_events,
+    workflow_runs,
+)
 from taskforge.runs.service import WorkflowRunService
 from taskforge.workflows.schema import (
     workflow_definitions,
@@ -201,6 +205,23 @@ async def verify_dependency_resolution(database_url: URL) -> None:
                 )
             )
         await set_join("succeeded", "succeeded")
+        async with sessions() as session:
+            join_task_id = await session.scalar(
+                select(task_runs.c.id).where(
+                    task_runs.c.workflow_run_id == join_run.id,
+                    task_runs.c.step_identifier == "join",
+                )
+            )
+            prior_event_count = len(
+                (
+                    await session.execute(
+                        select(workflow_run_execution_events.c.id).where(
+                            workflow_run_execution_events.c.workflow_run_id
+                            == join_run.id
+                        )
+                    )
+                ).all()
+            )
 
         first, second = await asyncio.gather(
             service.transition_runnable_tasks(join_run.id),
@@ -209,11 +230,40 @@ async def verify_dependency_resolution(database_url: URL) -> None:
         assert first.transitioned_count + second.transitioned_count == 1
         assert first.workflow_run_id == second.workflow_run_id == join_run.id
         assert await task_status(sessions, join_run.id, "join") == "runnable"
+        async with sessions() as session:
+            event = (
+                await session.execute(
+                    select(workflow_run_execution_events)
+                    .where(
+                        workflow_run_execution_events.c.workflow_run_id == join_run.id
+                    )
+                    .order_by(workflow_run_execution_events.c.cursor.desc())
+                    .limit(1)
+                )
+            ).one()
+        assert event.cursor == prior_event_count + 1
+        assert event.task_run_id == join_task_id
+        assert event.event_type == "task_run.status_changed"
+        assert event.payload == {"previous_status": "blocked", "status": "runnable"}
 
         no_op = await service.transition_runnable_tasks(join_run.id)
         assert no_op.transitioned_count == 0
         assert no_op.transitioned_task_ids == ()
         assert no_op.transitioned_step_identifiers == ()
+        async with sessions() as session:
+            assert (
+                len(
+                    (
+                        await session.execute(
+                            select(workflow_run_execution_events.c.id).where(
+                                workflow_run_execution_events.c.workflow_run_id
+                                == join_run.id
+                            )
+                        )
+                    ).all()
+                )
+                == prior_event_count + 1
+            )
         assert join_run.workflow_version_id == version_two_id
     finally:
         await engine.dispose()

@@ -8,7 +8,7 @@ from copy import deepcopy
 from datetime import datetime
 from types import TracebackType
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import (
     BigInteger,
@@ -36,6 +36,7 @@ from taskforge.persistence.dead_letters import (
     DeadLetterPersistenceInvariantViolation,
     ensure_dead_letter,
 )
+from taskforge.persistence.execution_events import append_status_changed_execution_event
 from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
     ExpiredClaimCandidatePage,
@@ -63,6 +64,10 @@ from taskforge.recovery.persistence_ports import (
 from taskforge.retries.domain import RetryEventType, RetryNotScheduledReason
 from taskforge.retries.persistence_ports import NewScheduledRetryAttempt
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
+from taskforge.runs.persistence_ports import (
+    WorkflowRunExecutionEventInvariantViolation,
+    WorkflowRunExecutionEventPersistenceUnavailable,
+)
 from taskforge.runs.schema import (
     task_attempt_claims,
     task_attempt_results,
@@ -485,6 +490,7 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                     candidate.task_attempt_id,
                     candidate.task_run_id,
                     candidate.workflow_run_id,
+                    TaskRunStatus(task.status),
                     candidate.attempt_number,
                     candidate.generation,
                     claim.worker_session_id,
@@ -518,6 +524,7 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                 candidate.task_attempt_id,
                 candidate.task_run_id,
                 candidate.workflow_run_id,
+                TaskRunStatus(task.status),
                 candidate.attempt_number,
                 candidate.generation,
                 claim.worker_session_id,
@@ -568,6 +575,13 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             ).one_or_none()
             if transitioned is None:
                 raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            await _append_recovery_status_event(
+                session,
+                workflow_run_id=prepared.workflow_run_id,
+                task_run_id=prepared.task_run_id,
+                previous_status=prepared.previous_task_status,
+                status=TaskRunStatus.RETRY_SCHEDULED,
+            )
             await session.execute(
                 insert(task_retry_events).values(
                     id=uuid4(),
@@ -609,6 +623,13 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             ).one_or_none()
             if transitioned is None:
                 raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            await _append_recovery_status_event(
+                session,
+                workflow_run_id=prepared.workflow_run_id,
+                task_run_id=prepared.task_run_id,
+                previous_status=prepared.previous_task_status,
+                status=TaskRunStatus.FAILED,
+            )
             await session.execute(
                 insert(task_retry_events).values(
                     id=uuid4(),
@@ -691,6 +712,13 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             ).one_or_none()
             if transitioned is None:
                 raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            await _append_recovery_status_event(
+                session,
+                workflow_run_id=prepared.workflow_run_id,
+                task_run_id=prepared.task_run_id,
+                previous_status=prepared.previous_task_status,
+                status=TaskRunStatus.CANCELLED,
+            )
             await session.execute(
                 insert(task_result_events).values(
                     id=uuid4(),
@@ -780,6 +808,28 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
         if self._context is None:
             raise RuntimeError("recovery transaction is not active")
         return self._context
+
+
+async def _append_recovery_status_event(
+    session: AsyncSession,
+    *,
+    workflow_run_id: UUID,
+    task_run_id: UUID,
+    previous_status: TaskRunStatus,
+    status: TaskRunStatus,
+) -> None:
+    try:
+        await append_status_changed_execution_event(
+            session,
+            workflow_run_id=workflow_run_id,
+            task_run_id=task_run_id,
+            previous_status=previous_status,
+            status=status,
+        )
+    except WorkflowRunExecutionEventInvariantViolation as error:
+        raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
+    except WorkflowRunExecutionEventPersistenceUnavailable as error:
+        raise ExpiredClaimRecoveryPersistenceUnavailable from error
 
 
 def _reference_expression(reference_time: datetime | None) -> Any:

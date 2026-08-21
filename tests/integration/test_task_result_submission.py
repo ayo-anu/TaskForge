@@ -29,6 +29,8 @@ from taskforge.worker.result_submission import (
 )
 from taskforge.worker.results import TaskExecutionResult, TaskExecutionResultKind
 from tests.integration.postgresql import (
+    ExpectedStatusExecutionEvent,
+    assert_status_execution_events,
     asyncpg_dsn,
     migration_database_url,
     temporary_database,
@@ -119,6 +121,18 @@ async def exercise_results(database_url: URL) -> None:
             dispatch.task_attempt_id,
         )
         assert tuple(state) == ("succeeded", "success", '{"answer": 42}', True)
+        await assert_status_execution_events(
+            setup,
+            dispatch.workflow_run_id,
+            (
+                ExpectedStatusExecutionEvent(
+                    dispatch.task_run_id, "dispatched", "claimed"
+                ),
+                ExpectedStatusExecutionEvent(
+                    dispatch.task_run_id, "running", "succeeded"
+                ),
+            ),
+        )
 
         retry_worker, retry_dispatch, retry_claim = await claimed_running_task(
             setup, claim_service
@@ -432,7 +446,9 @@ async def exercise_results(database_url: URL) -> None:
         )
         await setup.execute(
             "CREATE TRIGGER reject_result_event_trigger BEFORE INSERT ON "
-            "task_result_events FOR EACH ROW EXECUTE FUNCTION reject_result_event()"
+            "workflow_run_execution_events FOR EACH ROW WHEN "
+            f"(NEW.task_run_id = '{rollback_dispatch.task_run_id}'::uuid) "
+            "EXECUTE FUNCTION reject_result_event()"
         )
         with pytest.raises(TaskResultServiceUnavailable):
             await result_service.submit_result(
@@ -452,8 +468,21 @@ async def exercise_results(database_url: URL) -> None:
             rollback_dispatch.task_attempt_id,
         )
         assert tuple(rollback_state) == ("running", None, False)
+        await assert_status_execution_events(
+            setup,
+            rollback_dispatch.workflow_run_id,
+            (
+                ExpectedStatusExecutionEvent(
+                    rollback_dispatch.task_run_id, "dispatched", "claimed"
+                ),
+            ),
+        )
+        assert not await setup.fetchval(
+            "SELECT EXISTS (SELECT FROM task_result_events WHERE task_attempt_id = $1)",
+            rollback_dispatch.task_attempt_id,
+        )
         await setup.execute(
-            "DROP TRIGGER reject_result_event_trigger ON task_result_events"
+            "DROP TRIGGER reject_result_event_trigger ON workflow_run_execution_events"
         )
         await setup.execute("DROP FUNCTION reject_result_event()")
 

@@ -15,7 +15,12 @@ from taskforge.persistence.dead_letters import (
     DeadLetterPersistenceInvariantViolation,
     ensure_dead_letter,
 )
+from taskforge.persistence.execution_events import append_status_changed_execution_event
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
+from taskforge.runs.persistence_ports import (
+    WorkflowRunExecutionEventInvariantViolation,
+    WorkflowRunExecutionEventPersistenceUnavailable,
+)
 from taskforge.runs.schema import (
     task_attempt_claims,
     task_attempt_results,
@@ -303,6 +308,13 @@ class SQLAlchemyTaskResultRepository:
                 ).one_or_none()
                 if transitioned is None:
                     raise TaskResultPersistenceInvariantViolation
+                await append_status_changed_execution_event(
+                    session,
+                    workflow_run_id=workflow.id,
+                    task_run_id=result.task_run_id,
+                    previous_status=TaskRunStatus.RUNNING,
+                    status=target,
+                )
                 terminated = (
                     await session.execute(
                         update(task_attempt_claims)
@@ -343,6 +355,10 @@ class SQLAlchemyTaskResultRepository:
             raise
         except TaskResultPersistenceInvariantViolation:
             raise
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise TaskResultPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise TaskResultPersistenceUnavailable from error
         except IntegrityError as error:
             raise TaskResultPersistenceInvariantViolation from error
         except DBAPIError as error:

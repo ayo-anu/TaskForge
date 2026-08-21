@@ -10,7 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.schema import worker_credentials, worker_identities
+from taskforge.persistence.execution_events import append_status_changed_execution_event
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
+from taskforge.runs.persistence_ports import (
+    WorkflowRunExecutionEventInvariantViolation,
+    WorkflowRunExecutionEventPersistenceUnavailable,
+)
 from taskforge.runs.schema import (
     task_attempt_claims,
     task_attempts,
@@ -57,7 +62,7 @@ class SQLAlchemyTaskStartRepository:
                 )
                 workflow = (
                     await session.execute(
-                        select(workflow_runs.c.status)
+                        select(workflow_runs.c.id, workflow_runs.c.status)
                         .select_from(
                             workflow_runs.join(
                                 task_runs,
@@ -164,9 +169,20 @@ class SQLAlchemyTaskStartRepository:
                 ).one_or_none()
                 if transitioned is None:
                     raise TaskStartInvariantViolation
+                await append_status_changed_execution_event(
+                    session,
+                    workflow_run_id=workflow.id,
+                    task_run_id=task_run_id,
+                    previous_status=TaskRunStatus.CLAIMED,
+                    status=TaskRunStatus.RUNNING,
+                )
                 return PersistedTaskStart(True, workflow_status)
         except _START_REJECTIONS:
             raise
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise TaskStartInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise TaskStartPersistenceUnavailable from error
         except IntegrityError as error:
             raise TaskStartInvariantViolation from error
         except DBAPIError as error:

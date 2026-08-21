@@ -34,6 +34,7 @@ from taskforge.retries.domain import (
     RetryNotScheduledReason,
 )
 from taskforge.retries.persistence_ports import NewScheduledRetryAttempt
+from taskforge.runs.domain import TaskRunStatus
 from taskforge.worker.results import (
     TaskExecutionFailureKind,
     TaskExecutionResult,
@@ -76,6 +77,7 @@ def prepared(
         value.task_attempt_id,
         value.task_run_id,
         value.workflow_run_id,
+        TaskRunStatus.RUNNING,
         attempt_number,
         value.generation,
         value.worker_session_id,

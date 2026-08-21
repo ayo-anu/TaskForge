@@ -18,6 +18,7 @@ from taskforge.persistence.dead_letters import (
     DeadLetterPersistenceInvariantViolation,
     ensure_dead_letter,
 )
+from taskforge.persistence.execution_events import append_status_changed_execution_event
 from taskforge.retries.domain import RetryEventType, RetryNotScheduledReason
 from taskforge.retries.persistence_ports import (
     DueRetryPersistenceInvariantViolation,
@@ -33,6 +34,10 @@ from taskforge.retries.persistence_ports import (
     SkippedDueRetryCandidate,
 )
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
+from taskforge.runs.persistence_ports import (
+    WorkflowRunExecutionEventInvariantViolation,
+    WorkflowRunExecutionEventPersistenceUnavailable,
+)
 from taskforge.runs.schema import (
     task_attempt_claims,
     task_attempt_results,
@@ -185,6 +190,25 @@ class SQLAlchemyRetryTransitionTransaction:
             raise RetryTransitionPersistenceUnavailable from error
         if transitioned is None:
             raise RetryTransitionPersistenceInvariantViolation
+        workflow_run_id = await session.scalar(
+            select(task_runs.c.workflow_run_id).where(
+                task_runs.c.id == prepared.task_run_id
+            )
+        )
+        if not isinstance(workflow_run_id, UUID):
+            raise RetryTransitionPersistenceInvariantViolation
+        try:
+            await append_status_changed_execution_event(
+                session,
+                workflow_run_id=workflow_run_id,
+                task_run_id=prepared.task_run_id,
+                previous_status=TaskRunStatus.RETRY_PENDING,
+                status=TaskRunStatus.RETRY_SCHEDULED,
+            )
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise RetryTransitionPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise RetryTransitionPersistenceUnavailable from error
         await self._append_retry_event(
             prepared.task_run_id,
             RetryEventType.RETRY_SCHEDULED,
@@ -217,6 +241,25 @@ class SQLAlchemyRetryTransitionTransaction:
             raise RetryTransitionPersistenceUnavailable from error
         if transitioned is None:
             raise RetryTransitionPersistenceInvariantViolation
+        workflow_run_id = await self._required_session().scalar(
+            select(task_runs.c.workflow_run_id).where(
+                task_runs.c.id == prepared.task_run_id
+            )
+        )
+        if not isinstance(workflow_run_id, UUID):
+            raise RetryTransitionPersistenceInvariantViolation
+        try:
+            await append_status_changed_execution_event(
+                self._required_session(),
+                workflow_run_id=workflow_run_id,
+                task_run_id=prepared.task_run_id,
+                previous_status=TaskRunStatus.RETRY_PENDING,
+                status=TaskRunStatus.FAILED,
+            )
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise RetryTransitionPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise RetryTransitionPersistenceUnavailable from error
         await self._append_retry_event(
             prepared.task_run_id,
             RetryEventType.RETRY_NOT_SCHEDULED,
@@ -646,6 +689,18 @@ class SQLAlchemyDueRetryDispatchTransaction:
             raise DueRetryPersistenceUnavailable from error
         if transitioned is None:
             raise DueRetryPersistenceInvariantViolation
+        try:
+            await append_status_changed_execution_event(
+                session,
+                workflow_run_id=prepared.workflow_run_id,
+                task_run_id=prepared.task_run_id,
+                previous_status=TaskRunStatus.RETRY_SCHEDULED,
+                status=TaskRunStatus.DISPATCHED,
+            )
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise DueRetryPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise DueRetryPersistenceUnavailable from error
         try:
             await session.execute(
                 insert(task_retry_events).values(

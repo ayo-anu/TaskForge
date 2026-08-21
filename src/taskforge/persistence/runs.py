@@ -28,6 +28,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.identity.authorization import OwnerFilter
+from taskforge.persistence.execution_events import append_status_changed_execution_event
 from taskforge.retries.domain import (
     InspectedRetryEvent,
     InspectedRetryEventPage,
@@ -72,6 +73,8 @@ from taskforge.runs.persistence_ports import (
     PersistedWorkflowRunCancellation,
     PreparedWorkflowRunCreation,
     WorkflowRunCancellationPersistenceInvariantViolation,
+    WorkflowRunExecutionEventInvariantViolation,
+    WorkflowRunExecutionEventPersistenceUnavailable,
     WorkflowRunIdempotencyRecordConflict,
     WorkflowRunInspectionInvariantViolation,
     WorkflowRunPersistenceUnavailable,
@@ -230,6 +233,13 @@ class SQLAlchemyWorkflowRunRepository:
                 ).one_or_none()
                 if transitioned is None:
                     raise WorkflowRunCancellationPersistenceInvariantViolation
+                await append_status_changed_execution_event(
+                    session,
+                    workflow_run_id=workflow_run_id,
+                    task_run_id=None,
+                    previous_status=status,
+                    status=WorkflowRunStatus.CANCELLING,
+                )
                 await _suppress_unstarted_task_rows(session, workflow_run_id)
                 await _settle_dispatched_task_rows(session, workflow_run_id)
                 return PersistedWorkflowRunCancellation(
@@ -240,6 +250,10 @@ class SQLAlchemyWorkflowRunRepository:
                 )
         except WorkflowRunCancellationPersistenceInvariantViolation:
             raise
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise WorkflowRunCancellationPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise WorkflowRunPersistenceUnavailable from error
         except IntegrityError as error:
             raise WorkflowRunCancellationPersistenceInvariantViolation from error
         except DBAPIError as error:
@@ -272,6 +286,10 @@ class SQLAlchemyWorkflowRunRepository:
                 )
         except WorkflowRunCancellationPersistenceInvariantViolation:
             raise
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise WorkflowRunCancellationPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise WorkflowRunPersistenceUnavailable from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
 
@@ -311,6 +329,10 @@ class SQLAlchemyWorkflowRunRepository:
                 )
         except WorkflowRunCancellationPersistenceInvariantViolation:
             raise
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise WorkflowRunCancellationPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise WorkflowRunPersistenceUnavailable from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
 
@@ -415,6 +437,13 @@ class SQLAlchemyWorkflowRunRepository:
                 ).one_or_none()
                 if transitioned is None:
                     raise WorkflowRunCancellationPersistenceInvariantViolation
+                await append_status_changed_execution_event(
+                    session,
+                    workflow_run_id=workflow_run_id,
+                    task_run_id=None,
+                    previous_status=previous,
+                    status=WorkflowRunStatus.CANCELLED,
+                )
                 return CancellationFinalizationResult(
                     workflow_run_id,
                     True,
@@ -424,6 +453,10 @@ class SQLAlchemyWorkflowRunRepository:
                 )
         except WorkflowRunCancellationPersistenceInvariantViolation:
             raise
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise WorkflowRunCancellationPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise WorkflowRunPersistenceUnavailable from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
 
@@ -543,11 +576,23 @@ class SQLAlchemyWorkflowRunRepository:
         try:
             async with self._sessions.begin() as session:
                 rows = (await session.execute(statement)).all()
+                ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
+                for row in ordered:
+                    await append_status_changed_execution_event(
+                        session,
+                        workflow_run_id=workflow_run_id,
+                        task_run_id=row.id,
+                        previous_status=TaskRunStatus.BLOCKED,
+                        status=TaskRunStatus.RUNNABLE,
+                    )
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise WorkflowRunInspectionInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise WorkflowRunPersistenceUnavailable from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
 
         # PostgreSQL does not guarantee RETURNING order. Stabilize the boundary.
-        ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
         return RunnableTransitionResult(
             workflow_run_id=workflow_run_id,
             transitioned_task_ids=tuple(row.id for row in ordered),
@@ -579,11 +624,23 @@ class SQLAlchemyWorkflowRunRepository:
                             )
                         )
                     ).all()
+                ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
+                for row in ordered:
+                    await append_status_changed_execution_event(
+                        session,
+                        workflow_run_id=workflow_run_id,
+                        task_run_id=row.id,
+                        previous_status=TaskRunStatus.BLOCKED,
+                        status=TaskRunStatus.SKIPPED,
+                    )
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise WorkflowRunInspectionInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise WorkflowRunPersistenceUnavailable from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
 
         # PostgreSQL does not guarantee RETURNING order. Stabilize the boundary.
-        ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
         return DependencyFailurePropagationResult(
             workflow_run_id=workflow_run_id,
             skipped_task_ids=tuple(row.id for row in ordered),
@@ -619,6 +676,13 @@ class SQLAlchemyWorkflowRunRepository:
                     transitioned = (await session.execute(statement)).one_or_none()
                     if transitioned is not None:
                         resulting_status = WorkflowRunStatus(transitioned.status)
+                        await append_status_changed_execution_event(
+                            session,
+                            workflow_run_id=workflow_run_id,
+                            task_run_id=None,
+                            previous_status=previous_status,
+                            status=resulting_status,
+                        )
 
                 # Source-status branching above deliberately permits at most one
                 # guarded UPDATE. A selected transition ends this invocation.
@@ -628,6 +692,10 @@ class SQLAlchemyWorkflowRunRepository:
                     previous_status,
                     resulting_status,
                 )
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise WorkflowRunInspectionInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise WorkflowRunPersistenceUnavailable from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
 
@@ -1128,10 +1196,12 @@ def _run_inspection_statement(
             workflow_runs.join(
                 workflow_definitions,
                 workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
-            ).join(
+            )
+            .join(
                 workflow_versions,
                 workflow_versions.c.id == workflow_runs.c.workflow_version_id,
-            ).outerjoin(
+            )
+            .outerjoin(
                 workflow_run_cancellation_requests,
                 workflow_run_cancellation_requests.c.workflow_run_id
                 == workflow_runs.c.id,
@@ -1613,9 +1683,54 @@ async def _suppress_unstarted_task_rows(
     workflow_run_id: UUID,
 ) -> Sequence[Row[Any]]:
     """Cancel every pre-dispatch task while the caller holds the run lock."""
-    return (
-        await session.execute(_unstarted_task_suppression_statement(workflow_run_id))
+    eligible_statuses = (
+        TaskRunStatus.BLOCKED.value,
+        TaskRunStatus.RUNNABLE.value,
+        TaskRunStatus.RETRY_PENDING.value,
+        TaskRunStatus.RETRY_SCHEDULED.value,
+    )
+    selected = (
+        await session.execute(
+            select(
+                task_runs.c.id,
+                task_runs.c.step_identifier,
+                task_runs.c.status.label("previous_status"),
+            )
+            .where(
+                task_runs.c.workflow_run_id == workflow_run_id,
+                task_runs.c.status.in_(eligible_statuses),
+            )
+            .order_by(task_runs.c.step_identifier, task_runs.c.id)
+            .with_for_update()
+        )
     ).all()
+    if not selected:
+        return ()
+    updated = (
+        await session.execute(
+            update(task_runs)
+            .where(
+                task_runs.c.id.in_(tuple(row.id for row in selected)),
+                task_runs.c.status.in_(eligible_statuses),
+            )
+            .values(
+                status=TaskRunStatus.CANCELLED.value,
+                updated_at=func.statement_timestamp(),
+            )
+            .returning(task_runs.c.id)
+        )
+    ).all()
+    if {row.id for row in updated} != {row.id for row in selected}:
+        raise WorkflowRunCancellationPersistenceInvariantViolation
+    for row in selected:
+        await append_status_changed_execution_event(
+            session,
+            workflow_run_id=workflow_run_id,
+            task_run_id=row.id,
+            previous_status=TaskRunStatus(row.previous_status),
+            status=TaskRunStatus.CANCELLED,
+        )
+    return selected
 
 
 def _unstarted_task_suppression_statement(workflow_run_id: UUID) -> Any:
@@ -1669,7 +1784,7 @@ async def _settle_dispatched_task_rows(
     )
     if corrupt is not None:
         raise WorkflowRunCancellationPersistenceInvariantViolation
-    return (
+    rows = (
         await session.execute(
             update(task_runs)
             .where(
@@ -1684,6 +1799,16 @@ async def _settle_dispatched_task_rows(
             .returning(task_runs.c.id, task_runs.c.step_identifier)
         )
     ).all()
+    ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
+    for row in ordered:
+        await append_status_changed_execution_event(
+            session,
+            workflow_run_id=workflow_run_id,
+            task_run_id=row.id,
+            previous_status=TaskRunStatus.DISPATCHED,
+            status=TaskRunStatus.CANCELLED,
+        )
+    return ordered
 
 
 def _pending_to_running_statement(workflow_run_id: UUID) -> Any:

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import insert, select
 from sqlalchemy.engine import Row
@@ -11,6 +12,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.runs.domain import (
+    InvalidWorkflowRunExecutionEvent,
     NewWorkflowRunExecutionEvent,
     StoredWorkflowRunExecutionEvent,
 )
@@ -21,6 +23,33 @@ from taskforge.runs.persistence_ports import (
 from taskforge.runs.schema import workflow_run_execution_events
 
 MAX_EXECUTION_EVENT_PAGE_SIZE = 1000
+WORKFLOW_RUN_STATUS_CHANGED = "workflow_run.status_changed"
+TASK_RUN_STATUS_CHANGED = "task_run.status_changed"
+
+
+async def append_status_changed_execution_event(
+    session: AsyncSession,
+    *,
+    workflow_run_id: UUID,
+    task_run_id: UUID | None,
+    previous_status: StrEnum,
+    status: StrEnum,
+) -> StoredWorkflowRunExecutionEvent:
+    """Append one controlled workflow/task status transition event."""
+    event_type = (
+        WORKFLOW_RUN_STATUS_CHANGED if task_run_id is None else TASK_RUN_STATUS_CHANGED
+    )
+    try:
+        event = NewWorkflowRunExecutionEvent(
+            uuid4(),
+            workflow_run_id,
+            task_run_id,
+            event_type,
+            {"previous_status": previous_status.value, "status": status.value},
+        )
+    except InvalidWorkflowRunExecutionEvent as error:
+        raise WorkflowRunExecutionEventInvariantViolation from error
+    return await append_workflow_run_execution_event(session, event)
 
 
 async def append_workflow_run_execution_event(

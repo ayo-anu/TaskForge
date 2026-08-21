@@ -28,7 +28,12 @@ from taskforge.dispatch.publisher_ports import (
     StoredDispatch,
     UnpublishedDispatchCursor,
 )
+from taskforge.persistence.execution_events import append_status_changed_execution_event
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
+from taskforge.runs.persistence_ports import (
+    WorkflowRunExecutionEventInvariantViolation,
+    WorkflowRunExecutionEventPersistenceUnavailable,
+)
 from taskforge.runs.schema import (
     task_attempts,
     task_dispatch_outbox,
@@ -231,6 +236,18 @@ class SQLAlchemyTaskDispatchTransaction:
             raise TaskDispatchPersistenceUnavailable from error
         if transitioned is None:
             raise TaskDispatchStateConflict
+        try:
+            await append_status_changed_execution_event(
+                session,
+                workflow_run_id=prepared.workflow_run_id,
+                task_run_id=prepared.task_run_id,
+                previous_status=TaskRunStatus.RUNNABLE,
+                status=TaskRunStatus.DISPATCHED,
+            )
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise TaskDispatchPersistenceConflict from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise TaskDispatchPersistenceUnavailable from error
 
     async def commit(self) -> None:
         session = self._required_session()

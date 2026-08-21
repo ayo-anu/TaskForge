@@ -485,6 +485,25 @@ def test_repository_evaluates_at_most_one_transition_and_returns_result(
                 [SimpleNamespace(status=returned.value)] if returned is not None else []
             )
         )
+    if returned is not None:
+        results.append(
+            FakeResult(
+                [
+                    SimpleNamespace(
+                        id=uuid4(),
+                        workflow_run_id=run_id,
+                        cursor=1,
+                        task_run_id=None,
+                        event_type="workflow_run.status_changed",
+                        payload={
+                            "previous_status": source.value,
+                            "status": returned.value,
+                        },
+                        occurred_at=datetime.now(UTC),
+                    )
+                ]
+            )
+        )
     session = FakeSession(results)
 
     result = asyncio.run(
@@ -492,7 +511,7 @@ def test_repository_evaluates_at_most_one_transition_and_returns_result(
     )
 
     assert result == WorkflowRunEvaluationResult(run_id, True, source, expected)
-    assert session.execute_count <= 2
+    assert session.execute_count <= 3
     assert session.calls[-2:] == ["commit", "context_exit"]
 
 

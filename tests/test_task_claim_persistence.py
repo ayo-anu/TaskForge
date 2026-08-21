@@ -223,6 +223,18 @@ def test_repository_orchestrates_new_acquisition_in_one_context() -> None:
             SimpleNamespace(accepting_work=True, healthy=True),
             inserted,
             SimpleNamespace(id=envelope.task_run_id),
+            SimpleNamespace(
+                id=uuid4(),
+                workflow_run_id=envelope.workflow_run_id,
+                cursor=1,
+                task_run_id=envelope.task_run_id,
+                event_type="task_run.status_changed",
+                payload={
+                    "previous_status": "dispatched",
+                    "status": "claimed",
+                },
+                occurred_at=acquired_at,
+            ),
             None,
         ],
         [1, "test-capability", 1],

@@ -45,6 +45,8 @@ from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
 from taskforge.persistence.database import build_session_factory
 from taskforge.persistence.dispatch import SQLAlchemyTaskDispatchRepository
 from tests.integration.postgresql import (
+    ExpectedStatusExecutionEvent,
+    assert_status_execution_events,
     asyncpg_dsn,
     migration_database_url,
     temporary_database,
@@ -375,6 +377,15 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
         )
         assert replay.outcome is TaskClaimOutcome.REPLAYED_ACTIVE
         assert replay.result_authority is not None
+        await assert_status_execution_events(
+            setup,
+            dispatch.workflow_run_id,
+            (
+                ExpectedStatusExecutionEvent(
+                    dispatch.task_run_id, "dispatched", "claimed"
+                ),
+            ),
+        )
         original = next(
             result for result in results if not isinstance(result, Exception)
         )

@@ -6,6 +6,7 @@ import asyncio
 import os
 from uuid import UUID
 
+import asyncpg
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -24,7 +25,13 @@ from taskforge.runs.domain import (
 )
 from taskforge.runs.schema import task_runs, workflow_runs
 from taskforge.runs.service import WorkflowRunService, WorkflowRunServiceUnavailable
-from tests.integration.postgresql import migration_database_url, temporary_database
+from tests.integration.postgresql import (
+    ExpectedStatusExecutionEvent,
+    assert_status_execution_events,
+    asyncpg_dsn,
+    migration_database_url,
+    temporary_database,
+)
 from tests.integration.test_authentication_persistence import settings_for
 from tests.integration.test_workflow_run_dependency_failure_propagation import (
     seed_failure_graph,
@@ -81,6 +88,7 @@ async def set_all_tasks(
 
 async def verify_workflow_state_evaluation(database_url: URL) -> None:
     engine = build_async_engine(settings_for(database_url))
+    raw = await asyncpg.connect(asyncpg_dsn(database_url))
     sessions = build_session_factory(engine)
     repository = SQLAlchemyWorkflowRunRepository(sessions)
     service = WorkflowRunService(repository)
@@ -108,6 +116,11 @@ async def verify_workflow_state_evaluation(database_url: URL) -> None:
         running_no_op = await service.evaluate_workflow_run_state(created.id)
         assert not running_no_op.transitioned
         assert await run_projection(sessions, created.id) == before_running_no_op
+        await assert_status_execution_events(
+            raw,
+            created.id,
+            (ExpectedStatusExecutionEvent(None, "pending", "running"),),
+        )
 
         # Late all-success evaluation preserves pending -> running -> succeeded.
         await set_run_status(sessions, created.id, WorkflowRunStatus.PENDING)
@@ -284,6 +297,7 @@ async def verify_workflow_state_evaluation(database_url: URL) -> None:
         settled = await service.evaluate_workflow_run_state(created.id)
         assert settled.resulting_status is WorkflowRunStatus.FAILED
     finally:
+        await raw.close()
         await engine.dispose()
 
 

@@ -32,6 +32,8 @@ from taskforge.retries.service import (
     RetryTransitionServiceUnavailable,
 )
 from tests.integration.postgresql import (
+    ExpectedStatusExecutionEvent,
+    assert_status_execution_events,
     asyncpg_dsn,
     migration_database_url,
     temporary_database,
@@ -235,6 +237,15 @@ async def exercise_retry_transitions(database_url: URL) -> None:
                 workflow.task_run_id,
             )
             == 1
+        )
+        await assert_status_execution_events(
+            setup,
+            workflow.workflow_run_id,
+            (
+                ExpectedStatusExecutionEvent(
+                    workflow.task_run_id, "retry_pending", "retry_scheduled"
+                ),
+            ),
         )
 
         override = await add_retry_pending_task(

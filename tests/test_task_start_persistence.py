@@ -29,6 +29,10 @@ class FakeResult:
     def one_or_none(self) -> Any:
         return self.row
 
+    def one(self) -> Any:
+        assert self.row is not None
+        return self.row
+
 
 class FakeSession:
     def __init__(self, rows: list[object], scalars: list[object]) -> None:
@@ -98,10 +102,19 @@ def test_repository_commits_guarded_claimed_to_running_transition() -> None:
             SimpleNamespace(id=worker.worker_identity_id),
             SimpleNamespace(id=worker.credential_id),
             SimpleNamespace(ended_at=None),
-            SimpleNamespace(status=task.workflow_run_status),
+            SimpleNamespace(id=uuid4(), status=task.workflow_run_status),
             task,
             claim,
             SimpleNamespace(id=task_run_id),
+            SimpleNamespace(
+                id=uuid4(),
+                workflow_run_id=uuid4(),
+                cursor=1,
+                task_run_id=task_run_id,
+                event_type="task_run.status_changed",
+                payload={"previous_status": "claimed", "status": "running"},
+                occurred_at=datetime.now(UTC),
+            ),
         ],
         [1, False],
     )

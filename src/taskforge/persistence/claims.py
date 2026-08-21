@@ -49,7 +49,12 @@ from taskforge.dispatch.envelope import (
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.authorization import OwnerFilter
 from taskforge.identity.schema import worker_credentials, worker_identities
+from taskforge.persistence.execution_events import append_status_changed_execution_event
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
+from taskforge.runs.persistence_ports import (
+    WorkflowRunExecutionEventInvariantViolation,
+    WorkflowRunExecutionEventPersistenceUnavailable,
+)
 from taskforge.runs.schema import (
     task_attempt_claims,
     task_attempt_results,
@@ -324,6 +329,13 @@ class SQLAlchemyTaskClaimRepository:
                 ).one_or_none()
                 if transitioned is None:
                     raise TaskClaimInvariantViolation
+                await append_status_changed_execution_event(
+                    session,
+                    workflow_run_id=dispatch.workflow_run_id,
+                    task_run_id=dispatch.task_run_id,
+                    previous_status=TaskRunStatus.DISPATCHED,
+                    status=TaskRunStatus.CLAIMED,
+                )
                 await session.execute(
                     insert(task_claim_events).values(
                         id=uuid4(),
@@ -338,6 +350,10 @@ class SQLAlchemyTaskClaimRepository:
                 return _claim_result(inserted, TaskClaimOutcome.ACQUIRED_ACTIVE)
         except _CLAIM_REJECTIONS:
             raise
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise TaskClaimInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise TaskClaimPersistenceUnavailable from error
         except IntegrityError as error:
             raise TaskClaimInvariantViolation from error
         except DBAPIError as error:

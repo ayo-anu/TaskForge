@@ -26,6 +26,7 @@ pytestmark = [
 ]
 
 REVISION = "0022_run_execution_events"
+WAKEUP_REVISION = "0023_execution_event_wakeups"
 PREVIOUS_REVISION = "0021_recovered_cancellation"
 
 
@@ -48,7 +49,7 @@ async def assert_absent(database_url: URL) -> None:
         await connection.close()
 
 
-async def assert_catalog(database_url: URL) -> None:
+async def assert_catalog(database_url: URL, *, wakeup: bool) -> None:
     connection = await asyncpg.connect(asyncpg_dsn(database_url))
     try:
         columns = await connection.fetch(
@@ -113,11 +114,14 @@ async def assert_catalog(database_url: URL) -> None:
             "SELECT tgname FROM pg_trigger WHERE tgrelid = "
             "'workflow_run_execution_events'::regclass AND NOT tgisinternal"
         )
-        assert {row["tgname"] for row in triggers} == {
+        expected_triggers = {
             "trg_workflow_run_execution_events_allocate_cursor",
             "trg_workflow_run_execution_events_reject_mutation",
             "trg_workflow_run_execution_events_reject_truncate",
         }
+        if wakeup:
+            expected_triggers.add("trg_workflow_run_execution_events_publish_wakeup")
+        assert {row["tgname"] for row in triggers} == expected_triggers
         counter = await connection.fetchrow(
             "SELECT column_default, is_nullable FROM information_schema.columns "
             "WHERE table_name = 'workflow_runs' AND "
@@ -141,8 +145,12 @@ def test_execution_event_migration_is_exact_and_reversible() -> None:
             command.upgrade(config, PREVIOUS_REVISION)
             asyncio.run(assert_absent(database_url))
             command.upgrade(config, REVISION)
-            asyncio.run(assert_catalog(database_url))
+            asyncio.run(assert_catalog(database_url, wakeup=False))
+            command.upgrade(config, WAKEUP_REVISION)
+            asyncio.run(assert_catalog(database_url, wakeup=True))
+            command.downgrade(config, REVISION)
+            asyncio.run(assert_catalog(database_url, wakeup=False))
             command.downgrade(config, PREVIOUS_REVISION)
             asyncio.run(assert_absent(database_url))
             command.upgrade(config, "head")
-            asyncio.run(assert_catalog(database_url))
+            asyncio.run(assert_catalog(database_url, wakeup=True))

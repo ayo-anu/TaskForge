@@ -7,10 +7,11 @@ import os
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -18,6 +19,7 @@ from taskforge.dispatch.service import (
     DispatchedTask,
     TaskDispatchNotEligible,
     TaskDispatchService,
+    TaskDispatchServiceUnavailable,
 )
 from taskforge.identity.schema import api_principals
 from taskforge.persistence.database import build_async_engine, build_session_factory
@@ -26,6 +28,7 @@ from taskforge.runs.schema import (
     task_attempts,
     task_dispatch_outbox,
     task_runs,
+    workflow_run_execution_events,
     workflow_run_inputs,
     workflow_runs,
 )
@@ -40,7 +43,13 @@ from taskforge.workflows.task_types import (
     TaskTypeRegistry,
     WorkflowValidationIssue,
 )
-from tests.integration.postgresql import migration_database_url, temporary_database
+from tests.integration.postgresql import (
+    ExpectedStatusExecutionEvent,
+    assert_status_execution_events,
+    asyncpg_dsn,
+    migration_database_url,
+    temporary_database,
+)
 from tests.integration.test_authentication_persistence import settings_for
 
 pytestmark = [
@@ -175,11 +184,94 @@ async def verify_dispatch_creation(database_url: URL) -> None:
         assert "reference_sentinel" not in str(outbox.payload)
         assert task_status == "dispatched"
 
+        raw = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            await assert_status_execution_events(
+                raw,
+                workflow_run_id,
+                (ExpectedStatusExecutionEvent(task_run_id, "runnable", "dispatched"),),
+            )
+        finally:
+            await raw.close()
+
         with pytest.raises(TaskDispatchNotEligible):
             await service.dispatch_task(workflow_run_id, task_run_id)
         async with sessions() as session:
             assert len((await session.execute(select(task_attempts))).all()) == 1
             assert len((await session.execute(select(task_dispatch_outbox))).all()) == 1
+
+        rollback_run_id, rollback_task_id, _ = await seed_runnable_task(sessions)
+        async with sessions.begin() as session:
+            await session.execute(
+                text(
+                    "CREATE FUNCTION reject_dispatch_execution_event() RETURNS "
+                    "trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.task_run_id = "
+                    f"'{rollback_task_id}'::uuid THEN RAISE EXCEPTION "
+                    "'forced execution event failure'; END IF; RETURN NEW; END $$"
+                )
+            )
+            await session.execute(
+                text(
+                    "CREATE TRIGGER reject_dispatch_execution_event_trigger "
+                    "BEFORE INSERT ON workflow_run_execution_events FOR EACH ROW "
+                    "EXECUTE FUNCTION reject_dispatch_execution_event()"
+                )
+            )
+        with pytest.raises(TaskDispatchServiceUnavailable):
+            await service.dispatch_task(rollback_run_id, rollback_task_id)
+        async with sessions() as session:
+            assert (
+                await session.scalar(
+                    select(task_runs.c.status).where(task_runs.c.id == rollback_task_id)
+                )
+                == "runnable"
+            )
+            assert not (
+                await session.execute(
+                    select(task_attempts.c.id).where(
+                        task_attempts.c.task_run_id == rollback_task_id
+                    )
+                )
+            ).all()
+            assert not (
+                await session.execute(
+                    select(workflow_run_execution_events.c.id).where(
+                        workflow_run_execution_events.c.workflow_run_id
+                        == rollback_run_id
+                    )
+                )
+            ).all()
+            assert (
+                await session.scalar(
+                    select(workflow_runs.c.last_execution_event_cursor).where(
+                        workflow_runs.c.id == rollback_run_id
+                    )
+                )
+                == 0
+            )
+            assert not (
+                await session.execute(
+                    select(task_dispatch_outbox.c.id)
+                    .select_from(
+                        task_dispatch_outbox.join(
+                            task_attempts,
+                            task_attempts.c.id
+                            == task_dispatch_outbox.c.task_attempt_id,
+                        )
+                    )
+                    .where(task_attempts.c.task_run_id == rollback_task_id)
+                )
+            ).all()
+        async with sessions.begin() as session:
+            await session.execute(
+                text(
+                    "DROP TRIGGER reject_dispatch_execution_event_trigger ON "
+                    "workflow_run_execution_events"
+                )
+            )
+            await session.execute(
+                text("DROP FUNCTION reject_dispatch_execution_event()")
+            )
     finally:
         await engine.dispose()
 

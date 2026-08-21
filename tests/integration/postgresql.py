@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
-from uuid import uuid4
+from dataclasses import dataclass
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -36,6 +38,42 @@ SAFE_DATABASE_NAME = re.compile(
     r"taskforge_dead_letter_redrive|taskforge_run_cancellation|"
     r"taskforge_execution_event_mig|taskforge_execution_events)_[0-9a-f]{32}\Z"
 )
+
+
+@dataclass(frozen=True)
+class ExpectedStatusExecutionEvent:
+    task_run_id: UUID | None
+    previous_status: str
+    status: str
+
+
+async def assert_status_execution_events(
+    connection: asyncpg.Connection[asyncpg.Record],
+    workflow_run_id: UUID,
+    expected: tuple[ExpectedStatusExecutionEvent, ...],
+) -> None:
+    """Assert the complete ordered status-event stream for one workflow run."""
+    rows = await connection.fetch(
+        "SELECT cursor, task_run_id, event_type, payload FROM "
+        "workflow_run_execution_events WHERE workflow_run_id = $1 ORDER BY cursor",
+        workflow_run_id,
+    )
+    assert [row["cursor"] for row in rows] == list(range(1, len(expected) + 1))
+    assert len(rows) == len(expected)
+    for row, item in zip(rows, expected, strict=True):
+        assert row["task_run_id"] == item.task_run_id
+        assert row["event_type"] == (
+            "workflow_run.status_changed"
+            if item.task_run_id is None
+            else "task_run.status_changed"
+        )
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        assert payload == {
+            "previous_status": item.previous_status,
+            "status": item.status,
+        }
 
 
 def required_administrative_url(environment_variable: str) -> URL:

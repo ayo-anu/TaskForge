@@ -30,10 +30,13 @@ from taskforge.runs.domain import (
 )
 from taskforge.runs.schema import (
     workflow_run_cancellation_requests,
+    workflow_run_execution_events,
     workflow_runs,
 )
 from taskforge.runs.service import WorkflowRunService, WorkflowRunServiceUnavailable
 from tests.integration.postgresql import (
+    ExpectedStatusExecutionEvent,
+    assert_status_execution_events,
     asyncpg_dsn,
     migration_database_url,
     temporary_database,
@@ -77,6 +80,7 @@ async def _stored_run_and_request_count(
 
 async def _verify(database_url: URL) -> None:
     engine = build_async_engine(settings_for(database_url))
+    raw = await asyncpg.connect(asyncpg_dsn(database_url))
     sessions = build_session_factory(engine)
     repository = SQLAlchemyWorkflowRunRepository(sessions)
     service = WorkflowRunService(repository)
@@ -118,6 +122,31 @@ async def _verify(database_url: URL) -> None:
             "left": "claimed",
             "right": "running",
         }
+        task_ids = {
+            row["step_identifier"]: row["id"]
+            for row in await raw.fetch(
+                "SELECT id, step_identifier FROM task_runs WHERE workflow_run_id = $1",
+                created.id,
+            )
+        }
+        await assert_status_execution_events(
+            raw,
+            created.id,
+            (
+                ExpectedStatusExecutionEvent(None, "pending", "cancelling"),
+                ExpectedStatusExecutionEvent(task_ids["a"], "blocked", "cancelled"),
+                ExpectedStatusExecutionEvent(task_ids["b"], "runnable", "cancelled"),
+                ExpectedStatusExecutionEvent(
+                    task_ids["c"], "retry_pending", "cancelled"
+                ),
+                ExpectedStatusExecutionEvent(
+                    task_ids["independent"], "retry_scheduled", "cancelled"
+                ),
+                ExpectedStatusExecutionEvent(
+                    task_ids["join"], "dispatched", "cancelled"
+                ),
+            ),
+        )
 
         # Only an exact retry may heal missed pre-dispatch suppression.
         await set_statuses(sessions, created.id, a="runnable", b="blocked")
@@ -131,6 +160,14 @@ async def _verify(database_url: URL) -> None:
         assert unrelated.outcome is WorkflowRunCancellationOutcome.ALREADY_CANCELLING
         states = await status_map(sessions, created.id)
         assert states["a"] == "runnable" and states["b"] == "blocked"
+        assert (
+            await raw.fetchval(
+                "SELECT count(*) FROM workflow_run_execution_events "
+                "WHERE workflow_run_id = $1",
+                created.id,
+            )
+            == 6
+        )
 
         exact = await service.cancel_run(
             created.id,
@@ -198,7 +235,24 @@ async def _verify(database_url: URL) -> None:
             "pending",
             0,
         )
+        async with sessions() as session:
+            assert (
+                await session.scalar(
+                    select(workflow_runs.c.last_execution_event_cursor).where(
+                        workflow_runs.c.id == rollback.id
+                    )
+                )
+                == 0
+            )
+            assert not (
+                await session.execute(
+                    select(workflow_run_execution_events.c.id).where(
+                        workflow_run_execution_events.c.workflow_run_id == rollback.id
+                    )
+                )
+            ).all()
     finally:
+        await raw.close()
         await engine.dispose()
 
 

@@ -330,6 +330,68 @@ async def verify_concurrent_allocation(database_url: URL) -> None:
         )
 
 
+async def verify_transactional_wakeups(database_url: URL) -> None:
+    setup = await asyncpg.connect(asyncpg_dsn(database_url))
+    writer = await asyncpg.connect(asyncpg_dsn(database_url))
+    listener = await asyncpg.connect(asyncpg_dsn(database_url))
+    notifications: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+
+    def notified(
+        connection: asyncpg.Connection[asyncpg.Record],
+        pid: int,
+        channel: str,
+        payload: str,
+    ) -> None:
+        del connection, pid, channel
+        notifications.put_nowait(json.loads(payload))
+
+    try:
+        first_run, second_run, _, _ = await seed_runs(setup)
+        await listener.add_listener("taskforge_workflow_run_execution_events", notified)
+
+        transaction = writer.transaction()
+        await transaction.start()
+        await raw_append(writer, first_run)
+        await raw_append(writer, first_run)
+        assert notifications.empty()
+        await transaction.commit()
+
+        # A distinct committed run is a deterministic delimiter: PostgreSQL
+        # preserves notification commit order for this listening session.
+        await raw_append(setup, second_run)
+        observed: list[dict[str, str]] = []
+        async with asyncio.timeout(5):
+            while True:
+                item = await notifications.get()
+                observed.append(item)
+                if item == {"workflow_run_id": str(second_run)}:
+                    break
+        assert observed == [
+            {"workflow_run_id": str(first_run)},
+            {"workflow_run_id": str(second_run)},
+        ]
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM workflow_run_execution_events "
+                "WHERE workflow_run_id = $1",
+                first_run,
+            )
+            == 2
+        )
+
+        rollback = writer.transaction()
+        await rollback.start()
+        await raw_append(writer, first_run)
+        assert notifications.empty()
+        await rollback.rollback()
+        await raw_append(setup, second_run)
+        async with asyncio.timeout(5):
+            assert await notifications.get() == {"workflow_run_id": str(second_run)}
+        assert notifications.empty()
+    finally:
+        await asyncio.gather(setup.close(), writer.close(), listener.close())
+
+
 def test_execution_event_constraints_immutability_and_pagination() -> None:
     with temporary_database(
         "TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL",
@@ -367,3 +429,16 @@ def test_execution_event_concurrent_cursor_allocation_is_commit_safe() -> None:
         with migration_database_url(rendered):
             command.upgrade(Config("alembic.ini"), "head")
         asyncio.run(verify_concurrent_allocation(database_url))
+
+
+def test_execution_event_wakeups_are_transactional_and_run_scoped() -> None:
+    with temporary_database(
+        "TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL",
+        "taskforge_execution_events",
+    ) as database_url:
+        rendered = database_url.set(drivername="postgresql+asyncpg").render_as_string(
+            hide_password=False
+        )
+        with migration_database_url(rendered):
+            command.upgrade(Config("alembic.ini"), "head")
+        asyncio.run(verify_transactional_wakeups(database_url))

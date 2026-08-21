@@ -68,6 +68,8 @@ from taskforge.worker.results import (
     task_result_fingerprint,
 )
 from tests.integration.postgresql import (
+    ExpectedStatusExecutionEvent,
+    assert_status_execution_events,
     asyncpg_dsn,
     migration_database_url,
     temporary_database,
@@ -348,6 +350,15 @@ async def exercise_recovery(database_url: URL) -> None:
                 retryable.task_attempt_id,
             )
             == 1
+        )
+        await assert_status_execution_events(
+            connection,
+            retryable.workflow_run_id,
+            (
+                ExpectedStatusExecutionEvent(
+                    retryable.task_run_id, "running", "retry_scheduled"
+                ),
+            ),
         )
         original_dispatch = await connection.fetchval(
             "SELECT id FROM task_dispatch_outbox WHERE task_attempt_id = $1",
@@ -1103,7 +1114,7 @@ async def exercise_recovery(database_url: URL) -> None:
             "'injected progression failure'; END $$"
         )
         await connection.execute(
-            "CREATE TRIGGER trg_inject_progression_failure BEFORE UPDATE ON "
+            "CREATE TRIGGER trg_inject_progression_failure BEFORE UPDATE OF status ON "
             "workflow_runs FOR EACH ROW EXECUTE FUNCTION "
             "reject_recovery_progression()"
         )

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
+from taskforge.runs.domain import TaskRunStatus
+
 MAX_RECOVERY_SCAN_BATCH_SIZE = 100
 
 type JSONValue = (
@@ -19,6 +21,7 @@ class PreparedExpiredClaimRecovery:
     task_attempt_id: UUID
     task_run_id: UUID
     workflow_run_id: UUID
+    previous_task_status: TaskRunStatus
     attempt_number: int
     generation: int
     worker_session_id: UUID
@@ -50,6 +53,7 @@ class PreparedCancellationSettlement:
     task_attempt_id: UUID
     task_run_id: UUID
     workflow_run_id: UUID
+    previous_task_status: TaskRunStatus
     attempt_number: int
     generation: int
     worker_session_id: UUID
