@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -72,6 +73,17 @@ def message_metadata(message: AbstractIncomingMessage) -> DispatchTransportMetad
         message.content_type,
         message.content_encoding,
     )
+
+
+def first_dead_letter_event(
+    message: AbstractIncomingMessage,
+) -> Mapping[str, object]:
+    history = message.headers.get("x-death")
+    assert isinstance(history, list)
+    assert len(history) == 1
+    event = history[0]
+    assert isinstance(event, dict)
+    return event
 
 
 async def poll_message(
@@ -151,7 +163,7 @@ async def verify_topology(amqp_url: str) -> None:
             )
 
         malformed_value = json.loads(body)
-        malformed_value["schema_version"] = 2
+        malformed_value["schema_version"] = 4
         malformed_body = json.dumps(malformed_value, separators=(",", ":")).encode()
         await topology.exchange.publish(
             aio_pika.Message(
@@ -175,13 +187,59 @@ async def verify_topology(amqp_url: str) -> None:
         await reject_permanently_malformed(malformed)
         quarantined = await poll_message(topology.quarantine_queue)
         assert quarantined.body == malformed_body
-        await quarantined.ack()
+        dead_letter = first_dead_letter_event(quarantined)
+        assert dead_letter["reason"] == "rejected"
+        assert dead_letter["count"] == 1
+        assert (
+            dead_letter["queue"] == topology.capability_queues["document-workers"].name
+        )
+        assert dead_letter["exchange"] == topology.exchange.name
+        assert dead_letter["routing-keys"] == [envelope.route]
+        await quarantined.reject(requeue=False)
+
+        await channel.close()
+        channel = await connection.channel(
+            publisher_confirms=True, on_return_raises=True
+        )
+        topology = await declare_dispatch_topology(channel, registry(), configuration)
         assert (
             await topology.capability_queues["document-workers"].get(
                 fail=False, timeout=0.25
             )
             is None
         )
+        assert await topology.quarantine_queue.get(fail=False, timeout=0.25) is None
+
+        await topology.exchange.publish(
+            aio_pika.Message(
+                body,
+                content_type="application/json",
+                content_encoding="utf-8",
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                message_id=str(envelope.dispatch_id),
+            ),
+            routing_key=envelope.route,
+            mandatory=True,
+            timeout=3,
+        )
+        transient = await poll_message(topology.capability_queues["document-workers"])
+        assert not transient.redelivered
+        await channel.close()
+
+        channel = await connection.channel(
+            publisher_confirms=True, on_return_raises=True
+        )
+        topology = await declare_dispatch_topology(channel, registry(), configuration)
+        redelivered = await poll_message(topology.capability_queues["document-workers"])
+        assert redelivered.redelivered
+        assert isinstance(
+            validate_dispatch_transport(
+                redelivered.body, message_metadata(redelivered)
+            ),
+            ValidatedDispatchTransport,
+        )
+        await redelivered.ack()
+        assert await topology.quarantine_queue.get(fail=False, timeout=0.25) is None
 
         mismatch_channel = await connection.channel()
         with pytest.raises(ChannelPreconditionFailed):

@@ -588,6 +588,26 @@ def test_malformed_delivery_is_rejected_without_claiming() -> None:
     assert malformed.actions == ["reject:False"]
 
 
+def test_local_handler_registration_drift_preserves_valid_delivery() -> None:
+    _, control, issued, worker, _ = fixture()
+    task_types = TaskTypeRegistry(
+        (TaskTypeDefinition("test.task", "test-capability", AcceptParameters()),)
+    )
+    consumer = WorkerExecutionConsumer(
+        ClaimService(issued),
+        StartService([]),
+        ResultService(),
+        TaskHandlerRegistry((), task_types),
+        worker,
+        issued.claim.worker_session_id,
+    )
+
+    with pytest.raises(WorkerConsumptionPaused, match="registration drift"):
+        asyncio.run(consumer.consume(control))
+
+    assert control.actions == []
+
+
 @pytest.mark.parametrize(
     ("reason", "action", "paused"),
     (

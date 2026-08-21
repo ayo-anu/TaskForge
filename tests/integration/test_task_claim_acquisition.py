@@ -28,7 +28,11 @@ from taskforge.claims.persistence_ports import (
     TaskClaimAttemptStale,
     TaskClaimWorkerUnavailable,
 )
-from taskforge.claims.service import TaskClaimService, TaskClaimServiceUnavailable
+from taskforge.claims.service import (
+    TaskClaimService,
+    TaskClaimServiceInvariantError,
+    TaskClaimServiceUnavailable,
+)
 from taskforge.dispatch.envelope import (
     DispatchEnvelope,
     create_dispatch_envelope,
@@ -253,6 +257,47 @@ async def run_serialized_claim_race(
         await observer.close()
 
 
+async def exercise_database_outage_during_claim(
+    setup: asyncpg.Connection[asyncpg.Record],
+    database_url: URL,
+    service: TaskClaimService,
+) -> None:
+    dispatch = await add_dispatched_task(setup)
+    worker = await add_worker(setup)
+    blocker = await asyncpg.connect(asyncpg_dsn(database_url))
+    observer = await asyncpg.connect(asyncpg_dsn(database_url))
+    transaction = blocker.transaction()
+    pending: asyncio.Task[IssuedTaskClaim] | None = None
+    await transaction.start()
+    try:
+        await blocker.execute(
+            "SELECT id FROM task_runs WHERE id = $1 FOR UPDATE", dispatch.task_run_id
+        )
+        pending = asyncio.create_task(
+            service.claim_task(worker.authenticated, worker.session_id, dispatch)
+        )
+        await wait_for_lock_waiter(observer)
+        waiter_pid = await observer.fetchval(
+            "SELECT pid FROM pg_stat_activity WHERE datname = current_database() "
+            "AND pid <> ALL($1::int[]) AND wait_event_type = 'Lock' "
+            "ORDER BY query_start LIMIT 1",
+            [blocker.get_server_pid(), observer.get_server_pid()],
+        )
+        assert isinstance(waiter_pid, int)
+        assert await observer.fetchval("SELECT pg_terminate_backend($1)", waiter_pid)
+        with pytest.raises(TaskClaimServiceUnavailable):
+            await pending
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+        if blocker.is_in_transaction():
+            await transaction.rollback()
+        await blocker.close()
+        await observer.close()
+
+
 async def exercise_claim_acquisition(database_url: URL) -> None:
     dsn = asyncpg_dsn(database_url)
     setup = await asyncpg.connect(dsn)
@@ -328,6 +373,7 @@ async def exercise_claim_acquisition(database_url: URL) -> None:
         assert expired.result_authority is None
 
         await exercise_service_rejections(setup, service)
+        await exercise_database_outage_during_claim(setup, database_url, service)
 
         duplicate_dispatch = await add_dispatched_task(setup)
         duplicate_worker = await add_worker(setup)
@@ -496,6 +542,28 @@ async def assert_service_rejection_does_not_mutate(
 async def exercise_service_rejections(
     setup: asyncpg.Connection[asyncpg.Record], service: TaskClaimService
 ) -> None:
+    unknown_task = await add_dispatched_task(setup)
+    unknown_task_mapping = dispatch_envelope_to_mapping(unknown_task)
+    unknown_task_mapping["task_run_id"] = str(uuid4())
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        await add_worker(setup),
+        deserialize_dispatch_envelope(json.dumps(unknown_task_mapping).encode()),
+        TaskClaimRejectionReason.INVALID_DISPATCH,
+    )
+
+    unknown_dispatch = await add_dispatched_task(setup)
+    unknown_dispatch_mapping = dispatch_envelope_to_mapping(unknown_dispatch)
+    unknown_dispatch_mapping["dispatch_id"] = str(uuid4())
+    await assert_service_rejection_does_not_mutate(
+        setup,
+        service,
+        await add_worker(setup),
+        deserialize_dispatch_envelope(json.dumps(unknown_dispatch_mapping).encode()),
+        TaskClaimRejectionReason.INVALID_DISPATCH,
+    )
+
     stale_worker = await add_worker(setup)
     stale_dispatch = await add_dispatched_task(setup)
     await setup.execute(
@@ -531,6 +599,15 @@ async def exercise_service_rejections(
         mismatched_delivery,
         TaskClaimRejectionReason.INVALID_DISPATCH,
     )
+
+    corrupt_dispatch = await add_dispatched_task(setup, status="claimed")
+    corrupt_worker = await add_worker(setup)
+    with pytest.raises(TaskClaimServiceInvariantError):
+        await service.claim_task(
+            corrupt_worker.authenticated,
+            corrupt_worker.session_id,
+            corrupt_dispatch,
+        )
 
     deadline_dispatch = await add_dispatched_task(setup)
     deadline_tampering = create_dispatch_envelope(

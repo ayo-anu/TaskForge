@@ -131,7 +131,7 @@ class SQLAlchemyTaskClaimRepository:
                     )
                 ).one_or_none()
                 if task is None:
-                    raise TaskClaimInvariantViolation
+                    raise TaskClaimDispatchRejected
 
                 durable = (
                     await session.execute(
@@ -172,7 +172,7 @@ class SQLAlchemyTaskClaimRepository:
                     )
                 ).one_or_none()
                 if durable is None:
-                    raise TaskClaimInvariantViolation
+                    raise TaskClaimDispatchRejected
                 if not _dispatch_matches(dispatch, durable):
                     raise TaskClaimDispatchRejected
 
