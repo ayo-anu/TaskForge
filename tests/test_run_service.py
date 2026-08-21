@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
     CreatedWorkflowRun,
@@ -24,6 +25,7 @@ from taskforge.runs.domain import (
     NewWorkflowRun,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunIdempotencyConflict,
@@ -40,6 +42,7 @@ from taskforge.runs.domain import (
 from taskforge.runs.persistence_ports import (
     ExistingIdempotentWorkflowRun,
     IdempotentCreationPreparation,
+    PersistedWorkflowRunCancellation,
     PreparedWorkflowRunCreation,
     WorkflowRunCreationTransaction,
     WorkflowRunCreationTransactionContext,
@@ -79,6 +82,15 @@ class FakeRepository:
 
     def creation_transaction(self) -> WorkflowRunCreationTransactionContext:
         raise AssertionError("creation transaction was not expected")
+
+    async def cancel_run(
+        self,
+        workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+        command: WorkflowRunCancellationCommand,
+    ) -> PersistedWorkflowRunCancellation | None:
+        del workflow_run_id, owner_filter, command
+        raise AssertionError("cancellation was not expected")
 
     async def find_idempotent_run(
         self, principal_id: UUID, workflow_id: UUID, key_digest: str
@@ -542,6 +554,15 @@ class CreationRepository:
 
     def creation_transaction(self) -> WorkflowRunCreationTransactionContext:
         return self.transaction
+
+    async def cancel_run(
+        self,
+        workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+        command: WorkflowRunCancellationCommand,
+    ) -> PersistedWorkflowRunCancellation | None:
+        del workflow_run_id, owner_filter, command
+        raise AssertionError("cancellation was not expected")
 
     async def resolve_workflow_version(
         self,

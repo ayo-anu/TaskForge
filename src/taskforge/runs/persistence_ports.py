@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from types import TracebackType
 from typing import Protocol
 from uuid import UUID
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
+    AcceptedWorkflowRunCancellation,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     InspectedTaskRun,
@@ -17,9 +20,11 @@ from taskforge.runs.domain import (
     NewTaskRun,
     NewWorkflowRun,
     RunnableTransitionResult,
+    WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunInput,
+    WorkflowRunStatus,
     WorkflowRunVersionSnapshot,
     WorkflowVersionSelection,
 )
@@ -32,6 +37,27 @@ class WorkflowRunPersistenceUnavailable(Exception):
 
 class WorkflowRunInspectionInvariantViolation(Exception):
     """Durable workflow-run inspection facts are inconsistent."""
+
+
+class WorkflowRunCancellationPersistenceInvariantViolation(Exception):
+    """Durable cancellation facts violate the accepted state relationship."""
+
+
+class PersistedCancellationOutcome(StrEnum):
+    NEWLY_ACCEPTED = "newly_accepted"
+    EXACT_RETRY = "exact_retry"
+    ALREADY_CANCELLING = "already_cancelling"
+    ALREADY_CANCELLED = "already_cancelled"
+    TERMINAL_STATE_WON = "terminal_state_won"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+
+
+@dataclass(frozen=True)
+class PersistedWorkflowRunCancellation:
+    workflow_run_id: UUID
+    outcome: PersistedCancellationOutcome
+    status: WorkflowRunStatus
+    canonical_request: AcceptedWorkflowRunCancellation | None = None
 
 
 class WorkflowRunRecordConflict(Exception):
@@ -134,6 +160,13 @@ class WorkflowRunCreationTransactionContext(Protocol):
 
 class WorkflowRunRepository(Protocol):
     def creation_transaction(self) -> WorkflowRunCreationTransactionContext: ...
+
+    async def cancel_run(
+        self,
+        workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+        command: WorkflowRunCancellationCommand,
+    ) -> PersistedWorkflowRunCancellation | None: ...
 
     async def find_idempotent_run(
         self,

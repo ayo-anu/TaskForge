@@ -56,6 +56,18 @@ class WorkflowRunIdempotencyConflict(Exception):
     """A scoped idempotency key was reused for a different request."""
 
 
+class InvalidWorkflowRunCancellationIdempotencyKey(ValueError):
+    """A cancellation idempotency key is not a bounded opaque token."""
+
+
+class InvalidWorkflowRunCancellationReason(ValueError):
+    """A cancellation reason is neither absent nor bounded nonblank text."""
+
+
+class WorkflowRunCancellationIdempotencyConflict(Exception):
+    """A cancellation key was reused by its requester for different semantics."""
+
+
 class WorkflowRunStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -63,6 +75,14 @@ class WorkflowRunStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class WorkflowRunCancellationOutcome(StrEnum):
+    NEWLY_ACCEPTED = "newly_accepted"
+    EXACT_RETRY = "exact_retry"
+    ALREADY_CANCELLING = "already_cancelling"
+    ALREADY_CANCELLED = "already_cancelled"
+    TERMINAL_STATE_WON = "terminal_state_won"
 
 
 MAX_WORKFLOW_RECONCILIATION_ITERATIONS = 8
@@ -426,6 +446,54 @@ class WorkflowRunIdempotency:
         )
 
 
+@dataclass(frozen=True, repr=False)
+class WorkflowRunCancellationIdempotency:
+    key_digest: str
+    request_fingerprint: str
+
+    def __repr__(self) -> str:
+        return (
+            "WorkflowRunCancellationIdempotency(key_digest=<redacted>, "
+            "request_fingerprint=<redacted>)"
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowRunCancellationCommand:
+    workflow_run_id: UUID
+    requested_by_principal_id: UUID
+    reason: str | None
+    idempotency: WorkflowRunCancellationIdempotency
+
+
+@dataclass(frozen=True)
+class AcceptedWorkflowRunCancellation:
+    requested_by_principal_id: UUID
+    reason: str | None
+    requested_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.requested_at.tzinfo is None:
+            raise ValueError("cancellation request timestamp must be timezone-aware")
+        object.__setattr__(self, "requested_at", self.requested_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class WorkflowRunCancellationResult:
+    workflow_run_id: UUID
+    outcome: WorkflowRunCancellationOutcome
+    status: WorkflowRunStatus
+    accepted_request: AcceptedWorkflowRunCancellation | None = None
+
+    def __post_init__(self) -> None:
+        exposes_request = self.outcome in (
+            WorkflowRunCancellationOutcome.NEWLY_ACCEPTED,
+            WorkflowRunCancellationOutcome.EXACT_RETRY,
+        )
+        if exposes_request is (self.accepted_request is None):
+            raise ValueError("cancellation outcome and request disclosure disagree")
+
+
 def require_run_available(status: WorkflowDefinitionStatus) -> None:
     """Reject every definition state except enabled."""
     if status is not WorkflowDefinitionStatus.ENABLED:
@@ -500,6 +568,58 @@ def create_workflow_run_idempotency(
         key_digest=key_digest,
         request_fingerprint=_versioned_sha256(
             b"taskforge:workflow-run-request-fingerprint:v1\0" + encoded
+        ),
+    )
+
+
+def create_workflow_run_cancellation_command(
+    workflow_run_id: UUID,
+    requested_by_principal_id: UUID,
+    *,
+    idempotency_key: object,
+    reason: object,
+) -> WorkflowRunCancellationCommand:
+    """Normalize and fingerprint one cancellation command before persistence."""
+    if (
+        not isinstance(idempotency_key, str)
+        or not 16 <= len(idempotency_key) <= 128
+        or any(not 0x21 <= ord(character) <= 0x7E for character in idempotency_key)
+    ):
+        raise InvalidWorkflowRunCancellationIdempotencyKey
+    if reason is None:
+        normalized_reason = None
+    elif isinstance(reason, str):
+        normalized_reason = reason.strip()
+        if not 1 <= len(normalized_reason) <= 2000:
+            raise InvalidWorkflowRunCancellationReason
+    else:
+        raise InvalidWorkflowRunCancellationReason
+    normalized = {
+        "operation": "workflow_run_cancel",
+        "reason": normalized_reason,
+        "requested_by_principal_id": str(requested_by_principal_id),
+        "schema_version": 1,
+        "workflow_run_id": str(workflow_run_id),
+    }
+    encoded = json.dumps(
+        normalized,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return WorkflowRunCancellationCommand(
+        workflow_run_id,
+        requested_by_principal_id,
+        normalized_reason,
+        WorkflowRunCancellationIdempotency(
+            hashlib.sha256(
+                b"taskforge:workflow-run-cancellation-key:v1\0"
+                + idempotency_key.encode("ascii")
+            ).hexdigest(),
+            hashlib.sha256(
+                b"taskforge:workflow-run-cancellation-request:v1\0" + encoded
+            ).hexdigest(),
         ),
     )
 

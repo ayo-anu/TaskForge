@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import cast
 from uuid import UUID, uuid4
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
@@ -17,6 +18,9 @@ from taskforge.runs.domain import (
     ResolvedWorkflowVersion,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowRunCancellationIdempotencyConflict,
+    WorkflowRunCancellationOutcome,
+    WorkflowRunCancellationResult,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunIdempotencyConflict,
@@ -24,6 +28,7 @@ from taskforge.runs.domain import (
     WorkflowRunReconciliationResult,
     WorkflowRunStatus,
     WorkflowVersionSelection,
+    create_workflow_run_cancellation_command,
     create_workflow_run_idempotency,
     create_workflow_run_input,
     idempotency_fingerprints_match,
@@ -32,8 +37,10 @@ from taskforge.runs.domain import (
 )
 from taskforge.runs.persistence_ports import (
     ExistingIdempotentWorkflowRun,
+    PersistedCancellationOutcome,
     PreparedWorkflowRunCreation,
     RetryEventInspectionRepository,
+    WorkflowRunCancellationPersistenceInvariantViolation,
     WorkflowRunCreationTransaction,
     WorkflowRunIdempotencyRecordConflict,
     WorkflowRunInspectionInvariantViolation,
@@ -71,9 +78,58 @@ class WorkflowRunInspectionInvariantError(Exception):
     """Durable workflow-run inspection facts are inconsistent."""
 
 
+class WorkflowRunCancellationInvariantError(Exception):
+    """Durable cancellation facts are internally inconsistent."""
+
+
 class WorkflowRunService:
     def __init__(self, repository: WorkflowRunRepository) -> None:
         self._repository = repository
+
+    async def cancel_run(
+        self,
+        workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+        *,
+        requested_by_principal_id: UUID,
+        idempotency_key: object,
+        reason: object,
+    ) -> WorkflowRunCancellationResult:
+        """Accept or replay one owner-scoped workflow cancellation intention."""
+        command = create_workflow_run_cancellation_command(
+            workflow_run_id,
+            requested_by_principal_id,
+            idempotency_key=idempotency_key,
+            reason=reason,
+        )
+        try:
+            persisted = await self._repository.cancel_run(
+                workflow_run_id, owner_filter, command
+            )
+        except WorkflowRunCancellationPersistenceInvariantViolation as error:
+            raise WorkflowRunCancellationInvariantError from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        if persisted is None:
+            raise WorkflowRunNotFound
+        if persisted.outcome is PersistedCancellationOutcome.IDEMPOTENCY_CONFLICT:
+            raise WorkflowRunCancellationIdempotencyConflict
+        outcome = WorkflowRunCancellationOutcome(persisted.outcome.value)
+        disclosed = (
+            persisted.canonical_request
+            if outcome
+            in (
+                WorkflowRunCancellationOutcome.NEWLY_ACCEPTED,
+                WorkflowRunCancellationOutcome.EXACT_RETRY,
+            )
+            else None
+        )
+        return WorkflowRunCancellationResult(
+            workflow_run_id,
+            outcome,
+            persisted.status,
+            disclosed,
+        )
 
     async def resolve_version(
         self,

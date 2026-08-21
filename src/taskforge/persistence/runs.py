@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import TracebackType
 from typing import Any
 from uuid import UUID
@@ -26,6 +27,7 @@ from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.retries.domain import (
     InspectedRetryEvent,
     InspectedRetryEventPage,
@@ -36,6 +38,7 @@ from taskforge.retries.domain import (
     resolve_persisted_retry_policy,
 )
 from taskforge.runs.domain import (
+    AcceptedWorkflowRunCancellation,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
@@ -46,6 +49,7 @@ from taskforge.runs.domain import (
     RunFailureReason,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunInput,
@@ -58,7 +62,10 @@ from taskforge.runs.domain import (
 from taskforge.runs.persistence_ports import (
     ExistingIdempotentWorkflowRun,
     IdempotentCreationPreparation,
+    PersistedCancellationOutcome,
+    PersistedWorkflowRunCancellation,
     PreparedWorkflowRunCreation,
+    WorkflowRunCancellationPersistenceInvariantViolation,
     WorkflowRunIdempotencyRecordConflict,
     WorkflowRunInspectionInvariantViolation,
     WorkflowRunPersistenceUnavailable,
@@ -71,6 +78,7 @@ from taskforge.runs.schema import (
     task_attempts,
     task_retry_events,
     task_runs,
+    workflow_run_cancellation_requests,
     workflow_run_idempotency,
     workflow_run_inputs,
     workflow_runs,
@@ -101,6 +109,125 @@ class SQLAlchemyWorkflowRunRepository:
 
     def creation_transaction(self) -> SQLAlchemyWorkflowRunCreationTransaction:
         return SQLAlchemyWorkflowRunCreationTransaction(self._sessions)
+
+    async def cancel_run(
+        self,
+        workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+        command: WorkflowRunCancellationCommand,
+    ) -> PersistedWorkflowRunCancellation | None:
+        if command.workflow_run_id != workflow_run_id:
+            raise ValueError("cancellation command targets a different workflow run")
+        try:
+            async with self._sessions.begin() as session:
+                locked = (
+                    await session.execute(
+                        _workflow_run_cancellation_lock_statement(
+                            workflow_run_id, owner_filter
+                        )
+                    )
+                ).one_or_none()
+                if locked is None:
+                    return None
+                try:
+                    status = WorkflowRunStatus(locked.status)
+                except ValueError as error:
+                    raise WorkflowRunCancellationPersistenceInvariantViolation from error
+                existing = (
+                    await session.execute(
+                        _workflow_run_cancellation_request_statement(workflow_run_id)
+                    )
+                ).one_or_none()
+                if existing is not None:
+                    if status not in (
+                        WorkflowRunStatus.CANCELLING,
+                        WorkflowRunStatus.CANCELLED,
+                    ):
+                        raise WorkflowRunCancellationPersistenceInvariantViolation
+                    canonical = _accepted_cancellation(existing)
+                    same_scope_and_key = (
+                        existing.requested_by_principal_id
+                        == command.requested_by_principal_id
+                        and existing.idempotency_key_digest
+                        == command.idempotency.key_digest
+                    )
+                    if same_scope_and_key:
+                        outcome = (
+                            PersistedCancellationOutcome.EXACT_RETRY
+                            if hmac.compare_digest(
+                                existing.request_fingerprint,
+                                command.idempotency.request_fingerprint,
+                            )
+                            else PersistedCancellationOutcome.IDEMPOTENCY_CONFLICT
+                        )
+                    else:
+                        outcome = (
+                            PersistedCancellationOutcome.ALREADY_CANCELLING
+                            if status is WorkflowRunStatus.CANCELLING
+                            else PersistedCancellationOutcome.ALREADY_CANCELLED
+                        )
+                    return PersistedWorkflowRunCancellation(
+                        workflow_run_id, outcome, status, canonical
+                    )
+
+                if status in (
+                    WorkflowRunStatus.CANCELLING,
+                    WorkflowRunStatus.CANCELLED,
+                ):
+                    raise WorkflowRunCancellationPersistenceInvariantViolation
+                if status in (
+                    WorkflowRunStatus.SUCCEEDED,
+                    WorkflowRunStatus.FAILED,
+                ):
+                    return PersistedWorkflowRunCancellation(
+                        workflow_run_id,
+                        PersistedCancellationOutcome.TERMINAL_STATE_WON,
+                        status,
+                    )
+                if status not in (
+                    WorkflowRunStatus.PENDING,
+                    WorkflowRunStatus.RUNNING,
+                ):
+                    raise WorkflowRunCancellationPersistenceInvariantViolation
+
+                inserted = (
+                    await session.execute(
+                        insert(workflow_run_cancellation_requests)
+                        .values(
+                            workflow_run_id=workflow_run_id,
+                            requested_by_principal_id=(
+                                command.requested_by_principal_id
+                            ),
+                            idempotency_key_digest=command.idempotency.key_digest,
+                            request_fingerprint=(
+                                command.idempotency.request_fingerprint
+                            ),
+                            reason=command.reason,
+                        )
+                        .returning(*workflow_run_cancellation_requests.c)
+                    )
+                ).one()
+                transitioned = (
+                    await session.execute(
+                        _workflow_run_to_cancelling_statement(
+                            workflow_run_id, status, inserted.requested_at
+                        )
+                    )
+                ).one_or_none()
+                if transitioned is None:
+                    raise WorkflowRunCancellationPersistenceInvariantViolation
+                return PersistedWorkflowRunCancellation(
+                    workflow_run_id,
+                    PersistedCancellationOutcome.NEWLY_ACCEPTED,
+                    WorkflowRunStatus.CANCELLING,
+                    _accepted_cancellation(inserted),
+                )
+        except WorkflowRunCancellationPersistenceInvariantViolation:
+            raise
+        except IntegrityError as error:
+            raise WorkflowRunCancellationPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
 
     async def find_idempotent_run(
         self,
@@ -1136,6 +1263,55 @@ def _workflow_run_evaluation_lock_statement(
     )
 
 
+def _workflow_run_cancellation_lock_statement(
+    workflow_run_id: UUID,
+    owner_filter: OwnerFilter,
+) -> Select[Any]:
+    conditions: list[Any] = [workflow_runs.c.id == workflow_run_id]
+    if not owner_filter.unrestricted:
+        conditions.append(
+            workflow_definitions.c.owner_principal_id == owner_filter.principal_id
+        )
+    return (
+        select(workflow_runs.c.id, workflow_runs.c.status)
+        .select_from(
+            workflow_runs.join(
+                workflow_definitions,
+                workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
+            )
+        )
+        .where(*conditions)
+        .with_for_update(of=workflow_runs)
+    )
+
+
+def _workflow_run_cancellation_request_statement(
+    workflow_run_id: UUID,
+) -> Select[Any]:
+    return select(*workflow_run_cancellation_requests.c).where(
+        workflow_run_cancellation_requests.c.workflow_run_id == workflow_run_id
+    )
+
+
+def _workflow_run_to_cancelling_statement(
+    workflow_run_id: UUID,
+    expected_status: WorkflowRunStatus,
+    requested_at: datetime,
+) -> Any:
+    return (
+        update(workflow_runs)
+        .where(
+            workflow_runs.c.id == workflow_run_id,
+            workflow_runs.c.status == expected_status.value,
+        )
+        .values(
+            status=WorkflowRunStatus.CANCELLING.value,
+            updated_at=requested_at,
+        )
+        .returning(workflow_runs.c.status)
+    )
+
+
 def _pending_to_running_statement(workflow_run_id: UUID) -> Any:
     """Build the sole transition valid for a pending workflow run."""
     execution_progress_exists = exists(
@@ -1433,6 +1609,17 @@ def _existing_idempotent_run(row: Row[Any]) -> ExistingIdempotentWorkflowRun:
             blocked_task_count=row.blocked_task_count,
         ),
     )
+
+
+def _accepted_cancellation(row: Row[Any]) -> AcceptedWorkflowRunCancellation:
+    try:
+        return AcceptedWorkflowRunCancellation(
+            row.requested_by_principal_id,
+            row.reason,
+            row.requested_at,
+        )
+    except (TypeError, ValueError) as error:
+        raise WorkflowRunCancellationPersistenceInvariantViolation from error
 
 
 def _is_idempotency_scope_conflict(error: IntegrityError) -> bool:

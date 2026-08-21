@@ -1,4 +1,4 @@
-"""Authorized workflow-run creation and read-only inspection routes."""
+"""Authorized workflow-run creation, cancellation, and inspection routes."""
 
 from __future__ import annotations
 
@@ -36,11 +36,16 @@ from taskforge.runs.domain import (
     ExplicitWorkflowVersion,
     InspectedTaskRun,
     InspectedWorkflowRun,
+    InvalidWorkflowRunCancellationIdempotencyKey,
+    InvalidWorkflowRunCancellationReason,
     InvalidWorkflowRunIdempotencyKey,
     InvalidWorkflowRunInput,
     LatestWorkflowVersion,
     RunFailureReason,
     TaskRunStatus,
+    WorkflowRunCancellationIdempotencyConflict,
+    WorkflowRunCancellationOutcome,
+    WorkflowRunCancellationResult,
     WorkflowRunIdempotencyConflict,
     WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
@@ -48,6 +53,7 @@ from taskforge.runs.domain import (
 )
 from taskforge.runs.service import (
     TaskRunNotFound,
+    WorkflowRunCancellationInvariantError,
     WorkflowRunInspectionInvariantError,
     WorkflowRunNotFound,
     WorkflowRunPersistenceConflict,
@@ -66,6 +72,21 @@ class StartWorkflowRunRequest(BaseModel):
     version_number: Annotated[StrictInt, Field(gt=0)] | None = None
     payload: dict[str, JSONValue] = Field(default_factory=dict)
     input_references: dict[str, JSONValue] = Field(default_factory=dict)
+
+
+class CancelWorkflowRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = None
+
+
+class CancelWorkflowRunResponse(BaseModel):
+    workflow_run_id: UUID
+    outcome: WorkflowRunCancellationOutcome
+    status: WorkflowRunStatus
+    requested_by_principal_id: UUID | None = None
+    reason: str | None = None
+    requested_at: datetime | None = None
 
 
 class StartedWorkflowRunResponse(BaseModel):
@@ -219,6 +240,61 @@ async def start_workflow_run(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
     response.headers["Location"] = f"/api/v1/workflow-runs/{created.id}"
     return _started_run_response(created)
+
+
+@router.post(
+    "/api/v1/workflow-runs/{run_id}/cancel",
+    response_model=CancelWorkflowRunResponse,
+    responses=COMMON_RESPONSES,
+)
+async def cancel_workflow_run(
+    run_id: UUID,
+    body: CancelWorkflowRunRequest,
+    request: Request,
+    context: Annotated[
+        AuthorizationContext,
+        Depends(require_permission(Permission.OPERATE_WORKFLOW)),
+    ],
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", max_length=128),
+    ] = None,
+) -> CancelWorkflowRunResponse | Response:
+    try:
+        result = await _runtime(request).workflow_run_service.cancel_run(
+            run_id,
+            context.owner_filter_for(Permission.OPERATE_WORKFLOW),
+            requested_by_principal_id=context.principal_id,
+            idempotency_key=idempotency_key,
+            reason=body.reason,
+        )
+    except InvalidWorkflowRunCancellationIdempotencyKey:
+        return _cancellation_idempotency_key_validation_error(request)
+    except InvalidWorkflowRunCancellationReason:
+        return _cancellation_reason_validation_error(request)
+    except WorkflowRunNotFound as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except WorkflowRunCancellationIdempotencyConflict:
+        return error_response(
+            request,
+            status_code=status.HTTP_409_CONFLICT,
+            code="idempotency_conflict",
+            message="The idempotency key conflicts with an earlier request.",
+        )
+    except WorkflowRunCancellationInvariantError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        ) from error
+    except WorkflowRunServiceUnavailable as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
+    if result.outcome is WorkflowRunCancellationOutcome.TERMINAL_STATE_WON:
+        return error_response(
+            request,
+            status_code=status.HTTP_409_CONFLICT,
+            code="workflow_run_not_cancellable",
+            message="The workflow run is already terminal.",
+        )
+    return _cancellation_response(result)
 
 
 @router.get(
@@ -377,6 +453,22 @@ def _started_run_response(run: CreatedWorkflowRun) -> StartedWorkflowRunResponse
     )
 
 
+def _cancellation_response(
+    result: WorkflowRunCancellationResult,
+) -> CancelWorkflowRunResponse:
+    accepted = result.accepted_request
+    return CancelWorkflowRunResponse(
+        workflow_run_id=result.workflow_run_id,
+        outcome=result.outcome,
+        status=result.status,
+        requested_by_principal_id=(
+            accepted.requested_by_principal_id if accepted is not None else None
+        ),
+        reason=accepted.reason if accepted is not None else None,
+        requested_at=accepted.requested_at if accepted is not None else None,
+    )
+
+
 def _workflow_run_response(run: InspectedWorkflowRun) -> WorkflowRunResponse:
     return WorkflowRunResponse(
         id=run.id,
@@ -530,6 +622,38 @@ def _idempotency_key_validation_error(request: Request) -> Response:
                 code="invalid_idempotency_key",
                 path=["header", "Idempotency-Key"],
                 message="Idempotency-Key is invalid.",
+            ),
+        ),
+    )
+
+
+def _cancellation_idempotency_key_validation_error(request: Request) -> Response:
+    return error_response(
+        request,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        code="validation_failed",
+        message="The request is invalid.",
+        details=(
+            ErrorDetail(
+                code="invalid_idempotency_key",
+                path=["header", "Idempotency-Key"],
+                message="Idempotency-Key is invalid.",
+            ),
+        ),
+    )
+
+
+def _cancellation_reason_validation_error(request: Request) -> Response:
+    return error_response(
+        request,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        code="validation_failed",
+        message="The request is invalid.",
+        details=(
+            ErrorDetail(
+                code="invalid_cancellation_reason",
+                path=["body", "reason"],
+                message="Cancellation reason must be nonblank and at most 2000 characters.",
             ),
         ),
     )

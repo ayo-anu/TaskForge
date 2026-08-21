@@ -29,13 +29,18 @@ from taskforge.retries.domain import (
     RetryEventType,
 )
 from taskforge.runs.domain import (
+    AcceptedWorkflowRunCancellation,
     CreatedWorkflowRun,
     ExplicitWorkflowVersion,
     InspectedTaskRun,
     InspectedWorkflowRun,
+    InvalidWorkflowRunCancellationIdempotencyKey,
     InvalidWorkflowRunIdempotencyKey,
     LatestWorkflowVersion,
     TaskRunStatus,
+    WorkflowRunCancellationIdempotencyConflict,
+    WorkflowRunCancellationOutcome,
+    WorkflowRunCancellationResult,
     WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
     WorkflowRunStatus,
@@ -44,6 +49,7 @@ from taskforge.runs.domain import (
 )
 from taskforge.runs.service import (
     TaskRunNotFound,
+    WorkflowRunCancellationInvariantError,
     WorkflowRunNotFound,
     WorkflowRunPersistenceConflict,
     WorkflowRunServiceUnavailable,
@@ -157,6 +163,16 @@ class RunServiceStub:
             ),
             RetryEventCursor(self.task_id, now, event_id),
         )
+        self.cancellation = WorkflowRunCancellationResult(
+            self.run_id,
+            WorkflowRunCancellationOutcome.NEWLY_ACCEPTED,
+            WorkflowRunStatus.CANCELLING,
+            AcceptedWorkflowRunCancellation(
+                principal_id,
+                "maintenance",
+                now,
+            ),
+        )
 
     def _raise(self) -> None:
         if self.error is not None:
@@ -214,6 +230,28 @@ class RunServiceStub:
         self.calls.append(("get_run", run_id, owner_principal_id))
         self._raise()
         return self.inspected
+
+    async def cancel_run(
+        self,
+        run_id: UUID,
+        owner_filter: object,
+        *,
+        requested_by_principal_id: UUID,
+        idempotency_key: str | None,
+        reason: str | None,
+    ) -> WorkflowRunCancellationResult:
+        self.calls.append(
+            (
+                "cancel",
+                run_id,
+                owner_filter,
+                requested_by_principal_id,
+                idempotency_key,
+                reason,
+            )
+        )
+        self._raise()
+        return self.cancellation
 
     async def list_task_runs(
         self, run_id: UUID, *, owner_principal_id: UUID
@@ -373,6 +411,184 @@ def test_supplied_key_uses_idempotent_explicit_path_without_normalization() -> N
     assert service.calls[0][0] == "create_idempotent"
     assert isinstance(service.calls[0][4], ExplicitWorkflowVersion)
     assert service.calls[0][6] == key
+
+
+def test_authorized_cancellation_is_owner_scoped_and_returns_canonical_request() -> (
+    None
+):
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{service.run_id}/cancel",
+        runtime.api_credential,
+        headers={"Idempotency-Key": "cancel-request-0001"},
+        json={"reason": " maintenance "},
+    )
+
+    assert response.status_code == 200
+    assert service.cancellation.accepted_request is not None
+    assert response.json() == {
+        "workflow_run_id": str(service.run_id),
+        "outcome": "newly_accepted",
+        "status": "cancelling",
+        "requested_by_principal_id": str(runtime.principal_id),
+        "reason": "maintenance",
+        "requested_at": service.cancellation.accepted_request.requested_at.isoformat().replace(
+            "+00:00", "Z"
+        ),
+    }
+    call = service.calls[0]
+    assert call[0:2] == ("cancel", service.run_id)
+    assert call[2].principal_id == runtime.principal_id
+    assert call[3:] == (
+        runtime.principal_id,
+        "cancel-request-0001",
+        " maintenance ",
+    )
+
+
+def test_cancellation_conceals_canonical_metadata_for_noncanonical_request() -> None:
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    service.cancellation = WorkflowRunCancellationResult(
+        service.run_id,
+        WorkflowRunCancellationOutcome.ALREADY_CANCELLING,
+        WorkflowRunStatus.CANCELLING,
+    )
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{service.run_id}/cancel",
+        runtime.api_credential,
+        headers={"Idempotency-Key": "different-key-0001"},
+        json={"reason": "different"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "already_cancelling"
+    assert response.json()["requested_by_principal_id"] is None
+    assert response.json()["reason"] is None
+    assert response.json()["requested_at"] is None
+
+
+def test_cancellation_requires_operator_permission_and_idempotency_key() -> None:
+    viewer_app, viewer_runtime, viewer_service = make_app(
+        frozenset({Role.VIEWER.value})
+    )
+    operator_app, operator_runtime, operator_service = make_app(
+        frozenset({Role.WORKFLOW_OPERATOR.value})
+    )
+    path = f"/api/v1/workflow-runs/{viewer_service.run_id}/cancel"
+
+    forbidden = request(
+        viewer_app,
+        "POST",
+        path,
+        viewer_runtime.api_credential,
+        headers={"Idempotency-Key": "cancel-request-0001"},
+        json={},
+    )
+    operator_service.error = InvalidWorkflowRunCancellationIdempotencyKey()
+    invalid = request(
+        operator_app,
+        "POST",
+        f"/api/v1/workflow-runs/{operator_service.run_id}/cancel",
+        operator_runtime.api_credential,
+        json={},
+    )
+
+    assert forbidden.status_code == 403
+    assert viewer_service.calls == []
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "validation_failed"
+    assert invalid.json()["error"]["details"][0]["code"] == "invalid_idempotency_key"
+    assert invalid.json()["error"]["details"][0]["path"] == [
+        "header",
+        "Idempotency-Key",
+    ]
+    assert operator_service.calls[-1][4] is None
+
+
+def test_short_cancellation_idempotency_key_has_structured_422() -> None:
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    service.error = InvalidWorkflowRunCancellationIdempotencyKey()
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{service.run_id}/cancel",
+        runtime.api_credential,
+        headers={"Idempotency-Key": "too-short"},
+        json={},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_failed"
+    assert response.json()["error"]["details"] == [
+        {
+            "code": "invalid_idempotency_key",
+            "path": ["header", "Idempotency-Key"],
+            "message": "Idempotency-Key is invalid.",
+        }
+    ]
+    assert service.calls[-1][4] == "too-short"
+    assert "too-short" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    (
+        (WorkflowRunNotFound(), 404, "resource_not_found"),
+        (WorkflowRunCancellationIdempotencyConflict(), 409, "idempotency_conflict"),
+        (
+            WorkflowRunCancellationInvariantError(),
+            500,
+            "internal_error",
+        ),
+        (WorkflowRunServiceUnavailable(), 503, "service_unavailable"),
+    ),
+)
+def test_cancellation_failures_use_safe_stable_contracts(
+    error: Exception, expected_status: int, expected_code: str
+) -> None:
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    service.error = error
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{service.run_id}/cancel",
+        runtime.api_credential,
+        headers={"Idempotency-Key": "secret-cancel-key"},
+        json={},
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["error"]["code"] == expected_code
+    assert "secret-cancel-key" not in response.text
+
+
+def test_terminal_cancellation_outcome_is_conflict() -> None:
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    service.cancellation = WorkflowRunCancellationResult(
+        service.run_id,
+        WorkflowRunCancellationOutcome.TERMINAL_STATE_WON,
+        WorkflowRunStatus.SUCCEEDED,
+    )
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{service.run_id}/cancel",
+        runtime.api_credential,
+        headers={"Idempotency-Key": "cancel-request-0001"},
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "workflow_run_not_cancellable"
 
 
 @pytest.mark.parametrize("value", (True, False, "2", 2.0, 0, -1))

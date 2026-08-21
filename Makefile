@@ -72,7 +72,7 @@ credential-bootstrap-test:
 workflow-persistence-test:
 	@test "$${TASKFORGE_RUN_WORKFLOW_PERSISTENCE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_WORKFLOW_PERSISTENCE_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_workflow_persistence.py tests/integration/test_workflow_version_resolution.py tests/integration/test_workflow_run_creation.py tests/integration/test_workflow_run_idempotency.py tests/integration/test_task_dispatch_creation.py tests/integration/test_dispatch_publisher_persistence.py
+	uv run pytest tests/integration/test_workflow_persistence.py tests/integration/test_workflow_version_resolution.py tests/integration/test_workflow_run_creation.py tests/integration/test_workflow_run_idempotency.py tests/integration/test_workflow_run_cancellation.py tests/integration/test_task_dispatch_creation.py tests/integration/test_dispatch_publisher_persistence.py
 
 workflow-route-test:
 	@test "$${TASKFORGE_RUN_WORKFLOW_ROUTE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_WORKFLOW_ROUTE_INTEGRATION=1 is required" >&2; exit 2)
