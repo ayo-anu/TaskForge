@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -17,6 +18,8 @@ class CredentialRecord:
     revoked: bool
     expired: bool
     identity_disabled: bool
+    expires_at: datetime | None = None
+    observed_at: datetime | None = None
 
     def __repr__(self) -> str:
         return (

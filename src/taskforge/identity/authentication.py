@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
@@ -53,6 +54,8 @@ class AuthenticationUnavailable(Exception):
 class AuthenticatedAPIPrincipal:
     principal_id: UUID
     credential_id: UUID
+    credential_expires_at: datetime | None = None
+    credential_observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,8 @@ class APIAuthenticator:
         return AuthenticatedAPIPrincipal(
             principal_id=record.identity_id,
             credential_id=record.credential_id,
+            credential_expires_at=record.expires_at,
+            credential_observed_at=record.observed_at,
         )
 
 

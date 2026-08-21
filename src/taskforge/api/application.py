@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
 from taskforge.api.authentication import (
+    AuthenticationRuntime,
     AuthenticationRuntimeProtocol,
     build_authentication_runtime,
 )
@@ -19,6 +20,8 @@ from taskforge.api.dead_letters import router as dead_letters_router
 from taskforge.api.dependencies import build_readiness_coordinator
 from taskforge.api.errors import install_error_handling
 from taskforge.api.execution_stream import router as execution_stream_router
+from taskforge.api.execution_stream import serialize_execution_event
+from taskforge.api.execution_stream_runtime import ExecutionStreamRuntime
 from taskforge.api.health import (
     LivenessResponse,
     ReadinessCoordinator,
@@ -56,9 +59,20 @@ def create_app(
             raise
         app.state.readiness = resolved_readiness
         app.state.authentication = resolved_authentication
+        resolved_execution_stream: ExecutionStreamRuntime | None = None
+        if isinstance(resolved_authentication, AuthenticationRuntime):
+            resolved_execution_stream = ExecutionStreamRuntime(
+                resolved_settings,
+                resolved_authentication.workflow_run_execution_event_repository,
+                serialize_execution_event,
+            )
+            await resolved_execution_stream.start()
+            app.state.execution_stream = resolved_execution_stream
         try:
             yield
         finally:
+            if resolved_execution_stream is not None:
+                await resolved_execution_stream.close()
             await asyncio.gather(
                 resolved_authentication.close(),
                 resolved_readiness.close(),

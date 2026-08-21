@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -102,6 +103,32 @@ def test_authenticates_api_principal_and_worker_as_distinct_types() -> None:
 
     assert api_identity.principal_id == api_record.identity_id
     assert worker_identity.worker_identity_id == worker_record.identity_id
+
+
+def test_api_authentication_preserves_database_observed_expiry_metadata() -> None:
+    api_credential = credential(CredentialScope.API, secrets.token_bytes(32))
+    observed_at = datetime.now(UTC)
+    expires_at = observed_at + timedelta(minutes=5)
+    original = record(api_credential)
+    api_record = CredentialRecord(
+        original.credential_id,
+        original.identity_id,
+        original.credential_verifier,
+        original.revoked,
+        original.expired,
+        original.identity_disabled,
+        expires_at,
+        observed_at,
+    )
+
+    identity = asyncio.run(
+        APIAuthenticator(
+            FakeAPIRepository(api_record), timeout_seconds=0.1
+        ).authenticate(api_credential)
+    )
+
+    assert identity.credential_expires_at == expires_at
+    assert identity.credential_observed_at == observed_at
 
 
 @pytest.mark.parametrize(

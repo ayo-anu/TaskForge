@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Literal, Protocol, cast
 from uuid import UUID
@@ -13,6 +14,11 @@ from pydantic import BaseModel
 from taskforge.api.authentication import (
     AuthenticationRuntimeProtocol,
     authenticate_api_credential,
+)
+from taskforge.api.execution_stream_runtime import (
+    ExecutionStreamCapacityExceeded,
+    ExecutionStreamRuntime,
+    ExecutionStreamUnavailable,
 )
 from taskforge.identity.authentication import (
     AuthenticationFailure,
@@ -124,6 +130,7 @@ async def workflow_run_execution_stream(
     try:
         credential = _bearer_credential(websocket.headers.get("Authorization"))
         identity = await authenticate_api_credential(runtime, credential)
+        expiry_deadline = _credential_expiry_deadline(identity)
         context = await runtime.authorization_service.context_for(identity)
         context.require(Permission.VIEW)
         run_id = _parse_run_id(raw_run_id)
@@ -203,6 +210,48 @@ async def workflow_run_execution_stream(
         )
         return
 
+    live_runtime = cast(
+        ExecutionStreamRuntime | None,
+        getattr(websocket.app.state, "execution_stream", None),
+    )
+    if live_runtime is not None:
+        if (
+            expiry_deadline is not None
+            and expiry_deadline <= asyncio.get_running_loop().time()
+        ):
+            await websocket.close(
+                code=status.WS_1008_POLICY_VIOLATION,
+                reason=POLICY_REJECTION_REASON,
+            )
+            return
+        try:
+            subscription = await live_runtime.open_subscription(
+                websocket,
+                run_id,
+                last_delivered_cursor,
+                expiry_deadline,
+            )
+        except ExecutionStreamUnavailable:
+            await websocket.close(
+                code=status.WS_1011_INTERNAL_ERROR,
+                reason=SERVICE_REJECTION_REASON,
+            )
+            return
+        except ExecutionStreamCapacityExceeded:
+            await websocket.close(
+                code=status.WS_1013_TRY_AGAIN_LATER,
+                reason="stream capacity unavailable",
+            )
+            return
+        try:
+            await websocket.accept()
+        except (RuntimeError, WebSocketDisconnect):
+            await live_runtime.abort_subscription(subscription)
+            return
+        await live_runtime.serve(subscription)
+        return
+
+    # Injectable focused route tests may omit the process-level live runtime.
     await websocket.accept()
     if requested_cursor is not None:
         try:
@@ -302,6 +351,29 @@ def _execution_event_message(
             payload=dict(event.payload),
         )
     )
+
+
+def serialize_execution_event(
+    event: StoredWorkflowRunExecutionEvent,
+) -> dict[str, object]:
+    """Serialize the stable Task 4 envelope for replay and live delivery."""
+    return _execution_event_message(event).model_dump(mode="json")
+
+
+def _credential_expiry_deadline(identity: object) -> float | None:
+    expires_at = getattr(identity, "credential_expires_at", None)
+    observed_at = getattr(identity, "credential_observed_at", None)
+    if expires_at is None:
+        return None
+    if (
+        not isinstance(expires_at, datetime)
+        or not isinstance(observed_at, datetime)
+        or expires_at.tzinfo is None
+        or observed_at.tzinfo is None
+    ):
+        raise AuthenticationUnavailable
+    remaining = max(0.0, (expires_at - observed_at).total_seconds())
+    return asyncio.get_running_loop().time() + remaining
 
 
 async def _send_then_close(

@@ -196,6 +196,9 @@ async def verify_authentication(database_url: URL) -> None:
         second = await api_authenticator.authenticate(rotated_api)
         worker = await worker_authenticator.authenticate(valid_worker)
         assert first.principal_id == second.principal_id == api_identity_id
+        assert first.credential_expires_at is None
+        assert first.credential_observed_at is not None
+        assert first.credential_observed_at.tzinfo is not None
         assert worker.worker_identity_id == worker_identity_id
 
         for authenticator, presented, reason in (

@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     authentication_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
     database_pool_size: int = Field(default=5, ge=1, le=20)
     database_pool_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    execution_stream_max_connections: int = Field(default=500, ge=1, le=10_000)
+    execution_stream_queue_size: int = Field(default=100, ge=1, le=1_000)
+    execution_stream_listener_reconnect_max_seconds: float = Field(
+        default=5.0, gt=0, le=60
+    )
     worker_stale_after_seconds: int = Field(default=30, ge=1, le=3600)
     worker_offline_after_seconds: int = Field(default=120, ge=2, le=86400)
     task_claim_lease_seconds: int = Field(default=60, ge=1)

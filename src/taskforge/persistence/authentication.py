@@ -28,13 +28,15 @@ class SQLAlchemyAPICredentialRepository:
                 api_credentials.c.id,
                 api_credentials.c.principal_id,
                 api_credentials.c.credential_verifier,
+                api_credentials.c.expires_at,
+                func.statement_timestamp().label("observed_at"),
                 (api_credentials.c.revoked_at.is_not(None)).label("revoked"),
                 case(
                     (
                         api_credentials.c.expires_at.is_(None),
                         False,
                     ),
-                    else_=api_credentials.c.expires_at <= func.current_timestamp(),
+                    else_=api_credentials.c.expires_at <= func.statement_timestamp(),
                 ).label("expired"),
                 (api_principals.c.disabled_at.is_not(None)).label("identity_disabled"),
             )
@@ -57,6 +59,8 @@ class SQLAlchemyAPICredentialRepository:
             revoked=row.revoked,
             expired=row.expired,
             identity_disabled=row.identity_disabled,
+            expires_at=row.expires_at,
+            observed_at=row.observed_at,
         )
 
 
@@ -74,13 +78,15 @@ class SQLAlchemyWorkerCredentialRepository:
                 worker_credentials.c.id,
                 worker_credentials.c.worker_identity_id,
                 worker_credentials.c.credential_verifier,
+                worker_credentials.c.expires_at,
+                func.statement_timestamp().label("observed_at"),
                 (worker_credentials.c.revoked_at.is_not(None)).label("revoked"),
                 case(
                     (
                         worker_credentials.c.expires_at.is_(None),
                         False,
                     ),
-                    else_=worker_credentials.c.expires_at <= func.current_timestamp(),
+                    else_=worker_credentials.c.expires_at <= func.statement_timestamp(),
                 ).label("expired"),
                 (worker_identities.c.disabled_at.is_not(None)).label(
                     "identity_disabled"
@@ -105,4 +111,6 @@ class SQLAlchemyWorkerCredentialRepository:
             revoked=row.revoked,
             expired=row.expired,
             identity_disabled=row.identity_disabled,
+            expires_at=row.expires_at,
+            observed_at=row.observed_at,
         )

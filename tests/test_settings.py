@@ -51,6 +51,9 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.api_port == 8000
     assert settings.readiness_timeout_seconds == 2.0
     assert settings.authentication_timeout_seconds == 2.0
+    assert settings.execution_stream_max_connections == 500
+    assert settings.execution_stream_queue_size == 100
+    assert settings.execution_stream_listener_reconnect_max_seconds == 5.0
     assert settings.database_pool_size == 5
     assert settings.database_pool_timeout_seconds == 2.0
     assert settings.worker_stale_after_seconds == 30
