@@ -31,6 +31,8 @@ from taskforge.persistence.runs import (
     _task_run_list_statement,
     _unstarted_task_suppression_statement,
     _version_resolution_statement,
+    _workflow_cancellation_claim_result_violation_statement,
+    _workflow_cancellation_unsettled_exists_statement,
     _workflow_run_evaluation_lock_statement,
 )
 from taskforge.runs.domain import (
@@ -69,6 +71,40 @@ def test_unstarted_cancellation_statement_has_exact_pre_dispatch_boundary() -> N
     assert "statement_timestamp()" in sql
     for preserved in ("dispatched", "claimed", "running", "succeeded", "failed"):
         assert f"'{preserved}'" not in sql
+
+
+def test_cancellation_finalization_settlement_guard_checks_tasks_and_claim_results() -> (
+    None
+):
+    unsettled_sql = normalized_sql(
+        str(
+            _workflow_cancellation_unsettled_exists_statement(uuid4()).compile(
+                dialect=postgresql.dialect(),  # type: ignore[no-untyped-call]
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+    )
+
+    for terminal in ("succeeded", "failed", "skipped", "cancelled"):
+        assert f"'{terminal}'" in unsettled_sql
+    assert "task_attempt_claims.terminated_at IS NULL" in unsettled_sql
+    invariant_sql = normalized_sql(
+        str(
+            _workflow_cancellation_claim_result_violation_statement(uuid4()).compile(
+                dialect=postgresql.dialect(),  # type: ignore[no-untyped-call]
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+    )
+    assert "task_attempt_claims.terminated_at IS NOT NULL" in invariant_sql
+    assert (
+        "task_attempt_results.claim_generation = task_attempt_claims.generation"
+        in invariant_sql
+    )
+    assert (
+        "task_attempt_results.task_attempt_id = task_attempt_claims.task_attempt_id"
+        in invariant_sql
+    )
 
 
 def normalized_sql(statement: object) -> str:

@@ -39,6 +39,8 @@ from taskforge.retries.domain import (
 )
 from taskforge.runs.domain import (
     AcceptedWorkflowRunCancellation,
+    CancellationFinalizationOutcome,
+    CancellationFinalizationResult,
     CancellationPropagationResult,
     CancellationSettlementResult,
     CreatedWorkflowRun,
@@ -46,11 +48,13 @@ from taskforge.runs.domain import (
     ExplicitWorkflowVersion,
     InspectedTaskRun,
     InspectedWorkflowRun,
+    InspectedWorkflowRunCancellation,
     NewTaskRun,
     NewWorkflowRun,
     RunFailureReason,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowRunCancellationCaveat,
     WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
@@ -79,6 +83,7 @@ from taskforge.runs.schema import (
     task_attempt_claims,
     task_attempt_results,
     task_attempts,
+    task_result_events,
     task_retry_events,
     task_runs,
     workflow_run_cancellation_requests,
@@ -317,6 +322,110 @@ class SQLAlchemyWorkflowRunRepository:
             tuple(row.id for row in ordered),
             tuple(row.step_identifier for row in ordered),
         )
+
+    async def finalize_workflow_run_cancellation(
+        self,
+        workflow_run_id: UUID,
+    ) -> CancellationFinalizationResult:
+        """Derive cancelling-to-cancelled under the shared workflow-run lock."""
+        try:
+            async with self._sessions.begin() as session:
+                locked = (
+                    await session.execute(
+                        _workflow_run_evaluation_lock_statement(workflow_run_id)
+                    )
+                ).one_or_none()
+                if locked is None:
+                    return CancellationFinalizationResult(
+                        workflow_run_id, False, None, None, None
+                    )
+                try:
+                    previous = WorkflowRunStatus(locked.status)
+                except ValueError as error:
+                    raise WorkflowRunCancellationPersistenceInvariantViolation from error
+
+                request_count = await session.scalar(
+                    select(func.count())
+                    .select_from(workflow_run_cancellation_requests)
+                    .where(
+                        workflow_run_cancellation_requests.c.workflow_run_id
+                        == workflow_run_id
+                    )
+                )
+                cancellation_owned = previous in (
+                    WorkflowRunStatus.CANCELLING,
+                    WorkflowRunStatus.CANCELLED,
+                )
+                if cancellation_owned and request_count != 1:
+                    raise WorkflowRunCancellationPersistenceInvariantViolation
+                if not cancellation_owned:
+                    if request_count:
+                        raise WorkflowRunCancellationPersistenceInvariantViolation
+                    return CancellationFinalizationResult(
+                        workflow_run_id,
+                        True,
+                        previous,
+                        previous,
+                        CancellationFinalizationOutcome.NOT_CANCELLING,
+                    )
+
+                invalid_claim_result = await session.scalar(
+                    _workflow_cancellation_claim_result_violation_statement(
+                        workflow_run_id
+                    )
+                )
+                if invalid_claim_result:
+                    raise WorkflowRunCancellationPersistenceInvariantViolation
+                unsettled = await session.scalar(
+                    _workflow_cancellation_unsettled_exists_statement(workflow_run_id)
+                )
+                if unsettled:
+                    if previous is WorkflowRunStatus.CANCELLED:
+                        raise WorkflowRunCancellationPersistenceInvariantViolation
+                    return CancellationFinalizationResult(
+                        workflow_run_id,
+                        True,
+                        previous,
+                        previous,
+                        CancellationFinalizationOutcome.AWAITING_TASK_SETTLEMENT,
+                    )
+                if previous is WorkflowRunStatus.CANCELLED:
+                    return CancellationFinalizationResult(
+                        workflow_run_id,
+                        True,
+                        previous,
+                        previous,
+                        CancellationFinalizationOutcome.ALREADY_CANCELLED,
+                    )
+
+                transitioned = (
+                    await session.execute(
+                        update(workflow_runs)
+                        .where(
+                            workflow_runs.c.id == workflow_run_id,
+                            workflow_runs.c.status
+                            == WorkflowRunStatus.CANCELLING.value,
+                        )
+                        .values(
+                            status=WorkflowRunStatus.CANCELLED.value,
+                            updated_at=func.statement_timestamp(),
+                        )
+                        .returning(workflow_runs.c.status)
+                    )
+                ).one_or_none()
+                if transitioned is None:
+                    raise WorkflowRunCancellationPersistenceInvariantViolation
+                return CancellationFinalizationResult(
+                    workflow_run_id,
+                    True,
+                    previous,
+                    WorkflowRunStatus.CANCELLED,
+                    CancellationFinalizationOutcome.FINALIZED,
+                )
+        except WorkflowRunCancellationPersistenceInvariantViolation:
+            raise
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
 
     async def find_idempotent_run(
         self,
@@ -963,6 +1072,32 @@ def _run_inspection_statement(
     run_id: UUID,
     owner_principal_id: UUID,
 ) -> Select[Any]:
+    recovered_cancellation_count = (
+        select(func.count(task_result_events.c.id))
+        .select_from(
+            task_result_events.join(
+                task_attempts,
+                task_attempts.c.id == task_result_events.c.task_attempt_id,
+            )
+            .join(task_runs, task_runs.c.id == task_attempts.c.task_run_id)
+            .join(
+                task_attempt_results,
+                and_(
+                    task_attempt_results.c.task_attempt_id
+                    == task_result_events.c.task_attempt_id,
+                    task_attempt_results.c.claim_generation
+                    == task_result_events.c.claim_generation,
+                ),
+            )
+        )
+        .where(
+            task_runs.c.workflow_run_id == workflow_runs.c.id,
+            task_result_events.c.event_type == "result_recovered",
+            task_attempt_results.c.result_kind
+            == TaskExecutionResultKind.CANCELLATION.value,
+        )
+        .scalar_subquery()
+    )
     return (
         select(
             workflow_runs.c.id,
@@ -980,6 +1115,14 @@ def _run_inspection_statement(
                 ),
                 else_=None,
             ).label("failure_reason"),
+            workflow_run_cancellation_requests.c.requested_by_principal_id.label(
+                "cancellation_requested_by_principal_id"
+            ),
+            workflow_run_cancellation_requests.c.reason.label("cancellation_reason"),
+            workflow_run_cancellation_requests.c.requested_at.label(
+                "cancellation_requested_at"
+            ),
+            recovered_cancellation_count.label("recovered_cancellation_count"),
         )
         .select_from(
             workflow_runs.join(
@@ -988,6 +1131,10 @@ def _run_inspection_statement(
             ).join(
                 workflow_versions,
                 workflow_versions.c.id == workflow_runs.c.workflow_version_id,
+            ).outerjoin(
+                workflow_run_cancellation_requests,
+                workflow_run_cancellation_requests.c.workflow_run_id
+                == workflow_runs.c.id,
             )
         )
         .where(
@@ -1356,6 +1503,62 @@ def _workflow_run_evaluation_lock_statement(
     )
 
 
+def _workflow_cancellation_unsettled_exists_statement(
+    workflow_run_id: UUID,
+) -> Select[Any]:
+    terminal_statuses = (
+        TaskRunStatus.SUCCEEDED.value,
+        TaskRunStatus.FAILED.value,
+        TaskRunStatus.SKIPPED.value,
+        TaskRunStatus.CANCELLED.value,
+    )
+    nonterminal_task = exists(
+        select(task_runs.c.id).where(
+            task_runs.c.workflow_run_id == workflow_run_id,
+            task_runs.c.status.not_in(terminal_statuses),
+        )
+    )
+    claim_for_run = task_attempt_claims.join(
+        task_attempts,
+        task_attempts.c.id == task_attempt_claims.c.task_attempt_id,
+    ).join(task_runs, task_runs.c.id == task_attempts.c.task_run_id)
+    unterminated_claim = exists(
+        select(task_attempt_claims.c.task_attempt_id)
+        .select_from(claim_for_run)
+        .where(
+            task_runs.c.workflow_run_id == workflow_run_id,
+            task_attempt_claims.c.terminated_at.is_(None),
+        )
+    )
+    return select(nonterminal_task | unterminated_claim)
+
+
+def _workflow_cancellation_claim_result_violation_statement(
+    workflow_run_id: UUID,
+) -> Select[Any]:
+    claim_for_run = task_attempt_claims.join(
+        task_attempts,
+        task_attempts.c.id == task_attempt_claims.c.task_attempt_id,
+    ).join(task_runs, task_runs.c.id == task_attempts.c.task_run_id)
+    terminated_without_exact_result = exists(
+        select(task_attempt_claims.c.task_attempt_id)
+        .select_from(claim_for_run)
+        .where(
+            task_runs.c.workflow_run_id == workflow_run_id,
+            task_attempt_claims.c.terminated_at.is_not(None),
+            ~exists(
+                select(task_attempt_results.c.task_attempt_id).where(
+                    task_attempt_results.c.task_attempt_id
+                    == task_attempt_claims.c.task_attempt_id,
+                    task_attempt_results.c.claim_generation
+                    == task_attempt_claims.c.generation,
+                )
+            ),
+        )
+    )
+    return select(terminated_without_exact_result)
+
+
 def _workflow_run_cancellation_lock_statement(
     workflow_run_id: UUID,
     owner_filter: OwnerFilter,
@@ -1669,6 +1872,19 @@ def _dependency_failure_propagation_statement(
 
 
 def _inspected_run(row: Row[Any]) -> InspectedWorkflowRun:
+    cancellation = None
+    if row.cancellation_requested_by_principal_id is not None:
+        cancellation = InspectedWorkflowRunCancellation(
+            requested_by_principal_id=row.cancellation_requested_by_principal_id,
+            reason=row.cancellation_reason,
+            requested_at=row.cancellation_requested_at,
+            recovered_cancellation_count=row.recovered_cancellation_count,
+            caveats=(
+                WorkflowRunCancellationCaveat.EXTERNAL_EFFECTS_MAY_PERSIST,
+                WorkflowRunCancellationCaveat.PHYSICAL_EXECUTION_MAY_CONTINUE_AFTER_AUTHORITY_LOSS,
+                WorkflowRunCancellationCaveat.COMPLETED_TASK_OUTCOMES_ARE_PRESERVED,
+            ),
+        )
     return InspectedWorkflowRun(
         id=row.id,
         workflow_definition_id=row.workflow_definition_id,
@@ -1683,6 +1899,7 @@ def _inspected_run(row: Row[Any]) -> InspectedWorkflowRun:
             if row.failure_reason is not None
             else None
         ),
+        cancellation=cancellation,
     )
 
 

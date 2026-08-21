@@ -110,6 +110,18 @@ class RunFailureReason(StrEnum):
     CANCELLATION_REQUESTED = "cancellation_requested"
 
 
+class WorkflowRunCancellationCaveat(StrEnum):
+    """Stable limitations attached to cancellation inspection history."""
+
+    EXTERNAL_EFFECTS_MAY_PERSIST = "external_effects_may_persist"
+    PHYSICAL_EXECUTION_MAY_CONTINUE_AFTER_AUTHORITY_LOSS = (
+        "physical_execution_may_continue_after_authority_loss"
+    )
+    COMPLETED_TASK_OUTCOMES_ARE_PRESERVED = (
+        "completed_task_outcomes_are_preserved"
+    )
+
+
 @dataclass(frozen=True)
 class ExplicitWorkflowVersion:
     version_number: int
@@ -253,12 +265,31 @@ class InspectedWorkflowRun:
     created_at: datetime
     updated_at: datetime
     failure_reason: RunFailureReason | None = None
+    cancellation: InspectedWorkflowRunCancellation | None = None
 
     def __post_init__(self) -> None:
         if self.created_at.tzinfo is None or self.updated_at.tzinfo is None:
             raise ValueError("workflow run timestamps must be timezone-aware")
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
         object.__setattr__(self, "updated_at", self.updated_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class InspectedWorkflowRunCancellation:
+    requested_by_principal_id: UUID
+    reason: str | None
+    requested_at: datetime
+    recovered_cancellation_count: int
+    caveats: tuple[WorkflowRunCancellationCaveat, ...]
+
+    def __post_init__(self) -> None:
+        if self.requested_at.tzinfo is None:
+            raise ValueError("cancellation request timestamp must be timezone-aware")
+        if self.recovered_cancellation_count < 0:
+            raise ValueError("recovered cancellation count must be non-negative")
+        if len(set(self.caveats)) != len(self.caveats):
+            raise ValueError("cancellation caveats must be unique")
+        object.__setattr__(self, "requested_at", self.requested_at.astimezone(UTC))
 
 
 @dataclass(frozen=True)
@@ -451,6 +482,38 @@ class WorkflowRunEvaluationResult:
             and self.previous_status is not None
             and self.previous_status is not self.resulting_status
         )
+
+    @property
+    def made_progress(self) -> bool:
+        return self.transitioned
+
+
+class CancellationFinalizationOutcome(StrEnum):
+    FINALIZED = "finalized"
+    ALREADY_CANCELLED = "already_cancelled"
+    AWAITING_TASK_SETTLEMENT = "awaiting_task_settlement"
+    NOT_CANCELLING = "not_cancelling"
+
+
+@dataclass(frozen=True)
+class CancellationFinalizationResult:
+    workflow_run_id: UUID
+    found: bool
+    previous_status: WorkflowRunStatus | None
+    resulting_status: WorkflowRunStatus | None
+    outcome: CancellationFinalizationOutcome | None
+
+    def __post_init__(self) -> None:
+        if self.found is (self.previous_status is None):
+            raise ValueError("cancellation finalization presence and status disagree")
+        if self.found is (self.resulting_status is None):
+            raise ValueError("cancellation finalization presence and status disagree")
+        if self.found is (self.outcome is None):
+            raise ValueError("cancellation finalization presence and outcome disagree")
+
+    @property
+    def transitioned(self) -> bool:
+        return self.outcome is CancellationFinalizationOutcome.FINALIZED
 
     @property
     def made_progress(self) -> bool:

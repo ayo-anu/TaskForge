@@ -13,6 +13,7 @@ from taskforge.identity.authorization import OwnerFilter
 from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     AcceptedWorkflowRunCancellation,
+    CancellationFinalizationResult,
     CancellationPropagationResult,
     CancellationSettlementResult,
     CreatedWorkflowRun,
@@ -212,6 +213,12 @@ class WorkflowRunRepository(Protocol):
         workflow_run_id: UUID,
     ) -> CancellationSettlementResult:
         """Cancel unclaimed dispatched tasks when their workflow is cancelling."""
+
+    async def finalize_workflow_run_cancellation(
+        self,
+        workflow_run_id: UUID,
+    ) -> CancellationFinalizationResult:
+        """Finalize a fully settled cancellation-owned workflow run."""
 
     async def propagate_dependency_failures(
         self,

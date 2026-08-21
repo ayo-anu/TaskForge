@@ -12,6 +12,7 @@ from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.engine import URL
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.runs.domain import (
@@ -94,11 +95,19 @@ async def verify_reconciliation(database_url: URL) -> None:
             "succeeded",
         }
 
-        # Cancelling is quiescent only for Tasks 1-3 and is not settled here.
-        await set_run_status(sessions, created.id, WorkflowRunStatus.CANCELLING)
+        # A cancellation-owned terminal task graph finalizes before returning.
+        await set_run_status(sessions, created.id, WorkflowRunStatus.PENDING)
+        await service.cancel_run(
+            created.id,
+            OwnerFilter.only(owner_id),
+            requested_by_principal_id=owner_id,
+            idempotency_key="reconciliation-cancel-key",
+            reason="test cancellation",
+        )
         cancelling = await service.reconcile_workflow_run(created.id)
         assert cancelling.iterations == 1
-        assert cancelling.final_status is WorkflowRunStatus.CANCELLING
+        assert cancelling.final_status is WorkflowRunStatus.CANCELLED
+        assert cancelling.workflow_transition_count == 1
         assert cancelling.quiescent
 
         # A failure after Task 1 committed leaves durable progress. Retrying after

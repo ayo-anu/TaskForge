@@ -9,6 +9,7 @@ from taskforge.identity.authorization import OwnerFilter
 from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
+    CancellationFinalizationResult,
     CancellationPropagationResult,
     CancellationSettlementResult,
     CreatedWorkflowRun,
@@ -274,6 +275,19 @@ class WorkflowRunService:
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
 
+    async def finalize_workflow_run_cancellation(
+        self,
+        workflow_run_id: UUID,
+    ) -> CancellationFinalizationResult:
+        try:
+            return await self._repository.finalize_workflow_run_cancellation(
+                workflow_run_id
+            )
+        except WorkflowRunCancellationPersistenceInvariantViolation as error:
+            raise WorkflowRunCancellationInvariantError from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+
     async def evaluate_workflow_run_state(
         self,
         workflow_run_id: UUID,
@@ -333,9 +347,42 @@ class WorkflowRunService:
             cancelled_count += settlement.settled_count
             assert settlement.workflow_status is not None
             last_status = settlement.workflow_status
-            if last_status is WorkflowRunStatus.CANCELLING or last_status in (
-                terminal_statuses
+            if last_status in (
+                WorkflowRunStatus.CANCELLING,
+                WorkflowRunStatus.CANCELLED,
             ):
+                finalization = await self.finalize_workflow_run_cancellation(
+                    workflow_run_id
+                )
+                if not finalization.found:
+                    return WorkflowRunReconciliationResult(
+                        workflow_run_id,
+                        False,
+                        iteration,
+                        runnable_count,
+                        skipped_count,
+                        workflow_transition_count,
+                        cancelled_count,
+                        None,
+                        False,
+                        False,
+                    )
+                workflow_transition_count += int(finalization.transitioned)
+                assert finalization.resulting_status is not None
+                last_status = finalization.resulting_status
+                return WorkflowRunReconciliationResult(
+                    workflow_run_id,
+                    True,
+                    iteration,
+                    runnable_count,
+                    skipped_count,
+                    workflow_transition_count,
+                    cancelled_count,
+                    last_status,
+                    True,
+                    False,
+                )
+            if last_status in terminal_statuses:
                 return WorkflowRunReconciliationResult(
                     workflow_run_id,
                     True,

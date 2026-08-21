@@ -43,6 +43,7 @@ from taskforge.runs.domain import (
     LatestWorkflowVersion,
     RunFailureReason,
     TaskRunStatus,
+    WorkflowRunCancellationCaveat,
     WorkflowRunCancellationIdempotencyConflict,
     WorkflowRunCancellationOutcome,
     WorkflowRunCancellationResult,
@@ -102,6 +103,15 @@ class StartedWorkflowRunResponse(BaseModel):
 class WorkflowRunResponse(StartedWorkflowRunResponse):
     updated_at: datetime
     failure_reason: RunFailureReason | None
+    cancellation: WorkflowRunCancellationInspectionResponse | None
+
+
+class WorkflowRunCancellationInspectionResponse(BaseModel):
+    requested_by_principal_id: UUID
+    reason: str | None
+    requested_at: datetime
+    recovered_cancellation_count: int
+    caveats: tuple[WorkflowRunCancellationCaveat, ...]
 
 
 class TaskRunResponse(BaseModel):
@@ -480,6 +490,19 @@ def _workflow_run_response(run: InspectedWorkflowRun) -> WorkflowRunResponse:
         created_at=run.created_at,
         updated_at=run.updated_at,
         failure_reason=run.failure_reason,
+        cancellation=(
+            WorkflowRunCancellationInspectionResponse(
+                requested_by_principal_id=run.cancellation.requested_by_principal_id,
+                reason=run.cancellation.reason,
+                requested_at=run.cancellation.requested_at,
+                recovered_cancellation_count=(
+                    run.cancellation.recovered_cancellation_count
+                ),
+                caveats=run.cancellation.caveats,
+            )
+            if run.cancellation is not None
+            else None
+        ),
     )
 
 

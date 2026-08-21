@@ -34,10 +34,12 @@ from taskforge.runs.domain import (
     ExplicitWorkflowVersion,
     InspectedTaskRun,
     InspectedWorkflowRun,
+    InspectedWorkflowRunCancellation,
     InvalidWorkflowRunCancellationIdempotencyKey,
     InvalidWorkflowRunIdempotencyKey,
     LatestWorkflowVersion,
     TaskRunStatus,
+    WorkflowRunCancellationCaveat,
     WorkflowRunCancellationIdempotencyConflict,
     WorkflowRunCancellationOutcome,
     WorkflowRunCancellationResult,
@@ -690,6 +692,48 @@ def test_run_and_task_inspection_are_owner_scoped_and_minimal() -> None:
         ("list_tasks", service.run_id, runtime.principal_id),
         ("get_task", service.task_id, runtime.principal_id),
     ]
+
+
+def test_run_inspection_exposes_only_minimal_cancellation_history() -> None:
+    app, runtime, service = make_app(frozenset({Role.VIEWER.value}))
+    request_time = datetime.now(UTC)
+    service.inspected = InspectedWorkflowRun(
+        service.run_id,
+        service.workflow_id,
+        service.version_id,
+        2,
+        runtime.principal_id,
+        WorkflowRunStatus.CANCELLED,
+        request_time,
+        request_time,
+        cancellation=InspectedWorkflowRunCancellation(
+            runtime.principal_id,
+            "maintenance",
+            request_time,
+            2,
+            tuple(WorkflowRunCancellationCaveat),
+        ),
+    )
+
+    response = request(
+        app,
+        "GET",
+        f"/api/v1/workflow-runs/{service.run_id}",
+        runtime.api_credential,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cancellation"] == {
+        "requested_by_principal_id": str(runtime.principal_id),
+        "reason": "maintenance",
+        "requested_at": request_time.isoformat().replace("+00:00", "Z"),
+        "recovered_cancellation_count": 2,
+        "caveats": [caveat.value for caveat in WorkflowRunCancellationCaveat],
+    }
+    assert "idempotency_key_digest" not in response.text
+    assert "request_fingerprint" not in response.text
+    assert "terminal_task_outcomes" not in response.text
+    assert "unsettled_task_count" not in response.text
 
 
 def test_retry_history_is_owner_scoped_paginated_and_cursor_bound() -> None:

@@ -14,6 +14,8 @@ import pytest
 from taskforge.identity.authorization import OwnerFilter
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
+    CancellationFinalizationOutcome,
+    CancellationFinalizationResult,
     CancellationPropagationResult,
     CancellationSettlementResult,
     CreatedWorkflowRun,
@@ -1027,6 +1029,7 @@ class ScriptedProgressionRepository:
         *,
         cancellation: list[CancellationPropagationResult] | None = None,
         settlement: list[CancellationSettlementResult] | None = None,
+        finalization: list[CancellationFinalizationResult] | None = None,
         failure_at: tuple[str, int] | None = None,
     ) -> None:
         self.run_id = run_id
@@ -1045,6 +1048,7 @@ class ScriptedProgressionRepository:
             )
             for _ in range(max(len(runnable), 1))
         ]
+        self.finalization = finalization or []
         self.failure_at = failure_at
         self.calls: list[str] = []
 
@@ -1072,6 +1076,12 @@ class ScriptedProgressionRepository:
     ) -> CancellationSettlementResult:
         assert workflow_run_id == self.run_id
         return self._take("settlement", self.settlement)
+
+    async def finalize_workflow_run_cancellation(
+        self, workflow_run_id: UUID
+    ) -> CancellationFinalizationResult:
+        assert workflow_run_id == self.run_id
+        return self._take("finalization", self.finalization)
 
     async def propagate_dependency_failures(
         self, workflow_run_id: UUID
@@ -1212,13 +1222,26 @@ def test_reconciler_reports_missing_and_cancelling_without_another_cycle() -> No
                 run_id, True, WorkflowRunStatus.CANCELLING, (), ()
             )
         ],
+        finalization=[
+            CancellationFinalizationResult(
+                run_id,
+                True,
+                WorkflowRunStatus.CANCELLING,
+                WorkflowRunStatus.CANCELLING,
+                CancellationFinalizationOutcome.AWAITING_TASK_SETTLEMENT,
+            )
+        ],
     )
     cancelling = asyncio.run(
         reconciliation_service(cancelling_repository).reconcile_workflow_run(run_id)
     )
     assert cancelling.final_status is WorkflowRunStatus.CANCELLING
     assert cancelling.quiescent
-    assert cancelling_repository.calls == ["cancellation", "settlement"]
+    assert cancelling_repository.calls == [
+        "cancellation",
+        "settlement",
+        "finalization",
+    ]
 
 
 def test_reconciler_enforces_behavioral_iteration_budget_without_ninth_cycle() -> None:
