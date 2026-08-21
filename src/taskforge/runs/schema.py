@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Table,
+    Text,
     UniqueConstraint,
     func,
     text,
@@ -100,6 +101,54 @@ workflow_runs = Table(
         "requested_by_principal_id",
         "workflow_definition_id",
         name="uq_workflow_runs_id_requester_definition",
+    ),
+)
+
+workflow_run_cancellation_requests = Table(
+    "workflow_run_cancellation_requests",
+    metadata,
+    Column(
+        "workflow_run_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "workflow_runs.id",
+            name="fk_workflow_run_cancellation_requests_run",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        primary_key=True,
+    ),
+    Column(
+        "requested_by_principal_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "api_principals.id",
+            name="fk_workflow_run_cancellation_requests_requester",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column("idempotency_key_digest", String(64), nullable=False),
+    Column("request_fingerprint", String(64), nullable=False),
+    Column("reason", Text, nullable=True),
+    Column(
+        "requested_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("statement_timestamp()"),
+    ),
+    CheckConstraint(
+        "idempotency_key_digest ~ '^[0-9a-f]{64}$'",
+        name="key_digest_valid",
+    ),
+    CheckConstraint(
+        "request_fingerprint ~ '^[0-9a-f]{64}$'",
+        name="fingerprint_valid",
+    ),
+    CheckConstraint(
+        "reason IS NULL OR length(btrim(reason)) BETWEEN 1 AND 2000",
+        name="reason_valid",
     ),
 )
 

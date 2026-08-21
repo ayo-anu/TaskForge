@@ -21,6 +21,7 @@ from taskforge.runs.schema import (
     task_result_events,
     task_retry_events,
     task_runs,
+    workflow_run_cancellation_requests,
     workflow_run_idempotency,
     workflow_run_inputs,
     workflow_runs,
@@ -186,6 +187,36 @@ def test_idempotency_scope_is_bound_to_the_same_run_principal_and_workflow() -> 
     assert workflow_run_idempotency.c.created_at.server_default is not None
 
 
+def test_cancellation_request_is_one_immutable_intention_per_run() -> None:
+    assert tuple(workflow_run_cancellation_requests.primary_key.columns.keys()) == (
+        "workflow_run_id",
+    )
+    assert tuple(workflow_run_cancellation_requests.c.keys()) == (
+        "workflow_run_id",
+        "requested_by_principal_id",
+        "idempotency_key_digest",
+        "request_fingerprint",
+        "reason",
+        "requested_at",
+    )
+    assert foreign_key_shapes(workflow_run_cancellation_requests) == {
+        (("workflow_run_id",), ("workflow_runs.id",)),
+        (("requested_by_principal_id",), ("api_principals.id",)),
+    }
+    assert unique_column_sets(workflow_run_cancellation_requests) == set()
+    assert workflow_run_cancellation_requests.indexes == set()
+    assert workflow_run_cancellation_requests.c.reason.nullable is True
+    assert workflow_run_cancellation_requests.c.requested_at.server_default is not None
+    assert check_texts(workflow_run_cancellation_requests) == {
+        "idempotency_key_digest ~ '^[0-9a-f]{64}$'",
+        "request_fingerprint ~ '^[0-9a-f]{64}$'",
+        "reason IS NULL OR length(btrim(reason)) BETWEEN 1 AND 2000",
+    }
+    for foreign_key in workflow_run_cancellation_requests.foreign_key_constraints:
+        assert foreign_key.onupdate == "RESTRICT"
+        assert foreign_key.ondelete == "RESTRICT"
+
+
 def test_retry_events_use_task_scoped_attempt_foreign_keys_and_server_time() -> None:
     assert tuple(task_retry_events.c.keys()) == (
         "id",
@@ -230,6 +261,7 @@ def test_every_new_constraint_and_index_has_a_deterministic_name() -> None:
         task_attempt_results,
         task_result_events,
         task_retry_events,
+        workflow_run_cancellation_requests,
         workflow_run_idempotency,
     ):
         assert all(constraint.name for constraint in table.constraints)
