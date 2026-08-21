@@ -302,6 +302,48 @@ class StoredWorkflowRunExecutionEvent:
 
 
 @dataclass(frozen=True)
+class WorkflowRunExecutionEventResumeState:
+    """Durable cursor facts needed to classify one requested resume position."""
+
+    earliest_retained_cursor: int | None
+    latest_cursor: int
+    requested_cursor: int | None
+    requested_cursor_exists: bool | None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.latest_cursor, bool) or self.latest_cursor < 0:
+            raise ValueError("latest execution event cursor must be non-negative")
+        earliest = self.earliest_retained_cursor
+        if earliest is not None and (
+            isinstance(earliest, bool) or earliest <= 0 or earliest > self.latest_cursor
+        ):
+            raise ValueError("earliest retained execution event cursor is invalid")
+        requested = self.requested_cursor
+        if requested is not None and (isinstance(requested, bool) or requested < 0):
+            raise ValueError("requested execution event cursor must be non-negative")
+        if (requested is None) is not (self.requested_cursor_exists is None):
+            raise ValueError("requested cursor existence must match cursor presence")
+        if requested is not None:
+            exists = self.requested_cursor_exists
+            if type(exists) is not bool:
+                raise ValueError("requested cursor existence must be boolean")
+            expected_exists = (
+                earliest is not None
+                and earliest <= requested <= self.latest_cursor
+            )
+            if exists is not expected_exists:
+                raise ValueError(
+                    "requested cursor existence contradicts the retained range"
+                )
+        if self.latest_cursor == 0 and earliest is not None:
+            raise ValueError("an empty execution event stream has no retained cursor")
+        if self.latest_cursor > 0 and earliest is None:
+            raise ValueError(
+                "a nonempty execution event stream needs a retained cursor"
+            )
+
+
+@dataclass(frozen=True)
 class CreatedWorkflowRun:
     id: UUID
     workflow_definition_id: UUID

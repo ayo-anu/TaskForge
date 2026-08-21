@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import insert, select
+from sqlalchemy import Boolean, func, insert, literal, select
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -15,12 +15,13 @@ from taskforge.runs.domain import (
     InvalidWorkflowRunExecutionEvent,
     NewWorkflowRunExecutionEvent,
     StoredWorkflowRunExecutionEvent,
+    WorkflowRunExecutionEventResumeState,
 )
 from taskforge.runs.persistence_ports import (
     WorkflowRunExecutionEventInvariantViolation,
     WorkflowRunExecutionEventPersistenceUnavailable,
 )
-from taskforge.runs.schema import workflow_run_execution_events
+from taskforge.runs.schema import workflow_run_execution_events, workflow_runs
 
 MAX_EXECUTION_EVENT_PAGE_SIZE = 1000
 WORKFLOW_RUN_STATUS_CHANGED = "workflow_run.status_changed"
@@ -83,6 +84,59 @@ class SQLAlchemyWorkflowRunExecutionEventRepository:
 
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
+
+    async def inspect_resume_cursor(
+        self,
+        workflow_run_id: UUID,
+        requested_cursor: int | None,
+    ) -> WorkflowRunExecutionEventResumeState:
+        if requested_cursor is not None and (
+            isinstance(requested_cursor, bool)
+            or not isinstance(requested_cursor, int)
+            or requested_cursor < 0
+        ):
+            raise ValueError("requested cursor must be a non-negative integer")
+        earliest = (
+            select(func.min(workflow_run_execution_events.c.cursor))
+            .where(workflow_run_execution_events.c.workflow_run_id == workflow_run_id)
+            .scalar_subquery()
+        )
+        requested_exists = (
+            literal(None, Boolean)
+            if requested_cursor is None
+            else select(workflow_run_execution_events.c.id)
+            .where(
+                workflow_run_execution_events.c.workflow_run_id == workflow_run_id,
+                workflow_run_execution_events.c.cursor == requested_cursor,
+            )
+            .exists()
+        ).label("requested_cursor_exists")
+        try:
+            async with self._sessions() as session, session.begin():
+                row = (
+                    await session.execute(
+                        select(
+                            earliest.label("earliest_retained_cursor"),
+                            workflow_runs.c.last_execution_event_cursor.label(
+                                "latest_cursor"
+                            ),
+                            requested_exists,
+                        ).where(workflow_runs.c.id == workflow_run_id)
+                    )
+                ).one_or_none()
+        except DBAPIError as error:
+            raise WorkflowRunExecutionEventPersistenceUnavailable from error
+        if row is None:
+            raise WorkflowRunExecutionEventInvariantViolation
+        try:
+            return WorkflowRunExecutionEventResumeState(
+                row.earliest_retained_cursor,
+                row.latest_cursor,
+                requested_cursor,
+                row.requested_cursor_exists,
+            )
+        except (TypeError, ValueError) as error:
+            raise WorkflowRunExecutionEventInvariantViolation from error
 
     async def list_after(
         self,

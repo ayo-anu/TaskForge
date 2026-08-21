@@ -18,6 +18,7 @@ from taskforge.runs.domain import (
     InvalidWorkflowRunExecutionEvent,
     NewWorkflowRunExecutionEvent,
     StoredWorkflowRunExecutionEvent,
+    WorkflowRunExecutionEventResumeState,
 )
 from taskforge.workflows.task_types import JSONMapping
 
@@ -90,3 +91,44 @@ def test_list_after_rejects_invalid_cursor_and_page_limit_before_database_use() 
     for limit in (0, MAX_EXECUTION_EVENT_PAGE_SIZE + 1, True, cast(Any, "1")):
         with pytest.raises(ValueError):
             asyncio.run(repository.list_after(uuid4(), 0, limit))
+
+
+def test_resume_state_validates_empty_nonempty_and_requested_cursor_shape() -> None:
+    assert WorkflowRunExecutionEventResumeState(None, 0, None, None).latest_cursor == 0
+    assert WorkflowRunExecutionEventResumeState(1, 3, 2, True) == (
+        WorkflowRunExecutionEventResumeState(1, 3, 2, True)
+    )
+
+    for values in (
+        (1, 0, None, None),
+        (None, 1, None, None),
+        (0, 1, None, None),
+        (2, 1, None, None),
+        (None, -1, None, None),
+        (None, 0, 0, None),
+        (None, 0, None, False),
+    ):
+        with pytest.raises(ValueError):
+            WorkflowRunExecutionEventResumeState(*values)
+
+    for contradictory in (
+        (3, 8, 0, True),
+        (3, 8, 2, True),
+        (3, 8, 4, False),
+        (3, 8, 9, True),
+    ):
+        with pytest.raises(ValueError):
+            WorkflowRunExecutionEventResumeState(*contradictory)
+
+    assert WorkflowRunExecutionEventResumeState(3, 8, 2, False).requested_cursor == 2
+    assert WorkflowRunExecutionEventResumeState(None, 0, 0, False).latest_cursor == 0
+
+
+def test_resume_cursor_inspection_rejects_invalid_values_before_database_use() -> None:
+    repository = SQLAlchemyWorkflowRunExecutionEventRepository(
+        cast(async_sessionmaker[AsyncSession], None)
+    )
+
+    for cursor in (-1, True, cast(Any, "1")):
+        with pytest.raises(ValueError):
+            asyncio.run(repository.inspect_resume_cursor(uuid4(), cursor))

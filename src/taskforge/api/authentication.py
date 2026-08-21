@@ -33,6 +33,9 @@ from taskforge.persistence.authorization import SQLAlchemyPrincipalRoleRepositor
 from taskforge.persistence.claims import SQLAlchemyTaskClaimInspectionRepository
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.dead_letter_operations import SQLAlchemyDeadLetterRepository
+from taskforge.persistence.execution_events import (
+    SQLAlchemyWorkflowRunExecutionEventRepository,
+)
 from taskforge.persistence.principals import SQLAlchemyPrincipalProfileRepository
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.persistence.workers import (
@@ -42,6 +45,7 @@ from taskforge.persistence.workers import (
     SQLAlchemyWorkerRegistrationRepository,
 )
 from taskforge.persistence.workflows import SQLAlchemyWorkflowRepository
+from taskforge.runs.persistence_ports import WorkflowRunExecutionEventRepository
 from taskforge.runs.service import WorkflowRunService
 from taskforge.settings import Settings
 from taskforge.worker.domain import WorkerHealthThresholds
@@ -86,6 +90,7 @@ class AuthenticationRuntime:
         worker_capability_service: WorkerCapabilityService,
         task_claim_inspection_service: TaskClaimInspectionService,
         dead_letter_service: DeadLetterService,
+        workflow_run_execution_event_repository: WorkflowRunExecutionEventRepository,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
@@ -101,6 +106,9 @@ class AuthenticationRuntime:
         self.worker_capability_service = worker_capability_service
         self.task_claim_inspection_service = task_claim_inspection_service
         self.dead_letter_service = dead_letter_service
+        self.workflow_run_execution_event_repository = (
+            workflow_run_execution_event_repository
+        )
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -161,6 +169,9 @@ def build_authentication_runtime(
             SQLAlchemyTaskClaimInspectionRepository(sessions)
         ),
         dead_letter_service=DeadLetterService(SQLAlchemyDeadLetterRepository(sessions)),
+        workflow_run_execution_event_repository=(
+            SQLAlchemyWorkflowRunExecutionEventRepository(sessions)
+        ),
     )
 
 

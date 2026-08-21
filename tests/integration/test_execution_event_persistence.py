@@ -133,6 +133,13 @@ async def verify_constraints_immutability_and_pagination(database_url: URL) -> N
     repository = SQLAlchemyWorkflowRunExecutionEventRepository(sessions)
     try:
         first_run, second_run, first_task, second_task = await seed_runs(connection)
+        empty = await repository.inspect_resume_cursor(first_run, None)
+        assert (
+            empty.earliest_retained_cursor,
+            empty.latest_cursor,
+            empty.requested_cursor,
+            empty.requested_cursor_exists,
+        ) == (None, 0, None, None)
         first = await raw_append(connection, first_run)
         second = await raw_append(
             connection,
@@ -142,6 +149,29 @@ async def verify_constraints_immutability_and_pagination(database_url: URL) -> N
         )
         other = await raw_append(connection, second_run)
         assert (first["cursor"], second["cursor"], other["cursor"]) == (1, 2, 1)
+
+        no_cursor = await repository.inspect_resume_cursor(first_run, None)
+        beginning = await repository.inspect_resume_cursor(first_run, 0)
+        middle = await repository.inspect_resume_cursor(first_run, 1)
+        latest = await repository.inspect_resume_cursor(first_run, 2)
+        ahead = await repository.inspect_resume_cursor(first_run, 3)
+        independent = await repository.inspect_resume_cursor(second_run, 1)
+        assert (
+            no_cursor.earliest_retained_cursor,
+            no_cursor.latest_cursor,
+            no_cursor.requested_cursor_exists,
+        ) == (1, 2, None)
+        assert beginning.requested_cursor_exists is False
+        assert middle.requested_cursor_exists is True
+        assert latest.requested_cursor_exists is True
+        assert ahead.requested_cursor_exists is False
+        assert (
+            independent.earliest_retained_cursor,
+            independent.latest_cursor,
+            independent.requested_cursor_exists,
+        ) == (1, 1, True)
+        with pytest.raises(WorkflowRunExecutionEventInvariantViolation):
+            await repository.inspect_resume_cursor(uuid4(), 0)
 
         first_page = await repository.list_after(first_run, 0, 1)
         second_page = await repository.list_after(first_run, first_page[-1].cursor, 10)

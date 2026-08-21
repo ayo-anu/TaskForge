@@ -26,6 +26,7 @@ from taskforge.runs.domain import (
     StoredWorkflowRunExecutionEvent,
     WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
+    WorkflowRunExecutionEventResumeState,
     WorkflowRunIdempotency,
     WorkflowRunInput,
     WorkflowRunStatus,
@@ -262,6 +263,12 @@ class RetryEventInspectionRepository(Protocol):
 
 
 class WorkflowRunExecutionEventRepository(Protocol):
+    async def inspect_resume_cursor(
+        self,
+        workflow_run_id: UUID,
+        requested_cursor: int | None,
+    ) -> WorkflowRunExecutionEventResumeState: ...
+
     async def list_after(
         self,
         workflow_run_id: UUID,
