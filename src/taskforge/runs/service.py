@@ -10,6 +10,7 @@ from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
     CancellationPropagationResult,
+    CancellationSettlementResult,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     InspectedTaskRun,
@@ -262,6 +263,17 @@ class WorkflowRunService:
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
 
+    async def settle_dispatched_tasks(
+        self,
+        workflow_run_id: UUID,
+    ) -> CancellationSettlementResult:
+        try:
+            return await self._repository.settle_dispatched_tasks(workflow_run_id)
+        except WorkflowRunCancellationPersistenceInvariantViolation as error:
+            raise WorkflowRunCancellationInvariantError from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+
     async def evaluate_workflow_run_state(
         self,
         workflow_run_id: UUID,
@@ -304,8 +316,23 @@ class WorkflowRunService:
                     False,
                     False,
                 )
-            assert cancellation.workflow_status is not None
-            last_status = cancellation.workflow_status
+            settlement = await self.settle_dispatched_tasks(workflow_run_id)
+            if not settlement.found:
+                return WorkflowRunReconciliationResult(
+                    workflow_run_id,
+                    False,
+                    iteration,
+                    runnable_count,
+                    skipped_count,
+                    workflow_transition_count,
+                    cancelled_count,
+                    None,
+                    False,
+                    False,
+                )
+            cancelled_count += settlement.settled_count
+            assert settlement.workflow_status is not None
+            last_status = settlement.workflow_status
             if last_status is WorkflowRunStatus.CANCELLING or last_status in (
                 terminal_statuses
             ):
@@ -377,6 +404,7 @@ class WorkflowRunService:
 
             iteration_made_progress = (
                 cancellation.made_progress
+                or settlement.made_progress
                 or runnable.made_progress
                 or skipped.made_progress
                 or workflow.made_progress

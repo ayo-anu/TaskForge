@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -56,6 +57,7 @@ from taskforge.runs.schema import (
     task_claim_events,
     task_dispatch_outbox,
     task_runs,
+    workflow_run_cancellation_requests,
     workflow_runs,
 )
 from taskforge.worker.health import worker_session_is_healthy
@@ -358,6 +360,24 @@ class SQLAlchemyTaskClaimRepository:
                     authenticated_worker.worker_identity_id,
                     request.worker_session_id,
                 )
+                workflow = (
+                    await session.execute(
+                        select(workflow_runs.c.id, workflow_runs.c.status)
+                        .select_from(
+                            workflow_runs.join(
+                                task_runs,
+                                task_runs.c.workflow_run_id == workflow_runs.c.id,
+                            ).join(
+                                task_attempts,
+                                task_attempts.c.task_run_id == task_runs.c.id,
+                            )
+                        )
+                        .where(task_attempts.c.id == request.task_attempt_id)
+                        .with_for_update(of=workflow_runs)
+                    )
+                ).one_or_none()
+                if workflow is None:
+                    raise TaskClaimRenewalStale
                 task = (
                     await session.execute(
                         select(
@@ -466,6 +486,26 @@ class SQLAlchemyTaskClaimRepository:
                 ).one()
                 if current.lease_expires_at <= timing.reference_time:
                     raise TaskClaimRenewalExpired
+
+                if workflow.status == WorkflowRunStatus.CANCELLING.value:
+                    requested_at = await session.scalar(
+                        select(workflow_run_cancellation_requests.c.requested_at).where(
+                            workflow_run_cancellation_requests.c.workflow_run_id
+                            == workflow.id
+                        )
+                    )
+                    if not isinstance(requested_at, datetime):
+                        raise TaskClaimInvariantViolation
+                    return TaskClaimRenewalResult(
+                        TaskClaimRenewalOutcome.CANCELLATION_REQUESTED,
+                        _claim_lease(current),
+                        requested_at,
+                    )
+                if workflow.status not in (
+                    WorkflowRunStatus.PENDING.value,
+                    WorkflowRunStatus.RUNNING.value,
+                ):
+                    raise TaskClaimInvariantViolation
 
                 expected = request.expected_lease_expires_at
                 if expected < current.lease_expires_at:
@@ -707,28 +747,20 @@ def _dispatch_matches(dispatch: DispatchEnvelope, durable: Row[Any]) -> bool:
 
 
 def _claim_result(row: Row[Any], outcome: TaskClaimOutcome) -> TaskClaimResult:
-    return TaskClaimResult(
-        outcome,
-        TaskClaimLease(
-            row.task_attempt_id,
-            row.generation,
-            row.worker_session_id,
-            row.acquired_at,
-            row.lease_expires_at,
-        ),
+    return TaskClaimResult(outcome, _claim_lease(row))
+
+
+def _claim_lease(row: Row[Any]) -> TaskClaimLease:
+    return TaskClaimLease(
+        row.task_attempt_id,
+        row.generation,
+        row.worker_session_id,
+        row.acquired_at,
+        row.lease_expires_at,
     )
 
 
 def _renewal_result(
     row: Row[Any], outcome: TaskClaimRenewalOutcome
 ) -> TaskClaimRenewalResult:
-    return TaskClaimRenewalResult(
-        outcome,
-        TaskClaimLease(
-            row.task_attempt_id,
-            row.generation,
-            row.worker_session_id,
-            row.acquired_at,
-            row.lease_expires_at,
-        ),
-    )
+    return TaskClaimRenewalResult(outcome, _claim_lease(row))

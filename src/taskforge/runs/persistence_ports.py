@@ -14,6 +14,7 @@ from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     AcceptedWorkflowRunCancellation,
     CancellationPropagationResult,
+    CancellationSettlementResult,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     InspectedTaskRun,
@@ -205,6 +206,12 @@ class WorkflowRunRepository(Protocol):
         workflow_run_id: UUID,
     ) -> CancellationPropagationResult:
         """Cancel every pre-dispatch task when its workflow is cancelling."""
+
+    async def settle_dispatched_tasks(
+        self,
+        workflow_run_id: UUID,
+    ) -> CancellationSettlementResult:
+        """Cancel unclaimed dispatched tasks when their workflow is cancelling."""
 
     async def propagate_dependency_failures(
         self,

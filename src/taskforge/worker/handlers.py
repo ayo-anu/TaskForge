@@ -9,6 +9,7 @@ from types import MappingProxyType
 from uuid import UUID
 
 from taskforge.dispatch.envelope import FrozenJSONMapping, TraceContext
+from taskforge.worker.cancellation import TaskCancellationToken
 from taskforge.worker.results import (
     TaskCancellation,
     TaskPermanentFailure,
@@ -44,6 +45,7 @@ class TaskContext:
     correlation_id: str | None
     trace_context: TraceContext | None
     cancellation_requested_at_start: bool
+    cancellation_token: TaskCancellationToken
     deadline: TaskDeadline | None
 
     def __repr__(self) -> str:
@@ -56,6 +58,7 @@ class TaskContext:
             "parameters=<redacted>, references=<redacted>, "
             "correlation_id=<redacted>, trace_context=<redacted>, "
             f"cancellation_requested_at_start={self.cancellation_requested_at_start!r}, "
+            f"cancellation_requested={self.cancellation_token.is_cancellation_requested!r}, "
             f"deadline={self.deadline!r})"
         )
 
@@ -73,6 +76,7 @@ def create_task_context(
     correlation_id: str | None,
     trace_context: TraceContext | None,
     cancellation_requested_at_start: bool,
+    cancellation_token: TaskCancellationToken,
     deadline: TaskDeadline | None,
 ) -> TaskContext:
     return TaskContext(
@@ -88,6 +92,7 @@ def create_task_context(
         correlation_id,
         trace_context,
         cancellation_requested_at_start,
+        cancellation_token,
         deadline,
     )
 

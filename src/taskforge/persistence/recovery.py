@@ -40,6 +40,7 @@ from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
     ExpiredClaimCandidatePage,
     ExpiredClaimScanCursor,
+    PreparedCancellationSettlement,
     PreparedExpiredClaimRecovery,
     StaleWorkerSessionCandidate,
     StaleWorkerSessionCandidatePage,
@@ -70,6 +71,7 @@ from taskforge.runs.schema import (
     task_result_events,
     task_retry_events,
     task_runs,
+    workflow_run_cancellation_requests,
     workflow_runs,
 )
 from taskforge.worker.results import (
@@ -380,18 +382,21 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                 )
             ).one_or_none()
             if accepted is not None:
-                if (
-                    accepted.result_kind
-                    == TaskExecutionResultKind.RETRYABLE_FAILURE.value
-                    and accepted.failure_kind
-                    == TaskExecutionFailureKind.CLAIM_EXPIRED.value
-                    and accepted.claim_generation == candidate.generation
-                    and claim.lease_expires_at == candidate.lease_expires_at
-                ):
+                recovered_event = await session.scalar(
+                    select(task_result_events.c.id).where(
+                        task_result_events.c.task_attempt_id
+                        == candidate.task_attempt_id,
+                        task_result_events.c.claim_generation == candidate.generation,
+                        task_result_events.c.event_type == "result_recovered",
+                    )
+                )
+                if recovered_event is not None:
                     if (
                         claim.terminated_at is None
                         or claim.worker_session_id != candidate.worker_session_id
                         or accepted.dispatch_attempt_id != candidate.task_attempt_id
+                        or accepted.claim_generation != candidate.generation
+                        or claim.lease_expires_at != candidate.lease_expires_at
                     ):
                         raise ExpiredClaimRecoveryPersistenceInvariantViolation
                     return ExpiredClaimRecoveryNoOp(
@@ -446,6 +451,7 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             if workflow.status not in (
                 WorkflowRunStatus.PENDING.value,
                 WorkflowRunStatus.RUNNING.value,
+                WorkflowRunStatus.CANCELLING.value,
             ):
                 return ExpiredClaimRecoveryNoOp(
                     ExpiredClaimRecoveryNoOpReason.WORKFLOW_NOT_ELIGIBLE
@@ -463,6 +469,28 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             if claim.lease_expires_at > recovered_at:
                 return ExpiredClaimRecoveryNoOp(
                     ExpiredClaimRecoveryNoOpReason.CANDIDATE_NO_LONGER_EXPIRED
+                )
+            if workflow.status == WorkflowRunStatus.CANCELLING.value:
+                cancellation_exists = await session.scalar(
+                    select(
+                        func.count(workflow_run_cancellation_requests.c.workflow_run_id)
+                    ).where(
+                        workflow_run_cancellation_requests.c.workflow_run_id
+                        == workflow.id
+                    )
+                )
+                if cancellation_exists != 1:
+                    raise ExpiredClaimRecoveryPersistenceInvariantViolation
+                return PreparedCancellationSettlement(
+                    candidate.task_attempt_id,
+                    candidate.task_run_id,
+                    candidate.workflow_run_id,
+                    candidate.attempt_number,
+                    candidate.generation,
+                    claim.worker_session_id,
+                    attempt.dispatch_id,
+                    claim.lease_expires_at,
+                    recovered_at,
                 )
             snapshot = (
                 await session.execute(
@@ -599,6 +627,84 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             )
         except DeadLetterPersistenceInvariantViolation as error:
             raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
+        except IntegrityError as error:
+            raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
+        except DBAPIError as error:
+            raise ExpiredClaimRecoveryPersistenceUnavailable from error
+
+    async def settle_cancellation(
+        self,
+        prepared: PreparedCancellationSettlement,
+    ) -> None:
+        fingerprint = task_result_fingerprint(
+            result_kind=TaskExecutionResultKind.CANCELLATION,
+            failure_kind=None,
+            output=None,
+        )
+        session = self._required_session()
+        try:
+            await session.execute(
+                insert(task_attempt_results).values(
+                    task_attempt_id=prepared.task_attempt_id,
+                    claim_generation=prepared.generation,
+                    dispatch_id=prepared.dispatch_id,
+                    result_kind=TaskExecutionResultKind.CANCELLATION.value,
+                    failure_kind=None,
+                    output=null(),
+                    result_fingerprint=fingerprint,
+                    completed_at=prepared.recovered_at,
+                )
+            )
+            terminated = (
+                await session.execute(
+                    update(task_attempt_claims)
+                    .where(
+                        task_attempt_claims.c.task_attempt_id
+                        == prepared.task_attempt_id,
+                        task_attempt_claims.c.generation == prepared.generation,
+                        task_attempt_claims.c.terminated_at.is_(None),
+                        task_attempt_claims.c.lease_expires_at
+                        == prepared.lease_expires_at,
+                        task_attempt_claims.c.lease_expires_at <= prepared.recovered_at,
+                    )
+                    .values(terminated_at=prepared.recovered_at)
+                    .returning(task_attempt_claims.c.task_attempt_id)
+                )
+            ).one_or_none()
+            if terminated is None:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            transitioned = (
+                await session.execute(
+                    update(task_runs)
+                    .where(
+                        task_runs.c.id == prepared.task_run_id,
+                        task_runs.c.status.in_(
+                            (TaskRunStatus.CLAIMED.value, TaskRunStatus.RUNNING.value)
+                        ),
+                    )
+                    .values(
+                        status=TaskRunStatus.CANCELLED.value,
+                        updated_at=prepared.recovered_at,
+                    )
+                    .returning(task_runs.c.id)
+                )
+            ).one_or_none()
+            if transitioned is None:
+                raise ExpiredClaimRecoveryPersistenceInvariantViolation
+            await session.execute(
+                insert(task_result_events).values(
+                    id=uuid4(),
+                    task_attempt_id=prepared.task_attempt_id,
+                    claim_generation=prepared.generation,
+                    worker_session_id=prepared.worker_session_id,
+                    dispatch_id=prepared.dispatch_id,
+                    event_type="result_recovered",
+                    result_kind=TaskExecutionResultKind.CANCELLATION.value,
+                    failure_kind=None,
+                    result_fingerprint=fingerprint,
+                    occurred_at=prepared.recovered_at,
+                )
+            )
         except IntegrityError as error:
             raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
         except DBAPIError as error:

@@ -44,6 +44,7 @@ class ExpiredClaimRecoveryProgressionUnavailable(Exception):
 class ExpiredClaimRecoveryProgressionService:
     _RECONCILE_OUTCOMES = frozenset(
         {
+            ExpiredClaimRecoveryOutcome.CANCELLED,
             ExpiredClaimRecoveryOutcome.FAILED_NO_POLICY,
             ExpiredClaimRecoveryOutcome.FAILED_EXHAUSTED,
             ExpiredClaimRecoveryOutcome.ALREADY_RECOVERED,

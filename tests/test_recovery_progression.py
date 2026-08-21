@@ -96,6 +96,7 @@ def reconciliation(value: ExpiredClaimCandidate) -> WorkflowRunReconciliationRes
         ExpiredClaimRecoveryOutcome.FAILED_NO_POLICY,
         ExpiredClaimRecoveryOutcome.FAILED_EXHAUSTED,
         ExpiredClaimRecoveryOutcome.ALREADY_RECOVERED,
+        ExpiredClaimRecoveryOutcome.CANCELLED,
     ],
 )
 def test_terminal_or_replayed_recovery_reconciles_after_recovery(
@@ -127,6 +128,7 @@ def test_terminal_or_replayed_recovery_reconciles_after_recovery(
             ExpiredClaimRecoveryOutcome.FAILED_NO_POLICY,
             ExpiredClaimRecoveryOutcome.FAILED_EXHAUSTED,
             ExpiredClaimRecoveryOutcome.ALREADY_RECOVERED,
+            ExpiredClaimRecoveryOutcome.CANCELLED,
         }
     ],
 )

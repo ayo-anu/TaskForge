@@ -256,6 +256,41 @@ async def exercise_renewal(database_url: URL) -> None:
             )
         ).outcome is TaskClaimRenewalOutcome.RENEWED
 
+        cancelling_worker = await add_worker(setup)
+        cancelling_request = await add_current_claim(
+            setup,
+            cancelling_worker,
+            task_status="running",
+            lease_interval=timedelta(seconds=30),
+        )
+        run = await setup.fetchrow(
+            "SELECT wr.id, wr.requested_by_principal_id FROM workflow_runs wr "
+            "JOIN task_runs tr ON tr.workflow_run_id = wr.id "
+            "JOIN task_attempts ta ON ta.task_run_id = tr.id WHERE ta.id = $1",
+            cancelling_request.task_attempt_id,
+        )
+        assert run is not None
+        requested_at = await setup.fetchval(
+            "INSERT INTO workflow_run_cancellation_requests "
+            "(workflow_run_id, requested_by_principal_id, idempotency_key_digest, "
+            "request_fingerprint) VALUES ($1, $2, $3, $4) RETURNING requested_at",
+            run["id"],
+            run["requested_by_principal_id"],
+            "a" * 64,
+            "b" * 64,
+        )
+        await setup.execute(
+            "UPDATE workflow_runs SET status = 'cancelling' WHERE id = $1", run["id"]
+        )
+        denied = await repository.renew_claim(
+            cancelling_worker.authenticated, cancelling_request, lease_seconds=60
+        )
+        assert denied.outcome is TaskClaimRenewalOutcome.CANCELLATION_REQUESTED
+        assert denied.cancellation_requested_at == requested_at
+        assert denied.claim.lease_expires_at == (
+            cancelling_request.expected_lease_expires_at
+        )
+
         await exercise_rejections(setup, repository)
         await exercise_assignment_changes(setup, repository)
         await exercise_same_owner_race(

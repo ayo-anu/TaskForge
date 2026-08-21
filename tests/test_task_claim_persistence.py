@@ -396,6 +396,7 @@ def renewal_rows(
         SimpleNamespace(id=worker.worker_identity_id),
         SimpleNamespace(id=worker.credential_id),
         SimpleNamespace(ended_at=None),
+        SimpleNamespace(id=uuid4(), status="running"),
         SimpleNamespace(id=uuid4(), status="claimed", attempt_number=1),
         claim,
         None,
@@ -506,6 +507,34 @@ def test_repository_active_unchanged_and_replay_are_genuine_no_write_paths() -> 
     )
 
 
+def test_repository_denies_renewal_after_workflow_cancellation_wins() -> None:
+    worker = AuthenticatedWorker(uuid4(), uuid4())
+    session_id, attempt_id = uuid4(), uuid4()
+    current_expiry = datetime.now(UTC) + timedelta(seconds=30)
+    requested_at = datetime.now(UTC) - timedelta(seconds=1)
+    request = TaskClaimRenewalRequest(attempt_id, 2, session_id, current_expiry)
+    rows, _ = renewal_rows(
+        worker,
+        request,
+        current_expiry=current_expiry,
+        candidate_expiry=current_expiry + timedelta(seconds=60),
+        renewed_expiry=None,
+    )
+    rows[3].status = "cancelling"
+    session = FakeSession(rows, [1, requested_at])
+    repository = SQLAlchemyTaskClaimRepository(
+        cast(async_sessionmaker[AsyncSession], FakeSessions(session)),
+        worker_stale_after_seconds=30,
+    )
+
+    result = asyncio.run(repository.renew_claim(worker, request, lease_seconds=60))
+
+    assert result.outcome is TaskClaimRenewalOutcome.CANCELLATION_REQUESTED
+    assert result.cancellation_requested_at == requested_at
+    assert result.claim.lease_expires_at == current_expiry
+    assert not any(isinstance(statement, Update) for statement in session.statements)
+
+
 def test_repository_rejects_exact_recovered_generation_without_result_row_lock() -> (
     None
 ):
@@ -518,6 +547,7 @@ def test_repository_rejects_exact_recovered_generation_without_result_row_lock()
             SimpleNamespace(id=worker.worker_identity_id),
             SimpleNamespace(id=worker.credential_id),
             SimpleNamespace(ended_at=None),
+            SimpleNamespace(id=uuid4(), status="running"),
             SimpleNamespace(id=uuid4(), status="retry_scheduled", attempt_number=1),
             SimpleNamespace(
                 task_attempt_id=attempt_id,

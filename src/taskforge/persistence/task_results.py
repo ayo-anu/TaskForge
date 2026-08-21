@@ -15,7 +15,7 @@ from taskforge.persistence.dead_letters import (
     DeadLetterPersistenceInvariantViolation,
     ensure_dead_letter,
 )
-from taskforge.runs.domain import TaskRunStatus
+from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
 from taskforge.runs.schema import (
     task_attempt_claims,
     task_attempt_results,
@@ -36,7 +36,6 @@ from taskforge.worker.result_persistence_ports import (
     TaskResultPersistenceUnavailable,
 )
 from taskforge.worker.results import (
-    TaskExecutionFailureKind,
     TaskExecutionResultKind,
 )
 from taskforge.worker.schema import worker_sessions
@@ -75,6 +74,30 @@ class SQLAlchemyTaskResultRepository:
                 if worker_session is None:
                     raise TaskResultPersistenceAuthorityRejected
 
+                workflow = (
+                    await session.execute(
+                        select(
+                            workflow_runs.c.id,
+                            workflow_runs.c.status,
+                        )
+                        .select_from(
+                            workflow_runs.join(
+                                task_runs,
+                                task_runs.c.workflow_run_id == workflow_runs.c.id,
+                            ).join(
+                                task_attempts,
+                                task_attempts.c.task_run_id == task_runs.c.id,
+                            )
+                        )
+                        .where(
+                            task_attempts.c.id == result.task_attempt_id,
+                            task_runs.c.id == result.task_run_id,
+                        )
+                        .with_for_update(of=workflow_runs)
+                    )
+                ).one_or_none()
+                if workflow is None:
+                    raise TaskResultPersistenceNotFound
                 durable = (
                     await session.execute(
                         select(
@@ -82,26 +105,24 @@ class SQLAlchemyTaskResultRepository:
                             task_attempts.c.attempt_number,
                             task_runs.c.workflow_run_id,
                             task_runs.c.status,
-                            workflow_runs.c.status.label("workflow_run_status"),
                         )
                         .select_from(
                             task_attempts.join(
                                 task_runs,
                                 task_runs.c.id == task_attempts.c.task_run_id,
-                            ).join(
-                                workflow_runs,
-                                workflow_runs.c.id == task_runs.c.workflow_run_id,
                             )
                         )
                         .where(
                             task_attempts.c.id == result.task_attempt_id,
                             task_runs.c.id == result.task_run_id,
                         )
-                        .with_for_update(of=(workflow_runs, task_runs))
+                        .with_for_update(of=task_runs)
                     )
                 ).one_or_none()
                 if durable is None:
                     raise TaskResultPersistenceNotFound
+                if durable.workflow_run_id != workflow.id:
+                    raise TaskResultPersistenceInvariantViolation
                 dispatch_attempt_id = await session.scalar(
                     select(task_dispatch_outbox.c.task_attempt_id).where(
                         task_dispatch_outbox.c.id == result.dispatch_id
@@ -146,15 +167,16 @@ class SQLAlchemyTaskResultRepository:
                     )
                 ).one_or_none()
                 if accepted is not None:
-                    recovered_generation = (
-                        accepted.claim_generation == result.claim_generation
-                        and accepted.dispatch_id == result.dispatch_id
-                        and accepted.result_kind
-                        == TaskExecutionResultKind.RETRYABLE_FAILURE.value
-                        and accepted.failure_kind
-                        == TaskExecutionFailureKind.CLAIM_EXPIRED.value
+                    recovered_generation = await session.scalar(
+                        select(task_result_events.c.id).where(
+                            task_result_events.c.task_attempt_id
+                            == result.task_attempt_id,
+                            task_result_events.c.claim_generation
+                            == result.claim_generation,
+                            task_result_events.c.event_type == "result_recovered",
+                        )
                     )
-                    if recovered_generation:
+                    if recovered_generation is not None:
                         if claim.terminated_at is None:
                             raise TaskResultPersistenceInvariantViolation
                         await _append_event(
@@ -236,8 +258,17 @@ class SQLAlchemyTaskResultRepository:
                     raise TaskResultPersistenceAuthorityRejected
                 if durable.status != TaskRunStatus.RUNNING.value:
                     raise TaskResultPersistenceInvalidState
+                if workflow.status not in (
+                    WorkflowRunStatus.PENDING.value,
+                    WorkflowRunStatus.RUNNING.value,
+                    WorkflowRunStatus.CANCELLING.value,
+                ):
+                    raise TaskResultPersistenceInvalidState
 
-                target = _target_task_status(result.result_kind)
+                target = _target_task_status(
+                    result.result_kind,
+                    workflow_status=WorkflowRunStatus(workflow.status),
+                )
                 await session.execute(
                     insert(task_attempt_results).values(
                         task_attempt_id=result.task_attempt_id,
@@ -349,7 +380,16 @@ async def _lock_worker_authority(
         raise TaskResultPersistenceAuthorityRejected
 
 
-def _target_task_status(result_kind: TaskExecutionResultKind) -> TaskRunStatus:
+def _target_task_status(
+    result_kind: TaskExecutionResultKind,
+    *,
+    workflow_status: WorkflowRunStatus,
+) -> TaskRunStatus:
+    if (
+        result_kind is TaskExecutionResultKind.RETRYABLE_FAILURE
+        and workflow_status is WorkflowRunStatus.CANCELLING
+    ):
+        return TaskRunStatus.CANCELLED
     return {
         TaskExecutionResultKind.SUCCESS: TaskRunStatus.SUCCEEDED,
         TaskExecutionResultKind.RETRYABLE_FAILURE: TaskRunStatus.RETRY_PENDING,

@@ -23,6 +23,10 @@ from taskforge.dispatch.envelope import (
 )
 from taskforge.dispatch.transport import DispatchTransportMetadata
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.worker.cancellation import (
+    TaskCancellationObservation,
+    TaskCancellationObservationOutcome,
+)
 from taskforge.worker.consumer_ports import (
     BrokerConsumerUnavailable,
     BrokerDispatchDelivery,
@@ -158,6 +162,18 @@ class ResultService:
             self.outcome,
             self.task_attempt_id or request.task_attempt_id,
         )
+
+
+class CancellationObserver:
+    def __init__(self, observations: list[TaskCancellationObservation]) -> None:
+        self.observations = observations
+        self.calls = 0
+
+    async def observe_cancellation(self, *args: Any) -> TaskCancellationObservation:
+        del args
+        index = min(self.calls, len(self.observations) - 1)
+        self.calls += 1
+        return self.observations[index]
 
 
 def fixture(
@@ -867,4 +883,128 @@ def test_timeout_boundary_begins_after_durable_start_and_wraps_only_handler(
         "timeout-exit",
         "result",
     ]
+    assert control.actions == ["ack"]
+
+
+def test_cancellation_observed_before_invocation_skips_handler_and_settles() -> None:
+    _, control, issued, worker, _ = fixture()
+    requested_at = datetime.now(UTC)
+    observer = CancellationObserver(
+        [
+            TaskCancellationObservation(
+                TaskCancellationObservationOutcome.CANCELLATION_REQUESTED,
+                requested_at,
+            )
+        ]
+    )
+    handler_called = False
+
+    async def handler(context: TaskContext) -> object:
+        nonlocal handler_called
+        handler_called = True
+        del context
+        return None
+
+    results = ResultService()
+    consumer = WorkerExecutionConsumer(
+        ClaimService(issued),
+        StartService([]),
+        results,
+        registry(handler),
+        worker,
+        issued.claim.worker_session_id,
+        observer,
+    )
+
+    asyncio.run(consumer.consume(control))
+
+    assert not handler_called
+    assert results.requests[0].result.kind is TaskExecutionResultKind.CANCELLATION
+    assert control.actions == ["ack"]
+
+
+def test_initial_lost_authority_acks_without_handler_result_or_monitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, control, issued, worker, _ = fixture()
+    observer = CancellationObserver(
+        [
+            TaskCancellationObservation(
+                TaskCancellationObservationOutcome.NO_LONGER_AUTHORITATIVE
+            )
+        ]
+    )
+    handler_called = False
+    monitor_created = False
+    original_create_task = asyncio.create_task
+
+    def observed_create_task(*args: Any, **kwargs: Any) -> asyncio.Task[Any]:
+        nonlocal monitor_created
+        monitor_created = True
+        return original_create_task(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "taskforge.worker.execution.asyncio.create_task", observed_create_task
+    )
+
+    async def handler(context: TaskContext) -> object:
+        nonlocal handler_called
+        handler_called = True
+        del context
+        return None
+
+    results = ResultService()
+    consumer = WorkerExecutionConsumer(
+        ClaimService(issued),
+        StartService([]),
+        results,
+        registry(handler),
+        worker,
+        issued.claim.worker_session_id,
+        observer,
+    )
+
+    asyncio.run(consumer.consume(control))
+
+    assert not handler_called
+    assert results.requests == []
+    assert control.actions == ["ack"]
+    assert not monitor_created
+
+
+def test_running_handler_observes_monotonic_cancellation_token() -> None:
+    _, control, issued, worker, _ = fixture()
+    requested_at = datetime.now(UTC)
+    observer = CancellationObserver(
+        [
+            TaskCancellationObservation(TaskCancellationObservationOutcome.ACTIVE),
+            TaskCancellationObservation(
+                TaskCancellationObservationOutcome.CANCELLATION_REQUESTED,
+                requested_at,
+            ),
+        ]
+    )
+
+    async def handler(context: TaskContext) -> object:
+        observed = await asyncio.wait_for(context.cancellation_token.wait(), timeout=1)
+        assert observed == requested_at
+        assert context.cancellation_token.is_cancellation_requested
+        return TaskCancellation()
+
+    results = ResultService()
+    consumer = WorkerExecutionConsumer(
+        ClaimService(issued),
+        StartService([]),
+        results,
+        registry(handler),
+        worker,
+        issued.claim.worker_session_id,
+        observer,
+        cancellation_poll_seconds=0.001,
+    )
+
+    asyncio.run(consumer.consume(control))
+
+    assert observer.calls >= 2
+    assert results.requests[0].result.kind is TaskExecutionResultKind.CANCELLATION
     assert control.actions == ["ack"]

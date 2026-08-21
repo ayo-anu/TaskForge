@@ -15,6 +15,7 @@ from taskforge.identity.authorization import OwnerFilter
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
     CancellationPropagationResult,
+    CancellationSettlementResult,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
@@ -1025,6 +1026,7 @@ class ScriptedProgressionRepository:
         workflow: list[WorkflowRunEvaluationResult],
         *,
         cancellation: list[CancellationPropagationResult] | None = None,
+        settlement: list[CancellationSettlementResult] | None = None,
         failure_at: tuple[str, int] | None = None,
     ) -> None:
         self.run_id = run_id
@@ -1033,6 +1035,12 @@ class ScriptedProgressionRepository:
         self.workflow = workflow
         self.cancellation = cancellation or [
             CancellationPropagationResult(
+                run_id, True, WorkflowRunStatus.RUNNING, (), ()
+            )
+            for _ in range(max(len(runnable), 1))
+        ]
+        self.settlement = settlement or [
+            CancellationSettlementResult(
                 run_id, True, WorkflowRunStatus.RUNNING, (), ()
             )
             for _ in range(max(len(runnable), 1))
@@ -1058,6 +1066,12 @@ class ScriptedProgressionRepository:
     ) -> CancellationPropagationResult:
         assert workflow_run_id == self.run_id
         return self._take("cancellation", self.cancellation)
+
+    async def settle_dispatched_tasks(
+        self, workflow_run_id: UUID
+    ) -> CancellationSettlementResult:
+        assert workflow_run_id == self.run_id
+        return self._take("settlement", self.settlement)
 
     async def propagate_dependency_failures(
         self, workflow_run_id: UUID
@@ -1121,7 +1135,13 @@ def test_reconciler_calls_existing_operations_in_order_and_stops_at_quiescence()
     assert result == WorkflowRunReconciliationResult(
         run_id, True, 1, 0, 0, 0, 0, WorkflowRunStatus.RUNNING, True, False
     )
-    assert repository.calls == ["cancellation", "runnable", "skipped", "workflow"]
+    assert repository.calls == [
+        "cancellation",
+        "settlement",
+        "runnable",
+        "skipped",
+        "workflow",
+    ]
 
 
 def test_reconciler_completes_late_pending_success_without_post_terminal_cycle() -> (
@@ -1150,7 +1170,17 @@ def test_reconciler_completes_late_pending_success_without_post_terminal_cycle()
     assert result.workflow_transition_count == 2
     assert result.final_status is WorkflowRunStatus.SUCCEEDED
     assert result.quiescent and not result.bound_reached
-    assert repository.calls == ["cancellation", "runnable", "skipped", "workflow"] * 2
+    assert (
+        repository.calls
+        == [
+            "cancellation",
+            "settlement",
+            "runnable",
+            "skipped",
+            "workflow",
+        ]
+        * 2
+    )
 
 
 def test_reconciler_reports_missing_and_cancelling_without_another_cycle() -> None:
@@ -1177,13 +1207,18 @@ def test_reconciler_reports_missing_and_cancelling_without_another_cycle() -> No
                 run_id, True, WorkflowRunStatus.CANCELLING, (), ()
             )
         ],
+        settlement=[
+            CancellationSettlementResult(
+                run_id, True, WorkflowRunStatus.CANCELLING, (), ()
+            )
+        ],
     )
     cancelling = asyncio.run(
         reconciliation_service(cancelling_repository).reconcile_workflow_run(run_id)
     )
     assert cancelling.final_status is WorkflowRunStatus.CANCELLING
     assert cancelling.quiescent
-    assert cancelling_repository.calls == ["cancellation"]
+    assert cancelling_repository.calls == ["cancellation", "settlement"]
 
 
 def test_reconciler_enforces_behavioral_iteration_budget_without_ninth_cycle() -> None:
@@ -1208,7 +1243,7 @@ def test_reconciler_enforces_behavioral_iteration_budget_without_ninth_cycle() -
     assert result.iterations == MAX_WORKFLOW_RECONCILIATION_ITERATIONS
     assert result.runnable_transition_count == MAX_WORKFLOW_RECONCILIATION_ITERATIONS
     assert result.bound_reached and not result.quiescent
-    assert len(repository.calls) == MAX_WORKFLOW_RECONCILIATION_ITERATIONS * 4
+    assert len(repository.calls) == MAX_WORKFLOW_RECONCILIATION_ITERATIONS * 5
 
 
 def test_reconciler_can_prove_quiescence_on_final_budgeted_iteration() -> None:
@@ -1239,7 +1274,8 @@ def test_reconciler_can_prove_quiescence_on_final_budgeted_iteration() -> None:
 
 
 @pytest.mark.parametrize(
-    "failure_operation", ("cancellation", "runnable", "skipped", "workflow")
+    "failure_operation",
+    ("cancellation", "settlement", "runnable", "skipped", "workflow"),
 )
 def test_reconciler_propagates_operation_failure_and_stops_iteration(
     failure_operation: str,
@@ -1256,5 +1292,5 @@ def test_reconciler_propagates_operation_failure_and_stops_iteration(
     with pytest.raises(WorkflowRunServiceUnavailable):
         asyncio.run(reconciliation_service(repository).reconcile_workflow_run(run_id))
 
-    expected = ["cancellation", "runnable", "skipped", "workflow"]
+    expected = ["cancellation", "settlement", "runnable", "skipped", "workflow"]
     assert repository.calls == expected[: expected.index(failure_operation) + 1]

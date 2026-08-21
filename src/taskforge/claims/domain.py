@@ -55,6 +55,7 @@ class TaskClaimRenewalOutcome(StrEnum):
     RENEWED = "renewed"
     ACTIVE_UNCHANGED = "active_unchanged"
     REPLAYED = "replayed"
+    CANCELLATION_REQUESTED = "cancellation_requested"
 
 
 @dataclass(frozen=True, repr=False)
@@ -133,6 +134,17 @@ class TaskClaimRenewalRequest:
 class TaskClaimRenewalResult:
     outcome: TaskClaimRenewalOutcome
     claim: TaskClaimLease
+    cancellation_requested_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        requested = self.outcome is TaskClaimRenewalOutcome.CANCELLATION_REQUESTED
+        if requested is (self.cancellation_requested_at is None):
+            raise ValueError("renewal cancellation outcome and timestamp disagree")
+        if self.cancellation_requested_at is not None:
+            value = self.cancellation_requested_at
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("cancellation request time must be timezone-aware")
+            object.__setattr__(self, "cancellation_requested_at", value.astimezone(UTC))
 
 
 @dataclass(frozen=True)

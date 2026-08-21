@@ -120,6 +120,51 @@ async def exercise_results(database_url: URL) -> None:
         )
         assert tuple(state) == ("succeeded", "success", '{"answer": 42}', True)
 
+        retry_worker, retry_dispatch, retry_claim = await claimed_running_task(
+            setup, claim_service
+        )
+        run = await setup.fetchrow(
+            "SELECT id, requested_by_principal_id FROM workflow_runs WHERE id = $1",
+            retry_dispatch.workflow_run_id,
+        )
+        assert run is not None
+        await setup.execute(
+            "INSERT INTO workflow_run_cancellation_requests "
+            "(workflow_run_id, requested_by_principal_id, idempotency_key_digest, "
+            "request_fingerprint) VALUES ($1, $2, $3, $4)",
+            run["id"],
+            run["requested_by_principal_id"],
+            "a" * 64,
+            "b" * 64,
+        )
+        await setup.execute(
+            "UPDATE workflow_runs SET status = 'cancelling' WHERE id = $1", run["id"]
+        )
+        retryable = await result_service.submit_result(
+            retry_worker.authenticated,
+            retry_worker.session_id,
+            submission(
+                retry_dispatch,
+                retry_claim,
+                TaskExecutionResult.retryable_handler_reported(),
+            ),
+        )
+        assert retryable.outcome is TaskResultSubmissionOutcome.ACCEPTED
+        retry_shape = await setup.fetchrow(
+            "SELECT tr.status::text, tar.result_kind, tar.failure_kind, "
+            "(SELECT count(*) FROM task_attempts next WHERE next.task_run_id = tr.id) "
+            "FROM task_runs tr JOIN task_attempts ta ON ta.task_run_id = tr.id "
+            "JOIN task_attempt_results tar ON tar.task_attempt_id = ta.id "
+            "WHERE ta.id = $1",
+            retry_dispatch.task_attempt_id,
+        )
+        assert tuple(retry_shape) == (
+            "cancelled",
+            "retryable_failure",
+            "handler_reported",
+            1,
+        )
+
         replay = await result_service.submit_result(
             worker.authenticated, worker.session_id, accepted_request
         )

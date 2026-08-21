@@ -40,6 +40,7 @@ from taskforge.retries.domain import (
 from taskforge.runs.domain import (
     AcceptedWorkflowRunCancellation,
     CancellationPropagationResult,
+    CancellationSettlementResult,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
@@ -75,6 +76,7 @@ from taskforge.runs.persistence_ports import (
     WorkflowVersionResolutionRecord,
 )
 from taskforge.runs.schema import (
+    task_attempt_claims,
     task_attempt_results,
     task_attempts,
     task_retry_events,
@@ -172,6 +174,7 @@ class SQLAlchemyWorkflowRunRepository:
                         and status is WorkflowRunStatus.CANCELLING
                     ):
                         await _suppress_unstarted_task_rows(session, workflow_run_id)
+                        await _settle_dispatched_task_rows(session, workflow_run_id)
                     return PersistedWorkflowRunCancellation(
                         workflow_run_id, outcome, status, canonical
                     )
@@ -223,6 +226,7 @@ class SQLAlchemyWorkflowRunRepository:
                 if transitioned is None:
                     raise WorkflowRunCancellationPersistenceInvariantViolation
                 await _suppress_unstarted_task_rows(session, workflow_run_id)
+                await _settle_dispatched_task_rows(session, workflow_run_id)
                 return PersistedWorkflowRunCancellation(
                     workflow_run_id,
                     PersistedCancellationOutcome.NEWLY_ACCEPTED,
@@ -268,6 +272,45 @@ class SQLAlchemyWorkflowRunRepository:
 
         ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
         return CancellationPropagationResult(
+            workflow_run_id,
+            True,
+            status,
+            tuple(row.id for row in ordered),
+            tuple(row.step_identifier for row in ordered),
+        )
+
+    async def settle_dispatched_tasks(
+        self,
+        workflow_run_id: UUID,
+    ) -> CancellationSettlementResult:
+        """Cancel unclaimed dispatched work under one workflow-run lock."""
+        try:
+            async with self._sessions.begin() as session:
+                locked = (
+                    await session.execute(
+                        _workflow_run_evaluation_lock_statement(workflow_run_id)
+                    )
+                ).one_or_none()
+                if locked is None:
+                    return CancellationSettlementResult(
+                        workflow_run_id, False, None, (), ()
+                    )
+                try:
+                    status = WorkflowRunStatus(locked.status)
+                except ValueError as error:
+                    raise WorkflowRunCancellationPersistenceInvariantViolation from error
+                rows = (
+                    await _settle_dispatched_task_rows(session, workflow_run_id)
+                    if status is WorkflowRunStatus.CANCELLING
+                    else ()
+                )
+        except WorkflowRunCancellationPersistenceInvariantViolation:
+            raise
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+
+        ordered = sorted(rows, key=lambda row: (row.step_identifier, row.id))
+        return CancellationSettlementResult(
             workflow_run_id,
             True,
             status,
@@ -1392,6 +1435,52 @@ def _unstarted_task_suppression_statement(workflow_run_id: UUID) -> Any:
         )
         .returning(task_runs.c.id, task_runs.c.step_identifier)
     )
+
+
+async def _settle_dispatched_task_rows(
+    session: AsyncSession,
+    workflow_run_id: UUID,
+) -> Sequence[Row[Any]]:
+    """Cancel dispatched tasks after the caller serializes on their run."""
+    active_claim_exists = exists(
+        select(task_attempt_claims.c.task_attempt_id)
+        .select_from(
+            task_attempts.join(
+                task_attempt_claims,
+                task_attempt_claims.c.task_attempt_id == task_attempts.c.id,
+            )
+        )
+        .where(
+            task_attempts.c.task_run_id == task_runs.c.id,
+            task_attempt_claims.c.terminated_at.is_(None),
+        )
+    )
+    corrupt = await session.scalar(
+        select(task_runs.c.id)
+        .where(
+            task_runs.c.workflow_run_id == workflow_run_id,
+            task_runs.c.status == TaskRunStatus.DISPATCHED.value,
+            active_claim_exists,
+        )
+        .limit(1)
+    )
+    if corrupt is not None:
+        raise WorkflowRunCancellationPersistenceInvariantViolation
+    return (
+        await session.execute(
+            update(task_runs)
+            .where(
+                task_runs.c.workflow_run_id == workflow_run_id,
+                task_runs.c.status == TaskRunStatus.DISPATCHED.value,
+                ~active_claim_exists,
+            )
+            .values(
+                status=TaskRunStatus.CANCELLED.value,
+                updated_at=func.statement_timestamp(),
+            )
+            .returning(task_runs.c.id, task_runs.c.step_identifier)
+        )
+    ).all()
 
 
 def _pending_to_running_statement(workflow_run_id: UUID) -> Any:

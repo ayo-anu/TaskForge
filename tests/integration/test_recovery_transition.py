@@ -150,6 +150,21 @@ async def recoverable_candidate(
         "SELECT workflow_run_id FROM task_runs WHERE id = $1", facts.task_run_id
     )
     assert isinstance(workflow_run_id, UUID)
+    if run_status == "cancelling":
+        requester = await connection.fetchval(
+            "SELECT requested_by_principal_id FROM workflow_runs WHERE id = $1",
+            workflow_run_id,
+        )
+        await connection.execute(
+            "INSERT INTO workflow_run_cancellation_requests "
+            "(workflow_run_id, requested_by_principal_id, reason, "
+            "idempotency_key_digest, request_fingerprint) VALUES "
+            "($1, $2, 'recovery test cancellation', $3, $4)",
+            workflow_run_id,
+            requester,
+            "a" * 64,
+            "b" * 64,
+        )
     return ExpiredClaimCandidate(
         facts.attempt_id,
         facts.task_run_id,
@@ -405,8 +420,66 @@ async def exercise_recovery(database_url: URL) -> None:
         cancelling = await recoverable_candidate(connection, run_status="cancelling")
         assert (
             await service.recover_expired_claim(cancelling)
-        ).outcome is ExpiredClaimRecoveryOutcome.WORKFLOW_NOT_ELIGIBLE
-        assert (await shape(connection, cancelling))[:3] == ("running", None, None)
+        ).outcome is ExpiredClaimRecoveryOutcome.CANCELLED
+        cancelling_shape = await shape(connection, cancelling)
+        assert cancelling_shape[:3] == ("cancelled", cancelling_shape[1], None)
+        assert cancelling_shape[1] is not None
+        assert (
+            await connection.fetchval(
+                "SELECT count(*) FROM task_result_events WHERE task_attempt_id = $1 "
+                "AND event_type = 'result_recovered' AND result_kind = 'cancellation'",
+                cancelling.task_attempt_id,
+            )
+            == 1
+        )
+        assert (
+            await service.recover_expired_claim(cancelling)
+        ).outcome is ExpiredClaimRecoveryOutcome.ALREADY_RECOVERED
+
+        (
+            recovered_cancel,
+            recovered_worker,
+            recovered_dispatch,
+            recovered_claim,
+        ) = await production_result_race_candidate(connection, claim_service)
+        requester = await connection.fetchval(
+            "SELECT requested_by_principal_id FROM workflow_runs WHERE id = $1",
+            recovered_cancel.workflow_run_id,
+        )
+        await connection.execute(
+            "INSERT INTO workflow_run_cancellation_requests "
+            "(workflow_run_id, requested_by_principal_id, idempotency_key_digest, "
+            "request_fingerprint) VALUES ($1, $2, $3, $4)",
+            recovered_cancel.workflow_run_id,
+            requester,
+            "c" * 64,
+            "d" * 64,
+        )
+        await connection.execute(
+            "UPDATE workflow_runs SET status = 'cancelling' WHERE id = $1",
+            recovered_cancel.workflow_run_id,
+        )
+        assert (
+            await service.recover_expired_claim(recovered_cancel)
+        ).outcome is ExpiredClaimRecoveryOutcome.CANCELLED
+        recovered_authority = recovered_claim.result_authority
+        assert isinstance(recovered_authority, TaskClaimResultAuthority)
+        # The semantic cancellation fingerprint matches, but recovered provenance
+        # has already ended this authority generation, so a worker submission is
+        # stale rather than an identical replay.
+        with pytest.raises(TaskResultStale):
+            await result_service.submit_result(
+                recovered_worker.authenticated,
+                recovered_worker.session_id,
+                TaskResultSubmissionRequest(
+                    recovered_dispatch.dispatch_id,
+                    recovered_dispatch.task_run_id,
+                    recovered_dispatch.task_attempt_id,
+                    recovered_claim.claim.generation,
+                    recovered_authority,
+                    TaskExecutionResult.cancellation(),
+                ),
+            )
 
         result_first = await recoverable_candidate(connection)
         dispatch_id = await connection.fetchval(

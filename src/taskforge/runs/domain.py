@@ -391,6 +391,41 @@ class CancellationPropagationResult:
 
 
 @dataclass(frozen=True)
+class CancellationSettlementResult:
+    """The immutable outcome of one dispatched-task settlement pass."""
+
+    workflow_run_id: UUID
+    found: bool
+    workflow_status: WorkflowRunStatus | None
+    settled_task_ids: tuple[UUID, ...]
+    settled_step_identifiers: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.found is (self.workflow_status is None):
+            raise ValueError("cancellation settlement presence and status disagree")
+        if len(self.settled_task_ids) != len(self.settled_step_identifiers):
+            raise ValueError("settled task identities must remain paired")
+        if len(set(self.settled_task_ids)) != len(self.settled_task_ids):
+            raise ValueError("settled task identifiers must be unique")
+        if len(set(self.settled_step_identifiers)) != len(
+            self.settled_step_identifiers
+        ):
+            raise ValueError("settled step identifiers must be unique")
+        if self.workflow_status is not WorkflowRunStatus.CANCELLING and (
+            self.settled_task_ids or self.settled_step_identifiers
+        ):
+            raise ValueError("only a cancelling workflow may settle dispatched tasks")
+
+    @property
+    def settled_count(self) -> int:
+        return len(self.settled_task_ids)
+
+    @property
+    def made_progress(self) -> bool:
+        return self.settled_count > 0
+
+
+@dataclass(frozen=True)
 class WorkflowRunEvaluationResult:
     """The immutable outcome of one workflow-run state evaluation."""
 

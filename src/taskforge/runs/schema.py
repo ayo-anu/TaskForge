@@ -513,7 +513,8 @@ task_result_events = Table(
     ),
     CheckConstraint(
         "(event_type = 'result_recovered' AND "
-        "result_kind = 'retryable_failure' AND failure_kind = 'claim_expired') OR "
+        "((result_kind = 'retryable_failure' AND failure_kind = 'claim_expired') OR "
+        "(result_kind = 'cancellation' AND failure_kind IS NULL))) OR "
         "(event_type IN ('result_accepted', 'result_replayed', "
         "'result_conflict_rejected', 'result_stale_rejected') AND "
         "((result_kind = 'success' AND failure_kind IS NULL) OR "

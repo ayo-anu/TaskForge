@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     worker_stale_after_seconds: int = Field(default=30, ge=1, le=3600)
     worker_offline_after_seconds: int = Field(default=120, ge=2, le=86400)
     task_claim_lease_seconds: int = Field(default=60, ge=1)
+    task_cancellation_poll_seconds: float = Field(default=1.0, gt=0, le=60)
     task_claim_result_authority_secret: SecretStr = Field(
         default=SecretStr(DEVELOPMENT_CLAIM_RESULT_AUTHORITY_SECRET), min_length=32
     )

@@ -43,6 +43,31 @@ class PreparedExpiredClaimRecovery:
         )
 
 
+@dataclass(frozen=True)
+class PreparedCancellationSettlement:
+    """An expired authoritative claim that must settle as cancellation."""
+
+    task_attempt_id: UUID
+    task_run_id: UUID
+    workflow_run_id: UUID
+    attempt_number: int
+    generation: int
+    worker_session_id: UUID
+    dispatch_id: UUID
+    lease_expires_at: datetime
+    recovered_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.attempt_number <= 0 or self.generation <= 0:
+            raise ValueError("prepared settlement numbers must be positive")
+        lease_expires_at = _utc(self.lease_expires_at, field="prepared lease expiry")
+        recovered_at = _utc(self.recovered_at, field="settlement time")
+        if lease_expires_at > recovered_at:
+            raise ValueError("prepared claim must be expired")
+        object.__setattr__(self, "lease_expires_at", lease_expires_at)
+        object.__setattr__(self, "recovered_at", recovered_at)
+
+
 def _utc(value: datetime, *, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field} must be timezone-aware")

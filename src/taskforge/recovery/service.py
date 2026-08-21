@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
+    PreparedCancellationSettlement,
     PreparedExpiredClaimRecovery,
     StaleWorkerSessionCandidate,
 )
@@ -35,6 +36,7 @@ from taskforge.retries.persistence_ports import NewScheduledRetryAttempt
 
 
 class ExpiredClaimRecoveryOutcome(StrEnum):
+    CANCELLED = "cancelled"
     RETRY_SCHEDULED = "retry_scheduled"
     FAILED_NO_POLICY = "failed_no_policy"
     FAILED_EXHAUSTED = "failed_exhausted"
@@ -81,6 +83,14 @@ class ExpiredClaimRecoveryService:
                         ExpiredClaimRecoveryOutcome(preparation.reason.value),
                         candidate.task_attempt_id,
                         candidate.task_run_id,
+                    )
+                if isinstance(preparation, PreparedCancellationSettlement):
+                    await transaction.settle_cancellation(preparation)
+                    return ExpiredClaimRecoveryReceipt(
+                        ExpiredClaimRecoveryOutcome.CANCELLED,
+                        preparation.task_attempt_id,
+                        preparation.task_run_id,
+                        preparation.recovered_at,
                     )
                 return await self._apply_policy(transaction, preparation)
         except (

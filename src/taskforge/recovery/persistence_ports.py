@@ -12,6 +12,7 @@ from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
     ExpiredClaimCandidatePage,
     ExpiredClaimScanCursor,
+    PreparedCancellationSettlement,
     PreparedExpiredClaimRecovery,
     StaleWorkerSessionCandidate,
     StaleWorkerSessionCandidatePage,
@@ -67,7 +68,9 @@ class ExpiredClaimRecoveryNoOp:
 
 
 ExpiredClaimRecoveryPreparation = (
-    PreparedExpiredClaimRecovery | ExpiredClaimRecoveryNoOp
+    PreparedExpiredClaimRecovery
+    | PreparedCancellationSettlement
+    | ExpiredClaimRecoveryNoOp
 )
 
 
@@ -86,6 +89,11 @@ class ExpiredClaimRecoveryTransaction(Protocol):
         self,
         prepared: PreparedExpiredClaimRecovery,
         reason: RetryNotScheduledReason,
+    ) -> None: ...
+
+    async def settle_cancellation(
+        self,
+        prepared: PreparedCancellationSettlement,
     ) -> None: ...
 
 
