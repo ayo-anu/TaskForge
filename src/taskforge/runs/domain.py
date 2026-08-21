@@ -56,6 +56,10 @@ class WorkflowRunIdempotencyConflict(Exception):
     """A scoped idempotency key was reused for a different request."""
 
 
+class InvalidWorkflowRunExecutionEvent(ValueError):
+    """An execution event cannot be persisted safely."""
+
+
 class InvalidWorkflowRunCancellationIdempotencyKey(ValueError):
     """A cancellation idempotency key is not a bounded opaque token."""
 
@@ -233,6 +237,68 @@ class NewWorkflowRun:
     id: UUID
     requested_by_principal_id: UUID
     status: WorkflowRunStatus = WorkflowRunStatus.PENDING
+
+
+@dataclass(frozen=True, repr=False)
+class NewWorkflowRunExecutionEvent:
+    id: UUID
+    workflow_run_id: UUID
+    task_run_id: UUID | None
+    event_type: str
+    payload: JSONMapping
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.event_type.strip()) <= 128:
+            raise InvalidWorkflowRunExecutionEvent(
+                "execution event type must be bounded nonblank text"
+            )
+        issues, validated = validate_parameters(self.payload)
+        if issues or validated is None:
+            raise InvalidWorkflowRunExecutionEvent(
+                "execution event payload must be a bounded JSON object"
+            )
+        object.__setattr__(self, "payload", deepcopy(validated))
+
+    def __repr__(self) -> str:
+        return (
+            "NewWorkflowRunExecutionEvent("
+            f"id={self.id!r}, workflow_run_id={self.workflow_run_id!r}, "
+            f"task_run_id={self.task_run_id!r}, event_type={self.event_type!r}, "
+            "payload=<redacted>)"
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class StoredWorkflowRunExecutionEvent:
+    id: UUID
+    workflow_run_id: UUID
+    cursor: int
+    task_run_id: UUID | None
+    event_type: str
+    payload: JSONMapping
+    occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        if isinstance(self.cursor, bool) or self.cursor <= 0:
+            raise ValueError("execution event cursor must be positive")
+        if not 1 <= len(self.event_type.strip()) <= 128:
+            raise ValueError("persisted execution event type is invalid")
+        if self.occurred_at.tzinfo is None:
+            raise ValueError("execution event timestamp must be timezone-aware")
+        issues, validated = validate_parameters(self.payload)
+        if issues or validated is None:
+            raise ValueError("persisted execution event payload is invalid")
+        object.__setattr__(self, "payload", deepcopy(validated))
+        object.__setattr__(self, "occurred_at", self.occurred_at.astimezone(UTC))
+
+    def __repr__(self) -> str:
+        return (
+            "StoredWorkflowRunExecutionEvent("
+            f"id={self.id!r}, workflow_run_id={self.workflow_run_id!r}, "
+            f"cursor={self.cursor!r}, task_run_id={self.task_run_id!r}, "
+            f"event_type={self.event_type!r}, payload=<redacted>, "
+            f"occurred_at={self.occurred_at!r})"
+        )
 
 
 @dataclass(frozen=True)

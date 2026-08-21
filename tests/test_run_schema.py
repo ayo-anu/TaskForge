@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     CheckConstraint,
+    DefaultClause,
     Enum,
     ForeignKeyConstraint,
     Index,
@@ -22,6 +23,7 @@ from taskforge.runs.schema import (
     task_retry_events,
     task_runs,
     workflow_run_cancellation_requests,
+    workflow_run_execution_events,
     workflow_run_idempotency,
     workflow_run_inputs,
     workflow_runs,
@@ -71,6 +73,7 @@ def test_shared_metadata_registers_run_dispatch_and_claim_foundation_tables() ->
         "task_retry_events",
         "task_dispatch_outbox",
         "workflow_run_idempotency",
+        "workflow_run_execution_events",
     } <= set(metadata.tables)
     assert not any(
         fragment in table_name
@@ -114,6 +117,10 @@ def test_workflow_run_binds_definition_version_and_requester() -> None:
     }
     assert workflow_runs.c.created_at.server_default is not None
     assert workflow_runs.c.updated_at.server_default is not None
+    cursor_default = workflow_runs.c.last_execution_event_cursor.server_default
+    assert isinstance(cursor_default, DefaultClause)
+    assert str(cursor_default.arg) == "0"
+    assert "last_execution_event_cursor >= 0" in check_texts(workflow_runs)
 
 
 def test_run_inputs_require_explicit_json_objects() -> None:
@@ -132,8 +139,10 @@ def test_run_inputs_require_explicit_json_objects() -> None:
 
 def test_task_run_identity_and_composite_relationships_are_constrained() -> None:
     assert tuple(task_runs.primary_key.columns.keys()) == ("id",)
-    assert unique_column_sets(task_runs) == {("workflow_run_id", "step_identifier")}
-    assert ("workflow_run_id", "id") not in unique_column_sets(task_runs)
+    assert unique_column_sets(task_runs) == {
+        ("workflow_run_id", "step_identifier"),
+        ("workflow_run_id", "id"),
+    }
     assert foreign_key_shapes(task_runs) == {
         (
             ("workflow_run_id", "workflow_version_id"),
@@ -148,6 +157,31 @@ def test_task_run_identity_and_composite_relationships_are_constrained() -> None
         ),
     }
     assert "length(btrim(step_identifier)) > 0" in check_texts(task_runs)
+
+
+def test_execution_events_are_run_ordered_and_task_ownership_constrained() -> None:
+    assert tuple(workflow_run_execution_events.primary_key.columns.keys()) == ("id",)
+    assert unique_column_sets(workflow_run_execution_events) == {
+        ("workflow_run_id", "cursor")
+    }
+    assert foreign_key_shapes(workflow_run_execution_events) == {
+        (("workflow_run_id",), ("workflow_runs.id",)),
+        (
+            ("workflow_run_id", "task_run_id"),
+            ("task_runs.workflow_run_id", "task_runs.id"),
+        ),
+    }
+    assert workflow_run_execution_events.c.cursor.server_default is None
+    assert workflow_run_execution_events.c.payload.server_default is not None
+    assert workflow_run_execution_events.c.occurred_at.server_default is not None
+    assert check_texts(workflow_run_execution_events) == {
+        "cursor > 0",
+        "length(btrim(event_type)) BETWEEN 1 AND 128",
+        "jsonb_typeof(payload) = 'object'",
+    }
+    for foreign_key in workflow_run_execution_events.foreign_key_constraints:
+        assert foreign_key.onupdate == "RESTRICT"
+        assert foreign_key.ondelete == "RESTRICT"
 
 
 def test_task_run_indexes_cover_only_the_required_new_composite_path() -> None:
@@ -263,6 +297,7 @@ def test_every_new_constraint_and_index_has_a_deterministic_name() -> None:
         task_retry_events,
         workflow_run_cancellation_requests,
         workflow_run_idempotency,
+        workflow_run_execution_events,
     ):
         assert all(constraint.name for constraint in table.constraints)
         assert all(index.name for index in table.indexes)

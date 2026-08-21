@@ -23,6 +23,7 @@ from taskforge.runs.domain import (
     NewTaskRun,
     NewWorkflowRun,
     RunnableTransitionResult,
+    StoredWorkflowRunExecutionEvent,
     WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
@@ -40,6 +41,14 @@ class WorkflowRunPersistenceUnavailable(Exception):
 
 class WorkflowRunInspectionInvariantViolation(Exception):
     """Durable workflow-run inspection facts are inconsistent."""
+
+
+class WorkflowRunExecutionEventPersistenceUnavailable(Exception):
+    """Workflow-run execution-event persistence is unavailable."""
+
+
+class WorkflowRunExecutionEventInvariantViolation(Exception):
+    """Durable workflow-run execution-event facts are inconsistent."""
 
 
 class WorkflowRunCancellationPersistenceInvariantViolation(Exception):
@@ -250,3 +259,12 @@ class RetryEventInspectionRepository(Protocol):
         limit: int,
         cursor: RetryEventCursor | None,
     ) -> InspectedRetryEventPage | None: ...
+
+
+class WorkflowRunExecutionEventRepository(Protocol):
+    async def list_after(
+        self,
+        workflow_run_id: UUID,
+        after_cursor: int,
+        limit: int,
+    ) -> tuple[StoredWorkflowRunExecutionEvent, ...]: ...

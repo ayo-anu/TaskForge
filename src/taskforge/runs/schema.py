@@ -73,6 +73,12 @@ workflow_runs = Table(
     ),
     Column("status", workflow_run_status, nullable=False),
     Column(
+        "last_execution_event_cursor",
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    ),
+    Column(
         "created_at",
         DateTime(timezone=True),
         nullable=False,
@@ -101,6 +107,10 @@ workflow_runs = Table(
         "requested_by_principal_id",
         "workflow_definition_id",
         name="uq_workflow_runs_id_requester_definition",
+    ),
+    CheckConstraint(
+        "last_execution_event_cursor >= 0",
+        name="last_execution_event_cursor_nonnegative",
     ),
 )
 
@@ -240,6 +250,11 @@ task_runs = Table(
         "step_identifier",
         name="uq_task_runs_workflow_run_id_step_identifier",
     ),
+    UniqueConstraint(
+        "workflow_run_id",
+        "id",
+        name="uq_task_runs_workflow_run_id_id",
+    ),
     CheckConstraint(
         "length(btrim(step_identifier)) > 0",
         name="step_identifier_not_blank",
@@ -255,6 +270,48 @@ Index(
     "ix_task_runs_workflow_version_id_step_identifier",
     task_runs.c.workflow_version_id,
     task_runs.c.step_identifier,
+)
+
+workflow_run_execution_events = Table(
+    "workflow_run_execution_events",
+    metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    Column("workflow_run_id", UUID(as_uuid=True), nullable=False),
+    Column("cursor", BigInteger, nullable=False),
+    Column("task_run_id", UUID(as_uuid=True), nullable=True),
+    Column("event_type", String(128), nullable=False),
+    Column("payload", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
+    Column(
+        "occurred_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("statement_timestamp()"),
+    ),
+    CheckConstraint("cursor > 0", name="cursor_positive"),
+    CheckConstraint(
+        "length(btrim(event_type)) BETWEEN 1 AND 128",
+        name="event_type_valid",
+    ),
+    CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_object"),
+    ForeignKeyConstraint(
+        ("workflow_run_id",),
+        ("workflow_runs.id",),
+        name="fk_workflow_run_execution_events_run",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ("workflow_run_id", "task_run_id"),
+        ("task_runs.workflow_run_id", "task_runs.id"),
+        name="fk_workflow_run_execution_events_task_ownership",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    UniqueConstraint(
+        "workflow_run_id",
+        "cursor",
+        name="uq_workflow_run_execution_events_run_cursor",
+    ),
 )
 
 task_attempts = Table(

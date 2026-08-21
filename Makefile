@@ -27,7 +27,7 @@ migrations-check:
 migration-test:
 	@test "$${TASKFORGE_RUN_MIGRATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_MIGRATION_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_MIGRATION_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_MIGRATION_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_identity_migrations.py tests/integration/test_workflow_definition_migrations.py tests/integration/test_workflow_run_migrations.py tests/integration/test_task_dispatch_migrations.py tests/integration/test_task_claim_migrations.py tests/integration/test_task_claim_event_migrations.py tests/integration/test_retry_persistence_migrations.py tests/integration/test_retry_event_migrations.py tests/integration/test_recovery_migrations.py tests/integration/test_recovery_event_migrations.py tests/integration/test_dead_letter_migrations.py tests/integration/test_workflow_cancellation_migrations.py
+	uv run pytest tests/integration/test_identity_migrations.py tests/integration/test_workflow_definition_migrations.py tests/integration/test_workflow_run_migrations.py tests/integration/test_task_dispatch_migrations.py tests/integration/test_task_claim_migrations.py tests/integration/test_task_claim_event_migrations.py tests/integration/test_retry_persistence_migrations.py tests/integration/test_retry_event_migrations.py tests/integration/test_recovery_migrations.py tests/integration/test_recovery_event_migrations.py tests/integration/test_dead_letter_migrations.py tests/integration/test_workflow_cancellation_migrations.py tests/integration/test_execution_event_migrations.py
 
 claim-test:
 	@test "$${TASKFORGE_RUN_CLAIM_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_CLAIM_INTEGRATION=1 is required" >&2; exit 2)
@@ -72,7 +72,7 @@ credential-bootstrap-test:
 workflow-persistence-test:
 	@test "$${TASKFORGE_RUN_WORKFLOW_PERSISTENCE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_WORKFLOW_PERSISTENCE_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_WORKFLOW_PERSISTENCE_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_workflow_persistence.py tests/integration/test_workflow_version_resolution.py tests/integration/test_workflow_run_creation.py tests/integration/test_workflow_run_idempotency.py tests/integration/test_workflow_run_cancellation.py tests/integration/test_task_dispatch_creation.py tests/integration/test_dispatch_publisher_persistence.py
+	uv run pytest tests/integration/test_workflow_persistence.py tests/integration/test_workflow_version_resolution.py tests/integration/test_workflow_run_creation.py tests/integration/test_workflow_run_idempotency.py tests/integration/test_workflow_run_cancellation.py tests/integration/test_task_dispatch_creation.py tests/integration/test_dispatch_publisher_persistence.py tests/integration/test_execution_event_persistence.py
 
 workflow-route-test:
 	@test "$${TASKFORGE_RUN_WORKFLOW_ROUTE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_WORKFLOW_ROUTE_INTEGRATION=1 is required" >&2; exit 2)
