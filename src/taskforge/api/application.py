@@ -18,6 +18,7 @@ from taskforge.api.claims import router as claims_router
 from taskforge.api.dead_letters import router as dead_letters_router
 from taskforge.api.dependencies import build_readiness_coordinator
 from taskforge.api.errors import install_error_handling
+from taskforge.api.execution_stream import router as execution_stream_router
 from taskforge.api.health import (
     LivenessResponse,
     ReadinessCoordinator,
@@ -72,6 +73,7 @@ def create_app(
     app.include_router(runs_router)
     app.include_router(workers_router)
     app.include_router(dead_letters_router)
+    app.include_router(execution_stream_router)
 
     @app.get(
         "/health",

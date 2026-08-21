@@ -172,11 +172,19 @@ async def authenticate_api_principal(
     runtime = _runtime(request)
     credential = _extract_credential(authorization)
     try:
-        return await runtime.api_authenticator.authenticate(credential)
+        return await authenticate_api_credential(runtime, credential)
     except AuthenticationFailure as error:
         raise _credential_rejected() from error
     except AuthenticationUnavailable as error:
         raise _authentication_unavailable() from error
+
+
+async def authenticate_api_credential(
+    runtime: AuthenticationRuntimeProtocol,
+    credential: PresentedCredential,
+) -> AuthenticatedAPIPrincipal:
+    """Authenticate one parsed API credential for any supported transport."""
+    return await runtime.api_authenticator.authenticate(credential)
 
 
 async def authenticate_worker(
