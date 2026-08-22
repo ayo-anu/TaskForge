@@ -42,6 +42,10 @@ TASK_RUN_STATUSES = (
     "skipped",
     "cancelled",
 )
+WORKFLOW_REPLAY_MODES = (
+    "full",
+    "failed_subgraph",
+)
 
 workflow_run_status = Enum(
     *WORKFLOW_RUN_STATUSES,
@@ -51,6 +55,11 @@ workflow_run_status = Enum(
 task_run_status = Enum(
     *TASK_RUN_STATUSES,
     name="task_run_status",
+    native_enum=True,
+)
+workflow_replay_mode = Enum(
+    *WORKFLOW_REPLAY_MODES,
+    name="workflow_replay_mode",
     native_enum=True,
 )
 
@@ -112,6 +121,54 @@ workflow_runs = Table(
         "last_execution_event_cursor >= 0",
         name="last_execution_event_cursor_nonnegative",
     ),
+)
+
+workflow_run_replays = Table(
+    "workflow_run_replays",
+    metadata,
+    Column(
+        "workflow_run_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "workflow_runs.id",
+            name="fk_workflow_run_replays_run",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        primary_key=True,
+    ),
+    Column(
+        "source_workflow_run_id",
+        UUID(as_uuid=True),
+        ForeignKey(
+            "workflow_runs.id",
+            name="fk_workflow_run_replays_source_run",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column("mode", workflow_replay_mode, nullable=False),
+    Column("requested_scope", JSONB, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("statement_timestamp()"),
+    ),
+    CheckConstraint(
+        "workflow_run_id <> source_workflow_run_id",
+        name="source_not_self",
+    ),
+    CheckConstraint(
+        "jsonb_typeof(requested_scope) = 'object'",
+        name="requested_scope_object",
+    ),
+)
+
+Index(
+    "ix_workflow_run_replays_source_workflow_run_id",
+    workflow_run_replays.c.source_workflow_run_id,
 )
 
 workflow_run_cancellation_requests = Table(

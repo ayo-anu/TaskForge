@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from taskforge.persistence.schema import metadata
 from taskforge.runs.schema import (
     TASK_RUN_STATUSES,
+    WORKFLOW_REPLAY_MODES,
     WORKFLOW_RUN_STATUSES,
     task_attempt_results,
     task_claim_events,
@@ -26,6 +27,7 @@ from taskforge.runs.schema import (
     workflow_run_execution_events,
     workflow_run_idempotency,
     workflow_run_inputs,
+    workflow_run_replays,
     workflow_runs,
 )
 
@@ -74,12 +76,9 @@ def test_shared_metadata_registers_run_dispatch_and_claim_foundation_tables() ->
         "task_dispatch_outbox",
         "workflow_run_idempotency",
         "workflow_run_execution_events",
+        "workflow_run_replays",
     } <= set(metadata.tables)
-    assert not any(
-        fragment in table_name
-        for table_name in metadata.tables
-        for fragment in ("replay", "audit")
-    )
+    assert not any("audit" in table_name for table_name in metadata.tables)
 
 
 def test_run_statuses_use_native_enums_without_database_defaults() -> None:
@@ -121,6 +120,53 @@ def test_workflow_run_binds_definition_version_and_requester() -> None:
     assert isinstance(cursor_default, DefaultClause)
     assert str(cursor_default.arg) == "0"
     assert "last_execution_event_cursor >= 0" in check_texts(workflow_runs)
+
+
+def test_workflow_replay_records_constrained_immediate_source_lineage() -> None:
+    assert tuple(workflow_run_replays.c.keys()) == (
+        "workflow_run_id",
+        "source_workflow_run_id",
+        "mode",
+        "requested_scope",
+        "created_at",
+    )
+    assert tuple(workflow_run_replays.primary_key.columns.keys()) == (
+        "workflow_run_id",
+    )
+    assert isinstance(workflow_run_replays.c.workflow_run_id.type, UUID)
+    assert isinstance(workflow_run_replays.c.source_workflow_run_id.type, UUID)
+    assert isinstance(workflow_run_replays.c.mode.type, Enum)
+    assert workflow_run_replays.c.mode.type.native_enum is True
+    assert workflow_run_replays.c.mode.type.name == "workflow_replay_mode"
+    assert tuple(workflow_run_replays.c.mode.type.enums) == WORKFLOW_REPLAY_MODES
+    assert isinstance(workflow_run_replays.c.requested_scope.type, JSONB)
+    assert all(column.nullable is False for column in workflow_run_replays.c)
+    assert workflow_run_replays.c.mode.server_default is None
+    assert workflow_run_replays.c.requested_scope.server_default is None
+    assert workflow_run_replays.c.created_at.server_default is not None
+    assert foreign_key_shapes(workflow_run_replays) == {
+        (("workflow_run_id",), ("workflow_runs.id",)),
+        (("source_workflow_run_id",), ("workflow_runs.id",)),
+    }
+    for foreign_key in workflow_run_replays.foreign_key_constraints:
+        assert foreign_key.onupdate == "RESTRICT"
+        assert foreign_key.ondelete == "RESTRICT"
+    assert check_texts(workflow_run_replays) == {
+        "workflow_run_id <> source_workflow_run_id",
+        "jsonb_typeof(requested_scope) = 'object'",
+    }
+    assert unique_column_sets(workflow_run_replays) == set()
+    assert "workflow_definition_id" not in workflow_run_replays.c
+    assert "workflow_version_id" not in workflow_run_replays.c
+    assert {
+        (index.name, tuple(column.name for column in index.columns))
+        for index in workflow_run_replays.indexes
+    } == {
+        (
+            "ix_workflow_run_replays_source_workflow_run_id",
+            ("source_workflow_run_id",),
+        )
+    }
 
 
 def test_run_inputs_require_explicit_json_objects() -> None:
