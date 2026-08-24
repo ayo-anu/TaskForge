@@ -23,6 +23,7 @@ from taskforge.runs.domain import (
     NewTaskRun,
     NewWorkflowRun,
     RunnableTransitionResult,
+    SourceTaskRunState,
     StoredWorkflowRunExecutionEvent,
     WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
@@ -124,6 +125,24 @@ class PreparedFullWorkflowReplay:
         )
 
 
+@dataclass(frozen=True, repr=False)
+class PreparedFailedSubgraphWorkflowReplay:
+    source_workflow_run_id: UUID
+    source_status: WorkflowRunStatus
+    creation: PreparedWorkflowRunCreation
+    input_snapshot: WorkflowRunInput
+    source_tasks: tuple[SourceTaskRunState, ...]
+
+    def __repr__(self) -> str:
+        return (
+            "PreparedFailedSubgraphWorkflowReplay("
+            f"source_workflow_run_id={self.source_workflow_run_id!r}, "
+            f"source_status={self.source_status!r}, creation={self.creation!r}, "
+            f"source_task_count={len(self.source_tasks)!r}, "
+            "input_snapshot=<redacted>)"
+        )
+
+
 @dataclass(frozen=True)
 class ExistingIdempotentWorkflowRun:
     request_fingerprint: str
@@ -148,6 +167,12 @@ class WorkflowRunTimestamps:
 
 
 class WorkflowRunCreationTransaction(Protocol):
+    async def prepare_failed_subgraph_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+    ) -> PreparedFailedSubgraphWorkflowReplay | None: ...
+
     async def prepare_full_replay(
         self,
         source_workflow_run_id: UUID,
@@ -185,6 +210,15 @@ class WorkflowRunCreationTransaction(Protocol):
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+    ) -> WorkflowRunTimestamps: ...
+
+    async def insert_failed_subgraph_replay(
+        self,
+        prepared: PreparedFailedSubgraphWorkflowReplay,
+        run: NewWorkflowRun,
+        input_snapshot: WorkflowRunInput,
+        task_run_values: tuple[NewTaskRun, ...],
+        requested_scope: dict[str, object],
     ) -> WorkflowRunTimestamps: ...
 
     async def commit(self) -> None: ...

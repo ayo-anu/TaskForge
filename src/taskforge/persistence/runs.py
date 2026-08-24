@@ -55,6 +55,7 @@ from taskforge.runs.domain import (
     NewWorkflowRun,
     RunFailureReason,
     RunnableTransitionResult,
+    SourceTaskRunState,
     TaskRunStatus,
     WorkflowRunCancellationCaveat,
     WorkflowRunCancellationCommand,
@@ -72,6 +73,7 @@ from taskforge.runs.persistence_ports import (
     IdempotentCreationPreparation,
     PersistedCancellationOutcome,
     PersistedWorkflowRunCancellation,
+    PreparedFailedSubgraphWorkflowReplay,
     PreparedFullWorkflowReplay,
     PreparedWorkflowRunCreation,
     WorkflowRunCancellationPersistenceInvariantViolation,
@@ -867,6 +869,63 @@ class SQLAlchemyWorkflowRunCreationTransaction:
             ),
         )
 
+    async def prepare_failed_subgraph_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+    ) -> PreparedFailedSubgraphWorkflowReplay | None:
+        """Lock one owner-visible source and load its exact terminal task facts."""
+        session = self._required_session()
+        try:
+            source = (
+                await session.execute(
+                    _full_replay_source_lock_statement(
+                        source_workflow_run_id, owner_filter
+                    )
+                )
+            ).one_or_none()
+            if source is None:
+                return None
+            snapshot = await load_exact_workflow_version_snapshot(
+                session,
+                source.workflow_definition_id,
+                source.workflow_version_id,
+            )
+            task_rows = (
+                await session.execute(
+                    select(task_runs.c.step_identifier, task_runs.c.status)
+                    .where(task_runs.c.workflow_run_id == source_workflow_run_id)
+                    .order_by(task_runs.c.step_identifier)
+                )
+            ).all()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        if snapshot is None:
+            raise WorkflowRunRecordConflict
+        try:
+            source_status = WorkflowRunStatus(source.status)
+            definition_status = WorkflowDefinitionStatus(source.definition_status)
+            source_tasks = tuple(
+                SourceTaskRunState(row.step_identifier, TaskRunStatus(row.status))
+                for row in task_rows
+            )
+        except (TypeError, ValueError) as error:
+            raise WorkflowRunRecordConflict from error
+        return PreparedFailedSubgraphWorkflowReplay(
+            source_workflow_run_id=source_workflow_run_id,
+            source_status=source_status,
+            creation=PreparedWorkflowRunCreation(
+                source.workflow_definition_id,
+                definition_status,
+                snapshot,
+            ),
+            input_snapshot=WorkflowRunInput(
+                deepcopy(source.payload),
+                deepcopy(source.input_references),
+            ),
+            source_tasks=source_tasks,
+        )
+
     async def prepare_idempotent_creation(
         self,
         workflow_id: UUID,
@@ -993,6 +1052,37 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                     source_workflow_run_id=prepared.source_workflow_run_id,
                     mode="full",
                     requested_scope={},
+                )
+            )
+        except IntegrityError as error:
+            raise WorkflowRunRecordConflict from error
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        return timestamps
+
+    async def insert_failed_subgraph_replay(
+        self,
+        prepared: PreparedFailedSubgraphWorkflowReplay,
+        run: NewWorkflowRun,
+        input_snapshot: WorkflowRunInput,
+        task_run_values: tuple[NewTaskRun, ...],
+        requested_scope: dict[str, object],
+    ) -> WorkflowRunTimestamps:
+        session = self._required_session()
+        try:
+            timestamps = await insert_complete_workflow_run(
+                session,
+                prepared.creation,
+                run,
+                input_snapshot,
+                task_run_values,
+            )
+            await session.execute(
+                insert(workflow_run_replays).values(
+                    workflow_run_id=run.id,
+                    source_workflow_run_id=prepared.source_workflow_run_id,
+                    mode="failed_subgraph",
+                    requested_scope=requested_scope,
                 )
             )
         except IntegrityError as error:

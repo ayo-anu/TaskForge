@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from enum import StrEnum
 from uuid import UUID
 
 from taskforge.worker.results import TaskExecutionFailureKind
+from taskforge.workflows.dag_validation import DAGEdge, validate_dag
 from taskforge.workflows.domain import (
     MAX_TASK_DEADLINE_SECONDS,
     MAX_TASK_EXECUTION_TIMEOUT_SECONDS,
@@ -83,10 +85,23 @@ class WorkflowRunStatus(StrEnum):
 
 class WorkflowReplayMode(StrEnum):
     FULL = "full"
+    FAILED_SUBGRAPH = "failed_subgraph"
 
 
 class WorkflowRunReplayNotEligible(Exception):
     """The source workflow run has not reached a replayable terminal state."""
+
+
+class InvalidFailedSubgraphReplayRequest(ValueError):
+    """The requested failed-root collection is malformed."""
+
+
+class FailedSubgraphReplaySelectionInvalid(Exception):
+    """The requested failed roots cannot form a safe partial replay."""
+
+
+class WorkflowRunReplaySourceInvalid(Exception):
+    """Persisted source run, task, or graph facts are inconsistent."""
 
 
 class WorkflowRunCancellationOutcome(StrEnum):
@@ -227,6 +242,23 @@ class InitialTaskRun:
     status: TaskRunStatus
     deadline_seconds: int | None = None
     execution_timeout_seconds: int | None = None
+
+
+@dataclass(frozen=True)
+class SourceTaskRunState:
+    step_identifier: str
+    status: TaskRunStatus
+
+
+@dataclass(frozen=True)
+class FailedSubgraphReplaySelection:
+    canonical_failed_step_identifiers: tuple[str, ...]
+    selected_step_identifiers: tuple[str, ...]
+    initial_tasks: tuple[InitialTaskRun, ...]
+
+    @property
+    def requested_scope(self) -> dict[str, object]:
+        return {"failed_step_identifiers": list(self.canonical_failed_step_identifiers)}
 
 
 @dataclass(frozen=True)
@@ -376,6 +408,21 @@ class CreatedFullWorkflowReplay:
     def __post_init__(self) -> None:
         if self.mode is not WorkflowReplayMode.FULL:
             raise ValueError("full workflow replay result must use full mode")
+        if self.source_workflow_run_id == self.run.id:
+            raise ValueError("workflow replay must create a distinct run")
+
+
+@dataclass(frozen=True)
+class CreatedFailedSubgraphWorkflowReplay:
+    source_workflow_run_id: UUID
+    mode: WorkflowReplayMode
+    canonical_failed_step_identifiers: tuple[str, ...]
+    selected_step_identifiers: tuple[str, ...]
+    run: CreatedWorkflowRun
+
+    def __post_init__(self) -> None:
+        if self.mode is not WorkflowReplayMode.FAILED_SUBGRAPH:
+            raise ValueError("failed-subgraph replay result must use failed mode")
         if self.source_workflow_run_id == self.run.id:
             raise ValueError("workflow replay must create a distinct run")
 
@@ -952,3 +999,157 @@ def materialize_initial_tasks(
         )
         for identifier in ordered_steps
     )
+
+
+_FAILED_REPLAY_STEP_IDENTIFIER = re.compile(r"\A[a-z][a-z0-9_-]{0,127}\Z")
+
+
+def materialize_failed_subgraph_replay_tasks(
+    snapshot: WorkflowRunVersionSnapshot,
+    source_status: WorkflowRunStatus,
+    source_tasks: tuple[SourceTaskRunState, ...],
+    requested_failed_step_identifiers: object,
+) -> FailedSubgraphReplaySelection:
+    """Select and materialize one dependency-safe failed-task replay graph.
+
+    Non-selected source successes become fresh zero-attempt ``succeeded`` rows.
+    They carry forward control-flow satisfaction; they do not represent execution
+    performed within the replay run. This is safe only while dependencies are
+    control-flow-only and dispatch does not consume historical upstream outputs.
+    """
+    requested = _validate_failed_replay_roots(requested_failed_step_identifiers)
+    if source_status in (
+        WorkflowRunStatus.PENDING,
+        WorkflowRunStatus.RUNNING,
+        WorkflowRunStatus.CANCELLING,
+    ):
+        raise WorkflowRunReplayNotEligible
+
+    graph = validate_dag(
+        snapshot.step_identifiers,
+        tuple(
+            DAGEdge(
+                dependency.predecessor_identifier,
+                dependency.successor_identifier,
+            )
+            for dependency in snapshot.dependencies
+        ),
+    )
+    if not graph.is_valid or graph.topological_order is None:
+        raise WorkflowRunReplaySourceInvalid
+    topological = graph.topological_order
+    source_by_step: dict[str, TaskRunStatus] = {}
+    for task in source_tasks:
+        if task.step_identifier in source_by_step:
+            raise WorkflowRunReplaySourceInvalid
+        source_by_step[task.step_identifier] = task.status
+    if set(source_by_step) != set(topological):
+        raise WorkflowRunReplaySourceInvalid
+    terminal = {
+        TaskRunStatus.SUCCEEDED,
+        TaskRunStatus.FAILED,
+        TaskRunStatus.SKIPPED,
+        TaskRunStatus.CANCELLED,
+    }
+    if any(status not in terminal for status in source_by_step.values()):
+        raise WorkflowRunReplaySourceInvalid
+    if source_status is WorkflowRunStatus.SUCCEEDED:
+        if any(
+            status is not TaskRunStatus.SUCCEEDED for status in source_by_step.values()
+        ):
+            raise WorkflowRunReplaySourceInvalid
+        raise WorkflowRunReplayNotEligible
+    if source_status is WorkflowRunStatus.FAILED and (
+        TaskRunStatus.FAILED not in source_by_step.values()
+        or any(status is TaskRunStatus.CANCELLED for status in source_by_step.values())
+    ):
+        raise WorkflowRunReplaySourceInvalid
+    if TaskRunStatus.FAILED not in source_by_step.values():
+        raise WorkflowRunReplayNotEligible
+
+    outgoing: dict[str, set[str]] = {step: set() for step in topological}
+    incoming: dict[str, set[str]] = {step: set() for step in topological}
+    for dependency in snapshot.dependencies:
+        predecessor = dependency.predecessor_identifier
+        successor = dependency.successor_identifier
+        outgoing[predecessor].add(successor)
+        incoming[successor].add(predecessor)
+        if (
+            source_by_step[successor]
+            in (
+                TaskRunStatus.SUCCEEDED,
+                TaskRunStatus.FAILED,
+            )
+            and source_by_step[predecessor] is not TaskRunStatus.SUCCEEDED
+        ):
+            raise WorkflowRunReplaySourceInvalid
+
+    for root in requested:
+        status = source_by_step.get(root)
+        if status is None or status is not TaskRunStatus.FAILED:
+            raise FailedSubgraphReplaySelectionInvalid
+
+    closures = {root: _descendants(root, outgoing) for root in requested}
+    canonical = tuple(sorted(requested))
+    selected_set = set(canonical)
+    for root in canonical:
+        selected_set.update(closures[root])
+    if any(
+        status is not TaskRunStatus.SUCCEEDED
+        for step, status in source_by_step.items()
+        if step not in selected_set
+    ):
+        raise FailedSubgraphReplaySelectionInvalid
+
+    step_by_identifier = {step.step_identifier: step for step in snapshot.steps}
+    initial_tasks = tuple(
+        InitialTaskRun(
+            step_identifier=identifier,
+            status=(
+                TaskRunStatus.SUCCEEDED
+                if identifier not in selected_set
+                else (
+                    TaskRunStatus.BLOCKED
+                    if incoming[identifier] & selected_set
+                    else TaskRunStatus.RUNNABLE
+                )
+            ),
+            deadline_seconds=step_by_identifier[identifier].deadline_seconds,
+            execution_timeout_seconds=(
+                step_by_identifier[identifier].execution_timeout_seconds
+            ),
+        )
+        for identifier in topological
+    )
+    return FailedSubgraphReplaySelection(
+        canonical,
+        tuple(identifier for identifier in topological if identifier in selected_set),
+        initial_tasks,
+    )
+
+
+def _validate_failed_replay_roots(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (tuple, list)) or not value:
+        raise InvalidFailedSubgraphReplayRequest
+    if any(
+        not isinstance(identifier, str)
+        or _FAILED_REPLAY_STEP_IDENTIFIER.fullmatch(identifier) is None
+        for identifier in value
+    ):
+        raise InvalidFailedSubgraphReplayRequest
+    requested = tuple(value)
+    if len(set(requested)) != len(requested):
+        raise InvalidFailedSubgraphReplayRequest
+    return requested
+
+
+def _descendants(root: str, outgoing: dict[str, set[str]]) -> set[str]:
+    descendants: set[str] = set()
+    pending = list(outgoing[root])
+    while pending:
+        successor = pending.pop()
+        if successor in descendants:
+            continue
+        descendants.add(successor)
+        pending.extend(outgoing[successor])
+    return descendants

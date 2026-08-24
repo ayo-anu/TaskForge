@@ -28,6 +28,7 @@ from taskforge.runs.domain import (
     NewTaskRun,
     NewWorkflowRun,
     RunnableTransitionResult,
+    SourceTaskRunState,
     TaskRunStatus,
     WorkflowReplayMode,
     WorkflowRunCancellationCommand,
@@ -49,6 +50,7 @@ from taskforge.runs.persistence_ports import (
     ExistingIdempotentWorkflowRun,
     IdempotentCreationPreparation,
     PersistedWorkflowRunCancellation,
+    PreparedFailedSubgraphWorkflowReplay,
     PreparedFullWorkflowReplay,
     PreparedWorkflowRunCreation,
     WorkflowRunCreationTransaction,
@@ -490,7 +492,12 @@ def test_unexpected_and_cancellation_failures_are_not_normalized(
 class FakeCreationTransaction:
     def __init__(
         self,
-        prepared: IdempotentCreationPreparation | PreparedFullWorkflowReplay | None,
+        prepared: (
+            IdempotentCreationPreparation
+            | PreparedFullWorkflowReplay
+            | PreparedFailedSubgraphWorkflowReplay
+            | None
+        ),
     ) -> None:
         self.prepared = prepared
         self.calls: list[tuple[object, ...]] = []
@@ -512,6 +519,16 @@ class FakeCreationTransaction:
                 NewWorkflowRun,
                 WorkflowRunInput,
                 tuple[NewTaskRun, ...],
+            ]
+            | None
+        ) = None
+        self.failed_replay_inserted: (
+            tuple[
+                PreparedFailedSubgraphWorkflowReplay,
+                NewWorkflowRun,
+                WorkflowRunInput,
+                tuple[NewTaskRun, ...],
+                dict[str, object],
             ]
             | None
         ) = None
@@ -551,6 +568,20 @@ class FakeCreationTransaction:
         return (
             self.prepared
             if isinstance(self.prepared, PreparedFullWorkflowReplay)
+            else None
+        )
+
+    async def prepare_failed_subgraph_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+    ) -> PreparedFailedSubgraphWorkflowReplay | None:
+        self._record(
+            "prepare_failed_subgraph_replay", source_workflow_run_id, owner_filter
+        )
+        return (
+            self.prepared
+            if isinstance(self.prepared, PreparedFailedSubgraphWorkflowReplay)
             else None
         )
 
@@ -607,6 +638,25 @@ class FakeCreationTransaction:
     ) -> WorkflowRunTimestamps:
         self._record("insert_full_replay")
         self.replay_inserted = prepared, run, input_snapshot, task_run_values
+        now = datetime.now(UTC)
+        return WorkflowRunTimestamps(now, now)
+
+    async def insert_failed_subgraph_replay(
+        self,
+        prepared: PreparedFailedSubgraphWorkflowReplay,
+        run: NewWorkflowRun,
+        input_snapshot: WorkflowRunInput,
+        task_run_values: tuple[NewTaskRun, ...],
+        requested_scope: dict[str, object],
+    ) -> WorkflowRunTimestamps:
+        self._record("insert_failed_subgraph_replay")
+        self.failed_replay_inserted = (
+            prepared,
+            run,
+            input_snapshot,
+            task_run_values,
+            requested_scope,
+        )
         now = datetime.now(UTC)
         return WorkflowRunTimestamps(now, now)
 
@@ -734,6 +784,67 @@ def prepared_full_replay(
             {"database_password": {"secret_ref": "vault://taskforge/database"}},
         ),
     )
+
+
+def prepared_failed_subgraph_replay(
+    status: WorkflowRunStatus = WorkflowRunStatus.FAILED,
+) -> PreparedFailedSubgraphWorkflowReplay:
+    creation = prepared_creation(WorkflowDefinitionStatus.ARCHIVED)
+    return PreparedFailedSubgraphWorkflowReplay(
+        source_workflow_run_id=uuid4(),
+        source_status=status,
+        creation=creation,
+        input_snapshot=WorkflowRunInput(
+            {"ordinary": {"value": 1}},
+            {"database_password": {"secret_ref": "vault://taskforge/database"}},
+        ),
+        source_tasks=(
+            SourceTaskRunState("root", TaskRunStatus.SUCCEEDED),
+            SourceTaskRunState("leaf", TaskRunStatus.FAILED),
+        ),
+    )
+
+
+def test_failed_subgraph_replay_creates_carried_forward_complete_graph() -> None:
+    prepared = prepared_failed_subgraph_replay()
+    transaction = FakeCreationTransaction(prepared)
+    requester_id = uuid4()
+
+    replay = asyncio.run(
+        WorkflowRunService(
+            CreationRepository(transaction)
+        ).create_failed_subgraph_replay(
+            prepared.source_workflow_run_id,
+            OwnerFilter.only(uuid4()),
+            requested_by_principal_id=requester_id,
+            failed_step_identifiers=("leaf",),
+        )
+    )
+
+    assert replay.mode is WorkflowReplayMode.FAILED_SUBGRAPH
+    assert replay.canonical_failed_step_identifiers == ("leaf",)
+    assert replay.selected_step_identifiers == ("leaf",)
+    assert transaction.failed_replay_inserted is not None
+    _, run, copied_input, tasks, scope = transaction.failed_replay_inserted
+    assert run.id == replay.run.id != prepared.source_workflow_run_id
+    assert copied_input == prepared.input_snapshot
+    assert copied_input is not prepared.input_snapshot
+    assert [(task.step_identifier, task.status) for task in tasks] == [
+        ("root", TaskRunStatus.SUCCEEDED),
+        ("leaf", TaskRunStatus.RUNNABLE),
+    ]
+    assert len({task.id for task in tasks}) == 2
+    assert scope == {"failed_step_identifiers": ["leaf"]}
+    assert [call[0] for call in transaction.calls] == [
+        "enter",
+        "prepare_failed_subgraph_replay",
+        "insert_failed_subgraph_replay",
+        "commit",
+        "exit",
+    ]
+    rendered = repr(prepared) + repr(replay)
+    assert "ordinary" not in rendered
+    assert "vault://taskforge/database" not in rendered
 
 
 @pytest.mark.parametrize(

@@ -11,8 +11,10 @@ from taskforge.runs.domain import (
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     ExplicitWorkflowVersion,
+    FailedSubgraphReplaySelectionInvalid,
     InspectedTaskRun,
     InspectedWorkflowRun,
+    InvalidFailedSubgraphReplayRequest,
     InvalidWorkflowRunIdempotencyKey,
     InvalidWorkflowRunInput,
     InvalidWorkflowVersionSelection,
@@ -20,10 +22,13 @@ from taskforge.runs.domain import (
     ResolvedWorkflowVersion,
     RunFailureReason,
     RunnableTransitionResult,
+    SourceTaskRunState,
     TaskRunStatus,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunReconciliationResult,
+    WorkflowRunReplayNotEligible,
+    WorkflowRunReplaySourceInvalid,
     WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
     WorkflowRunVersionDependency,
@@ -32,11 +37,205 @@ from taskforge.runs.domain import (
     WorkflowVersionSnapshotInvalid,
     create_workflow_run_idempotency,
     create_workflow_run_input,
+    materialize_failed_subgraph_replay_tasks,
     materialize_initial_tasks,
     require_run_available,
 )
 from taskforge.runs.schema import TASK_RUN_STATUSES, WORKFLOW_RUN_STATUSES
 from taskforge.workflows.domain import WorkflowDefinitionStatus
+
+
+def failed_replay_snapshot() -> WorkflowRunVersionSnapshot:
+    return WorkflowRunVersionSnapshot(
+        uuid4(),
+        uuid4(),
+        1,
+        tuple(
+            WorkflowRunVersionStep(identifier)
+            for identifier in ("root", "alpha", "beta", "shared", "leaf")
+        ),
+        (
+            WorkflowRunVersionDependency("root", "alpha"),
+            WorkflowRunVersionDependency("root", "beta"),
+            WorkflowRunVersionDependency("alpha", "shared"),
+            WorkflowRunVersionDependency("beta", "shared"),
+            WorkflowRunVersionDependency("shared", "leaf"),
+        ),
+    )
+
+
+def source_states(**statuses: TaskRunStatus) -> tuple[SourceTaskRunState, ...]:
+    defaults = {
+        "root": TaskRunStatus.SUCCEEDED,
+        "alpha": TaskRunStatus.FAILED,
+        "beta": TaskRunStatus.FAILED,
+        "shared": TaskRunStatus.SKIPPED,
+        "leaf": TaskRunStatus.SKIPPED,
+    }
+    defaults.update(statuses)
+    return tuple(
+        SourceTaskRunState(identifier, status)
+        for identifier, status in defaults.items()
+    )
+
+
+def test_failed_subgraph_selection_sorts_roots_and_deduplicates_overlap() -> None:
+    selection = materialize_failed_subgraph_replay_tasks(
+        failed_replay_snapshot(),
+        WorkflowRunStatus.FAILED,
+        source_states(),
+        ["beta", "alpha"],
+    )
+
+    assert selection.canonical_failed_step_identifiers == ("alpha", "beta")
+    assert selection.selected_step_identifiers == (
+        "alpha",
+        "beta",
+        "shared",
+        "leaf",
+    )
+    assert selection.requested_scope == {"failed_step_identifiers": ["alpha", "beta"]}
+    assert [
+        (task.step_identifier, task.status) for task in selection.initial_tasks
+    ] == [
+        ("root", TaskRunStatus.SUCCEEDED),
+        ("alpha", TaskRunStatus.RUNNABLE),
+        ("beta", TaskRunStatus.RUNNABLE),
+        ("shared", TaskRunStatus.BLOCKED),
+        ("leaf", TaskRunStatus.BLOCKED),
+    ]
+
+
+def test_failed_intermediate_replays_transitive_descendants_only() -> None:
+    snapshot = WorkflowRunVersionSnapshot(
+        uuid4(),
+        uuid4(),
+        1,
+        tuple(
+            WorkflowRunVersionStep(identifier)
+            for identifier in ("upstream", "failed", "child", "leaf", "independent")
+        ),
+        (
+            WorkflowRunVersionDependency("upstream", "failed"),
+            WorkflowRunVersionDependency("failed", "child"),
+            WorkflowRunVersionDependency("child", "leaf"),
+        ),
+    )
+    selection = materialize_failed_subgraph_replay_tasks(
+        snapshot,
+        WorkflowRunStatus.FAILED,
+        (
+            SourceTaskRunState("upstream", TaskRunStatus.SUCCEEDED),
+            SourceTaskRunState("failed", TaskRunStatus.FAILED),
+            SourceTaskRunState("child", TaskRunStatus.SKIPPED),
+            SourceTaskRunState("leaf", TaskRunStatus.SKIPPED),
+            SourceTaskRunState("independent", TaskRunStatus.SUCCEEDED),
+        ),
+        ("failed",),
+    )
+
+    assert selection.selected_step_identifiers == ("failed", "child", "leaf")
+    statuses = {task.step_identifier: task.status for task in selection.initial_tasks}
+    assert statuses == {
+        "independent": TaskRunStatus.SUCCEEDED,
+        "upstream": TaskRunStatus.SUCCEEDED,
+        "failed": TaskRunStatus.RUNNABLE,
+        "child": TaskRunStatus.BLOCKED,
+        "leaf": TaskRunStatus.BLOCKED,
+    }
+
+
+@pytest.mark.parametrize("roots", (None, (), [], ["alpha", "alpha"], ["Bad Step"]))
+def test_failed_subgraph_request_shape_is_strict(roots: object) -> None:
+    with pytest.raises(InvalidFailedSubgraphReplayRequest):
+        materialize_failed_subgraph_replay_tasks(
+            failed_replay_snapshot(),
+            WorkflowRunStatus.FAILED,
+            source_states(),
+            roots,
+        )
+
+
+@pytest.mark.parametrize("root", ("unknown", "root", "shared"))
+def test_failed_subgraph_rejects_unknown_or_nonfailed_roots(root: str) -> None:
+    with pytest.raises(FailedSubgraphReplaySelectionInvalid):
+        materialize_failed_subgraph_replay_tasks(
+            failed_replay_snapshot(),
+            WorkflowRunStatus.FAILED,
+            source_states(),
+            (root,),
+        )
+
+
+def test_failed_subgraph_rejects_non_successful_work_outside_closure() -> None:
+    with pytest.raises(FailedSubgraphReplaySelectionInvalid):
+        materialize_failed_subgraph_replay_tasks(
+            failed_replay_snapshot(),
+            WorkflowRunStatus.FAILED,
+            source_states(),
+            ("alpha",),
+        )
+
+
+def test_failed_subgraph_rejects_impossible_executed_descendant_history() -> None:
+    with pytest.raises(WorkflowRunReplaySourceInvalid):
+        materialize_failed_subgraph_replay_tasks(
+            failed_replay_snapshot(),
+            WorkflowRunStatus.FAILED,
+            source_states(shared=TaskRunStatus.FAILED),
+            ("alpha", "beta"),
+        )
+
+
+def test_failed_subgraph_accepts_succeeded_predecessor_then_failed_task() -> None:
+    snapshot = WorkflowRunVersionSnapshot(
+        uuid4(),
+        uuid4(),
+        1,
+        (WorkflowRunVersionStep("a"), WorkflowRunVersionStep("b")),
+        (WorkflowRunVersionDependency("a", "b"),),
+    )
+    selection = materialize_failed_subgraph_replay_tasks(
+        snapshot,
+        WorkflowRunStatus.FAILED,
+        (
+            SourceTaskRunState("a", TaskRunStatus.SUCCEEDED),
+            SourceTaskRunState("b", TaskRunStatus.FAILED),
+        ),
+        ("b",),
+    )
+    assert [
+        (task.step_identifier, task.status) for task in selection.initial_tasks
+    ] == [
+        ("a", TaskRunStatus.SUCCEEDED),
+        ("b", TaskRunStatus.RUNNABLE),
+    ]
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        WorkflowRunStatus.PENDING,
+        WorkflowRunStatus.RUNNING,
+        WorkflowRunStatus.CANCELLING,
+        WorkflowRunStatus.SUCCEEDED,
+    ),
+)
+def test_failed_subgraph_rejects_ineligible_source_states(
+    status: WorkflowRunStatus,
+) -> None:
+    tasks = (
+        tuple(
+            SourceTaskRunState(task.step_identifier, TaskRunStatus.SUCCEEDED)
+            for task in failed_replay_snapshot().steps
+        )
+        if status is WorkflowRunStatus.SUCCEEDED
+        else source_states()
+    )
+    with pytest.raises(WorkflowRunReplayNotEligible):
+        materialize_failed_subgraph_replay_tasks(
+            failed_replay_snapshot(), status, tasks, ("alpha",)
+        )
 
 
 @pytest.mark.parametrize("value", (True, False, 0, -1, "1", None))

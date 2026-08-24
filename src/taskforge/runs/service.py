@@ -12,9 +12,11 @@ from taskforge.runs.domain import (
     CancellationFinalizationResult,
     CancellationPropagationResult,
     CancellationSettlementResult,
+    CreatedFailedSubgraphWorkflowReplay,
     CreatedFullWorkflowReplay,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
+    InitialTaskRun,
     InspectedTaskRun,
     InspectedWorkflowRun,
     NewTaskRun,
@@ -31,12 +33,14 @@ from taskforge.runs.domain import (
     WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
     WorkflowRunReconciliationResult,
+    WorkflowRunReplaySourceInvalid,
     WorkflowRunStatus,
     WorkflowVersionSelection,
     create_workflow_run_cancellation_command,
     create_workflow_run_idempotency,
     create_workflow_run_input,
     idempotency_fingerprints_match,
+    materialize_failed_subgraph_replay_tasks,
     materialize_initial_tasks,
     require_full_replay_source_terminal,
     require_run_available,
@@ -44,6 +48,7 @@ from taskforge.runs.domain import (
 from taskforge.runs.persistence_ports import (
     ExistingIdempotentWorkflowRun,
     PersistedCancellationOutcome,
+    PreparedFailedSubgraphWorkflowReplay,
     PreparedFullWorkflowReplay,
     PreparedWorkflowRunCreation,
     RetryEventInspectionRepository,
@@ -130,6 +135,58 @@ class WorkflowRunService:
         return CreatedFullWorkflowReplay(
             source_workflow_run_id,
             WorkflowReplayMode.FULL,
+            created,
+        )
+
+    async def create_failed_subgraph_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+        *,
+        requested_by_principal_id: UUID,
+        failed_step_identifiers: object,
+    ) -> CreatedFailedSubgraphWorkflowReplay:
+        """Create one fresh dependency-safe replay of requested failed roots."""
+        try:
+            async with self._repository.creation_transaction() as transaction:
+                prepared = await transaction.prepare_failed_subgraph_replay(
+                    source_workflow_run_id, owner_filter
+                )
+                if prepared is None:
+                    raise WorkflowRunNotFound
+                snapshot = prepared.creation.snapshot
+                if snapshot is None:
+                    raise WorkflowRunReplayInvariantError
+                try:
+                    selection = materialize_failed_subgraph_replay_tasks(
+                        snapshot,
+                        prepared.source_status,
+                        prepared.source_tasks,
+                        failed_step_identifiers,
+                    )
+                except WorkflowRunReplaySourceInvalid as error:
+                    raise WorkflowRunReplayInvariantError from error
+                accepted_input = create_workflow_run_input(
+                    prepared.input_snapshot.payload,
+                    prepared.input_snapshot.input_references,
+                )
+                created = await _create_prepared_failed_subgraph_replay(
+                    transaction,
+                    prepared,
+                    accepted_input,
+                    requested_by_principal_id,
+                    selection.initial_tasks,
+                    selection.requested_scope,
+                )
+        except WorkflowRunRecordConflict as error:
+            raise WorkflowRunPersistenceConflict from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        return CreatedFailedSubgraphWorkflowReplay(
+            source_workflow_run_id,
+            WorkflowReplayMode.FAILED_SUBGRAPH,
+            selection.canonical_failed_step_identifiers,
+            selection.selected_step_identifiers,
             created,
         )
 
@@ -741,4 +798,50 @@ async def _create_prepared_full_replay(
         task_count=len(task_values),
         runnable_task_count=runnable_count,
         blocked_task_count=len(task_values) - runnable_count,
+    )
+
+
+async def _create_prepared_failed_subgraph_replay(
+    transaction: WorkflowRunCreationTransaction,
+    prepared: PreparedFailedSubgraphWorkflowReplay,
+    input_snapshot: WorkflowRunInput,
+    requested_by_principal_id: UUID,
+    initial_tasks: tuple[InitialTaskRun, ...],
+    requested_scope: dict[str, object],
+) -> CreatedWorkflowRun:
+    snapshot = prepared.creation.snapshot
+    if snapshot is None:
+        raise WorkflowRunReplayInvariantError
+    run = NewWorkflowRun(uuid4(), requested_by_principal_id)
+    task_values = tuple(
+        NewTaskRun(
+            uuid4(),
+            task.step_identifier,
+            task.status,
+            task.deadline_seconds,
+            task.execution_timeout_seconds,
+        )
+        for task in initial_tasks
+    )
+    timestamps = await transaction.insert_failed_subgraph_replay(
+        prepared,
+        run,
+        input_snapshot,
+        task_values,
+        requested_scope,
+    )
+    await transaction.commit()
+    runnable_count = sum(task.status is TaskRunStatus.RUNNABLE for task in task_values)
+    blocked_count = sum(task.status is TaskRunStatus.BLOCKED for task in task_values)
+    return CreatedWorkflowRun(
+        id=run.id,
+        workflow_definition_id=prepared.creation.workflow_definition_id,
+        workflow_version_id=snapshot.workflow_version_id,
+        version_number=snapshot.version_number,
+        requested_by_principal_id=requested_by_principal_id,
+        status=WorkflowRunStatus.PENDING,
+        created_at=timestamps.created_at,
+        task_count=len(task_values),
+        runnable_task_count=runnable_count,
+        blocked_task_count=blocked_count,
     )
