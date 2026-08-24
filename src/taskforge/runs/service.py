@@ -24,6 +24,8 @@ from taskforge.runs.domain import (
     ResolvedWorkflowVersion,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowReplayIdempotency,
+    WorkflowReplayIdempotencyConflict,
     WorkflowReplayMode,
     WorkflowRunCancellationIdempotencyConflict,
     WorkflowRunCancellationOutcome,
@@ -36,16 +38,22 @@ from taskforge.runs.domain import (
     WorkflowRunReplaySourceInvalid,
     WorkflowRunStatus,
     WorkflowVersionSelection,
+    canonicalize_failed_subgraph_replay_request,
+    create_workflow_replay_idempotency,
+    create_workflow_replay_idempotency_from_digest,
+    create_workflow_replay_key_digest,
     create_workflow_run_cancellation_command,
     create_workflow_run_idempotency,
     create_workflow_run_input,
     idempotency_fingerprints_match,
     materialize_failed_subgraph_replay_tasks,
     materialize_initial_tasks,
+    reconstruct_failed_subgraph_selection,
     require_full_replay_source_terminal,
     require_run_available,
 )
 from taskforge.runs.persistence_ports import (
+    ExistingIdempotentWorkflowReplay,
     ExistingIdempotentWorkflowRun,
     PersistedCancellationOutcome,
     PreparedFailedSubgraphWorkflowReplay,
@@ -58,6 +66,7 @@ from taskforge.runs.persistence_ports import (
     WorkflowRunInspectionInvariantViolation,
     WorkflowRunPersistenceUnavailable,
     WorkflowRunRecordConflict,
+    WorkflowRunReplayPersistenceInvariantViolation,
     WorkflowRunRepository,
 )
 
@@ -138,6 +147,68 @@ class WorkflowRunService:
             created,
         )
 
+    async def create_idempotent_full_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+        *,
+        requested_by_principal_id: UUID,
+        idempotency_key: object,
+    ) -> CreatedFullWorkflowReplay:
+        """Create or recover one requester/source-scoped full replay."""
+        prepared: PreparedFullWorkflowReplay | None = None
+        idempotency: WorkflowReplayIdempotency | None = None
+        try:
+            async with self._repository.creation_transaction() as transaction:
+                prepared = await transaction.prepare_replay_source(
+                    source_workflow_run_id, owner_filter
+                )
+                if prepared is None:
+                    raise WorkflowRunNotFound
+                idempotency = create_workflow_replay_idempotency(
+                    idempotency_key,
+                    source_workflow_run_id=source_workflow_run_id,
+                    requested_by_principal_id=requested_by_principal_id,
+                    mode=WorkflowReplayMode.FULL,
+                    requested_scope={},
+                )
+                existing = await transaction.find_idempotent_replay(
+                    requested_by_principal_id,
+                    prepared.creation.workflow_definition_id,
+                    idempotency.key_digest,
+                )
+                if existing is not None:
+                    return _replay_idempotent_full_replay(
+                        existing, idempotency, prepared
+                    )
+                require_full_replay_source_terminal(prepared.source_status)
+                accepted_input = create_workflow_run_input(
+                    prepared.input_snapshot.payload,
+                    prepared.input_snapshot.input_references,
+                )
+                created = await _create_prepared_full_replay(
+                    transaction,
+                    prepared,
+                    accepted_input,
+                    requested_by_principal_id,
+                    idempotency=idempotency,
+                )
+        except WorkflowRunIdempotencyRecordConflict:
+            assert prepared is not None
+            assert idempotency is not None
+            return await self._recover_idempotent_full_replay(
+                prepared, requested_by_principal_id, idempotency
+            )
+        except WorkflowRunReplayPersistenceInvariantViolation as error:
+            raise WorkflowRunReplayInvariantError from error
+        except WorkflowRunRecordConflict as error:
+            raise WorkflowRunPersistenceConflict from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        return CreatedFullWorkflowReplay(
+            source_workflow_run_id, WorkflowReplayMode.FULL, created
+        )
+
     async def create_failed_subgraph_replay(
         self,
         source_workflow_run_id: UUID,
@@ -189,6 +260,152 @@ class WorkflowRunService:
             selection.selected_step_identifiers,
             created,
         )
+
+    async def create_idempotent_failed_subgraph_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+        *,
+        requested_by_principal_id: UUID,
+        failed_step_identifiers: object,
+        idempotency_key: object,
+    ) -> CreatedFailedSubgraphWorkflowReplay:
+        """Create or recover one requester/source-scoped failed replay."""
+        prepared: PreparedFullWorkflowReplay | None = None
+        idempotency: WorkflowReplayIdempotency | None = None
+        canonical_roots: tuple[str, ...] | None = None
+        try:
+            async with self._repository.creation_transaction() as transaction:
+                prepared = await transaction.prepare_replay_source(
+                    source_workflow_run_id, owner_filter
+                )
+                if prepared is None:
+                    raise WorkflowRunNotFound
+                key_digest = create_workflow_replay_key_digest(
+                    idempotency_key, source_workflow_run_id
+                )
+                canonical_roots = canonicalize_failed_subgraph_replay_request(
+                    failed_step_identifiers
+                )
+                scope: dict[str, object] = {
+                    "failed_step_identifiers": list(canonical_roots)
+                }
+                idempotency = create_workflow_replay_idempotency_from_digest(
+                    key_digest,
+                    source_workflow_run_id=source_workflow_run_id,
+                    requested_by_principal_id=requested_by_principal_id,
+                    mode=WorkflowReplayMode.FAILED_SUBGRAPH,
+                    requested_scope=scope,
+                )
+                existing = await transaction.find_idempotent_replay(
+                    requested_by_principal_id,
+                    prepared.creation.workflow_definition_id,
+                    idempotency.key_digest,
+                )
+                if existing is not None:
+                    return _replay_idempotent_failed_subgraph_replay(
+                        existing, idempotency, prepared, canonical_roots
+                    )
+                source_tasks = await transaction.load_replay_source_tasks(
+                    source_workflow_run_id
+                )
+                failed_prepared = PreparedFailedSubgraphWorkflowReplay(
+                    source_workflow_run_id,
+                    prepared.source_status,
+                    prepared.creation,
+                    prepared.input_snapshot,
+                    source_tasks,
+                )
+                snapshot = prepared.creation.snapshot
+                if snapshot is None:
+                    raise WorkflowRunReplayInvariantError
+                try:
+                    selection = materialize_failed_subgraph_replay_tasks(
+                        snapshot,
+                        prepared.source_status,
+                        source_tasks,
+                        canonical_roots,
+                    )
+                except WorkflowRunReplaySourceInvalid as error:
+                    raise WorkflowRunReplayInvariantError from error
+                accepted_input = create_workflow_run_input(
+                    prepared.input_snapshot.payload,
+                    prepared.input_snapshot.input_references,
+                )
+                created = await _create_prepared_failed_subgraph_replay(
+                    transaction,
+                    failed_prepared,
+                    accepted_input,
+                    requested_by_principal_id,
+                    selection.initial_tasks,
+                    selection.requested_scope,
+                    idempotency=idempotency,
+                )
+        except WorkflowRunIdempotencyRecordConflict:
+            assert prepared is not None
+            assert idempotency is not None
+            assert canonical_roots is not None
+            return await self._recover_idempotent_failed_subgraph_replay(
+                prepared, requested_by_principal_id, idempotency, canonical_roots
+            )
+        except WorkflowRunReplayPersistenceInvariantViolation as error:
+            raise WorkflowRunReplayInvariantError from error
+        except WorkflowRunRecordConflict as error:
+            raise WorkflowRunPersistenceConflict from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        return CreatedFailedSubgraphWorkflowReplay(
+            source_workflow_run_id,
+            WorkflowReplayMode.FAILED_SUBGRAPH,
+            selection.canonical_failed_step_identifiers,
+            selection.selected_step_identifiers,
+            created,
+        )
+
+    async def _recover_idempotent_full_replay(
+        self,
+        prepared: PreparedFullWorkflowReplay,
+        principal_id: UUID,
+        idempotency: WorkflowReplayIdempotency,
+    ) -> CreatedFullWorkflowReplay:
+        existing = await self._find_idempotent_replay(
+            principal_id, prepared.creation.workflow_definition_id, idempotency
+        )
+        return _replay_idempotent_full_replay(existing, idempotency, prepared)
+
+    async def _recover_idempotent_failed_subgraph_replay(
+        self,
+        prepared: PreparedFullWorkflowReplay,
+        principal_id: UUID,
+        idempotency: WorkflowReplayIdempotency,
+        canonical_roots: tuple[str, ...],
+    ) -> CreatedFailedSubgraphWorkflowReplay:
+        existing = await self._find_idempotent_replay(
+            principal_id, prepared.creation.workflow_definition_id, idempotency
+        )
+        return _replay_idempotent_failed_subgraph_replay(
+            existing, idempotency, prepared, canonical_roots
+        )
+
+    async def _find_idempotent_replay(
+        self,
+        principal_id: UUID,
+        workflow_id: UUID,
+        idempotency: WorkflowReplayIdempotency,
+    ) -> ExistingIdempotentWorkflowReplay:
+        try:
+            existing = await self._repository.find_idempotent_replay(
+                principal_id, workflow_id, idempotency.key_digest
+            )
+        except WorkflowRunReplayPersistenceInvariantViolation as error:
+            raise WorkflowRunReplayInvariantError from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        if existing is None:
+            raise WorkflowRunPersistenceConflict(
+                "idempotency winner was not found after uniqueness conflict"
+            )
+        return existing
 
     async def cancel_run(
         self,
@@ -710,6 +927,71 @@ def _replay_idempotent_run(
     return existing.run
 
 
+def _verify_idempotent_replay(
+    existing: ExistingIdempotentWorkflowReplay,
+    idempotency: WorkflowReplayIdempotency,
+    prepared: PreparedFullWorkflowReplay,
+    expected_mode: WorkflowReplayMode,
+    expected_scope: dict[str, object],
+) -> None:
+    if not idempotency_fingerprints_match(
+        existing.request_fingerprint,
+        idempotency.request_fingerprint,
+    ):
+        raise WorkflowReplayIdempotencyConflict
+    if (
+        existing.source_workflow_run_id != prepared.source_workflow_run_id
+        or existing.mode is not expected_mode
+        or existing.requested_scope != expected_scope
+        or existing.run.workflow_definition_id
+        != prepared.creation.workflow_definition_id
+    ):
+        raise WorkflowRunReplayInvariantError
+
+
+def _replay_idempotent_full_replay(
+    existing: ExistingIdempotentWorkflowReplay,
+    idempotency: WorkflowReplayIdempotency,
+    prepared: PreparedFullWorkflowReplay,
+) -> CreatedFullWorkflowReplay:
+    _verify_idempotent_replay(
+        existing, idempotency, prepared, WorkflowReplayMode.FULL, {}
+    )
+    return CreatedFullWorkflowReplay(
+        prepared.source_workflow_run_id, WorkflowReplayMode.FULL, existing.run
+    )
+
+
+def _replay_idempotent_failed_subgraph_replay(
+    existing: ExistingIdempotentWorkflowReplay,
+    idempotency: WorkflowReplayIdempotency,
+    prepared: PreparedFullWorkflowReplay,
+    canonical_roots: tuple[str, ...],
+) -> CreatedFailedSubgraphWorkflowReplay:
+    scope: dict[str, object] = {"failed_step_identifiers": list(canonical_roots)}
+    _verify_idempotent_replay(
+        existing,
+        idempotency,
+        prepared,
+        WorkflowReplayMode.FAILED_SUBGRAPH,
+        scope,
+    )
+    snapshot = prepared.creation.snapshot
+    if snapshot is None:
+        raise WorkflowRunReplayInvariantError
+    try:
+        selected = reconstruct_failed_subgraph_selection(snapshot, canonical_roots)
+    except WorkflowRunReplaySourceInvalid as error:
+        raise WorkflowRunReplayInvariantError from error
+    return CreatedFailedSubgraphWorkflowReplay(
+        prepared.source_workflow_run_id,
+        WorkflowReplayMode.FAILED_SUBGRAPH,
+        canonical_roots,
+        selected,
+        existing.run,
+    )
+
+
 async def _create_prepared_run(
     transaction: WorkflowRunCreationTransaction,
     prepared: PreparedWorkflowRunCreation,
@@ -766,6 +1048,8 @@ async def _create_prepared_full_replay(
     prepared: PreparedFullWorkflowReplay,
     input_snapshot: WorkflowRunInput,
     requested_by_principal_id: UUID,
+    *,
+    idempotency: WorkflowReplayIdempotency | None = None,
 ) -> CreatedWorkflowRun:
     snapshot = prepared.creation.snapshot
     if snapshot is None:
@@ -783,7 +1067,7 @@ async def _create_prepared_full_replay(
         for task in initial_tasks
     )
     timestamps = await transaction.insert_full_replay(
-        prepared, run, input_snapshot, task_values
+        prepared, run, input_snapshot, task_values, idempotency
     )
     await transaction.commit()
     runnable_count = sum(task.status is TaskRunStatus.RUNNABLE for task in task_values)
@@ -808,6 +1092,8 @@ async def _create_prepared_failed_subgraph_replay(
     requested_by_principal_id: UUID,
     initial_tasks: tuple[InitialTaskRun, ...],
     requested_scope: dict[str, object],
+    *,
+    idempotency: WorkflowReplayIdempotency | None = None,
 ) -> CreatedWorkflowRun:
     snapshot = prepared.creation.snapshot
     if snapshot is None:
@@ -829,6 +1115,7 @@ async def _create_prepared_failed_subgraph_replay(
         input_snapshot,
         task_values,
         requested_scope,
+        idempotency,
     )
     await transaction.commit()
     runnable_count = sum(task.status is TaskRunStatus.RUNNABLE for task in task_values)

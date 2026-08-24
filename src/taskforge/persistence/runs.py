@@ -57,6 +57,8 @@ from taskforge.runs.domain import (
     RunnableTransitionResult,
     SourceTaskRunState,
     TaskRunStatus,
+    WorkflowReplayIdempotency,
+    WorkflowReplayMode,
     WorkflowRunCancellationCaveat,
     WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
@@ -67,8 +69,10 @@ from taskforge.runs.domain import (
     WorkflowRunVersionSnapshot,
     WorkflowRunVersionStep,
     WorkflowVersionSelection,
+    canonicalize_failed_subgraph_replay_request,
 )
 from taskforge.runs.persistence_ports import (
+    ExistingIdempotentWorkflowReplay,
     ExistingIdempotentWorkflowRun,
     IdempotentCreationPreparation,
     PersistedCancellationOutcome,
@@ -83,6 +87,7 @@ from taskforge.runs.persistence_ports import (
     WorkflowRunInspectionInvariantViolation,
     WorkflowRunPersistenceUnavailable,
     WorkflowRunRecordConflict,
+    WorkflowRunReplayPersistenceInvariantViolation,
     WorkflowRunTimestamps,
     WorkflowVersionResolutionRecord,
 )
@@ -482,6 +487,25 @@ class SQLAlchemyWorkflowRunRepository:
             raise WorkflowRunPersistenceUnavailable from error
         return _existing_idempotent_run(row) if row is not None else None
 
+    async def find_idempotent_replay(
+        self,
+        principal_id: UUID,
+        workflow_id: UUID,
+        key_digest: str,
+    ) -> ExistingIdempotentWorkflowReplay | None:
+        try:
+            async with self._sessions() as session, session.begin():
+                row = (
+                    await session.execute(
+                        _idempotent_replay_statement(
+                            principal_id, workflow_id, key_digest
+                        )
+                    )
+                ).one_or_none()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        return _existing_idempotent_replay(row) if row is not None else None
+
     async def get_run(
         self,
         run_id: UUID,
@@ -869,6 +893,53 @@ class SQLAlchemyWorkflowRunCreationTransaction:
             ),
         )
 
+    async def prepare_replay_source(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+    ) -> PreparedFullWorkflowReplay | None:
+        """Load the authorized immutable replay source without source task states."""
+        return await self.prepare_full_replay(source_workflow_run_id, owner_filter)
+
+    async def load_replay_source_tasks(
+        self,
+        source_workflow_run_id: UUID,
+    ) -> tuple[SourceTaskRunState, ...]:
+        session = self._required_session()
+        try:
+            rows = (
+                await session.execute(
+                    select(task_runs.c.step_identifier, task_runs.c.status)
+                    .where(task_runs.c.workflow_run_id == source_workflow_run_id)
+                    .order_by(task_runs.c.step_identifier)
+                )
+            ).all()
+            return tuple(
+                SourceTaskRunState(row.step_identifier, TaskRunStatus(row.status))
+                for row in rows
+            )
+        except (TypeError, ValueError) as error:
+            raise WorkflowRunRecordConflict from error
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+
+    async def find_idempotent_replay(
+        self,
+        principal_id: UUID,
+        workflow_id: UUID,
+        key_digest: str,
+    ) -> ExistingIdempotentWorkflowReplay | None:
+        session = self._required_session()
+        try:
+            row = (
+                await session.execute(
+                    _idempotent_replay_statement(principal_id, workflow_id, key_digest)
+                )
+            ).one_or_none()
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        return _existing_idempotent_replay(row) if row is not None else None
+
     async def prepare_failed_subgraph_replay(
         self,
         source_workflow_run_id: UUID,
@@ -1036,6 +1107,7 @@ class SQLAlchemyWorkflowRunCreationTransaction:
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         session = self._required_session()
         try:
@@ -1054,7 +1126,13 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                     requested_scope={},
                 )
             )
+            if idempotency is not None:
+                await _insert_run_idempotency(
+                    session, prepared.creation, run, idempotency
+                )
         except IntegrityError as error:
+            if _is_idempotency_scope_conflict(error):
+                raise WorkflowRunIdempotencyRecordConflict from error
             raise WorkflowRunRecordConflict from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
@@ -1067,6 +1145,7 @@ class SQLAlchemyWorkflowRunCreationTransaction:
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
         requested_scope: dict[str, object],
+        idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         session = self._required_session()
         try:
@@ -1085,7 +1164,13 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                     requested_scope=requested_scope,
                 )
             )
+            if idempotency is not None:
+                await _insert_run_idempotency(
+                    session, prepared.creation, run, idempotency
+                )
         except IntegrityError as error:
+            if _is_idempotency_scope_conflict(error):
+                raise WorkflowRunIdempotencyRecordConflict from error
             raise WorkflowRunRecordConflict from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
@@ -1227,6 +1312,23 @@ async def insert_complete_workflow_run(
     return WorkflowRunTimestamps(row.created_at, row.updated_at)
 
 
+async def _insert_run_idempotency(
+    session: AsyncSession,
+    prepared: PreparedWorkflowRunCreation,
+    run: NewWorkflowRun,
+    idempotency: WorkflowRunIdempotency | WorkflowReplayIdempotency,
+) -> None:
+    await session.execute(
+        insert(workflow_run_idempotency).values(
+            principal_id=run.requested_by_principal_id,
+            workflow_definition_id=prepared.workflow_definition_id,
+            idempotency_key_digest=idempotency.key_digest,
+            request_fingerprint=idempotency.request_fingerprint,
+            workflow_run_id=run.id,
+        )
+    )
+
+
 def _definition_lock_statement(
     workflow_id: UUID,
     owner_principal_id: UUID,
@@ -1333,6 +1435,22 @@ def _idempotent_run_statement(
             workflow_run_idempotency.c.workflow_definition_id == workflow_id,
             workflow_run_idempotency.c.idempotency_key_digest == key_digest,
         )
+    )
+
+
+def _idempotent_replay_statement(
+    principal_id: UUID,
+    workflow_id: UUID,
+    key_digest: str,
+) -> Select[Any]:
+    statement = _idempotent_run_statement(principal_id, workflow_id, key_digest)
+    return statement.add_columns(
+        workflow_run_replays.c.source_workflow_run_id,
+        workflow_run_replays.c.mode.label("replay_mode"),
+        workflow_run_replays.c.requested_scope,
+    ).outerjoin(
+        workflow_run_replays,
+        workflow_run_replays.c.workflow_run_id == workflow_runs.c.id,
     )
 
 
@@ -2322,6 +2440,38 @@ def _existing_idempotent_run(row: Row[Any]) -> ExistingIdempotentWorkflowRun:
             blocked_task_count=row.blocked_task_count,
         ),
     )
+
+
+def _existing_idempotent_replay(row: Row[Any]) -> ExistingIdempotentWorkflowReplay:
+    try:
+        mode = WorkflowReplayMode(row.replay_mode)
+        if not isinstance(row.requested_scope, dict):
+            raise ValueError("replay scope must be an object")
+        scope = deepcopy(row.requested_scope)
+        if mode is WorkflowReplayMode.FULL:
+            if scope != {}:
+                raise ValueError("full replay scope must be empty")
+        else:
+            if set(scope) != {"failed_step_identifiers"}:
+                raise ValueError("failed replay scope shape is invalid")
+            roots = canonicalize_failed_subgraph_replay_request(
+                scope["failed_step_identifiers"]
+            )
+            canonical_scope = {"failed_step_identifiers": list(roots)}
+            if scope != canonical_scope:
+                raise ValueError("failed replay scope is not canonical")
+        ordinary = _existing_idempotent_run(row)
+        if row.source_workflow_run_id is None:
+            raise ValueError("replay lineage is missing")
+        return ExistingIdempotentWorkflowReplay(
+            row.request_fingerprint,
+            row.source_workflow_run_id,
+            mode,
+            scope,
+            ordinary.run,
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise WorkflowRunReplayPersistenceInvariantViolation from error
 
 
 def _accepted_cancellation(row: Row[Any]) -> AcceptedWorkflowRunCancellation:

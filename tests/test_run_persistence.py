@@ -18,6 +18,8 @@ from taskforge.persistence.runs import (
     _active_run_progression_lock_statement,
     _definition_lock_statement,
     _dependency_failure_propagation_statement,
+    _existing_idempotent_replay,
+    _idempotent_replay_statement,
     _idempotent_run_statement,
     _inspected_task_run,
     _is_idempotency_scope_conflict,
@@ -41,6 +43,7 @@ from taskforge.runs.domain import (
     NewTaskRun,
     NewWorkflowRun,
     TaskRunStatus,
+    WorkflowReplayMode,
     WorkflowRunEvaluationResult,
     WorkflowRunInput,
     WorkflowRunStatus,
@@ -51,6 +54,7 @@ from taskforge.runs.persistence_ports import (
     PreparedWorkflowRunCreation,
     WorkflowRunInspectionInvariantViolation,
     WorkflowRunPersistenceUnavailable,
+    WorkflowRunReplayPersistenceInvariantViolation,
     WorkflowRunTimestamps,
 )
 from taskforge.workflows.domain import WorkflowDefinitionStatus
@@ -167,6 +171,53 @@ def test_idempotency_lookup_is_fully_scoped_and_loads_original_result() -> None:
     assert "workflow_run_idempotency.idempotency_key_digest =" in sql
     assert "workflow_runs" in sql
     assert "workflow_versions" in sql
+
+
+def test_replay_idempotency_lookup_includes_immutable_lineage() -> None:
+    sql = normalized_sql(
+        _idempotent_replay_statement(uuid4(), uuid4(), "sha256:v1:digest")
+    )
+
+    assert "workflow_run_idempotency.principal_id =" in sql
+    assert "workflow_run_idempotency.workflow_definition_id =" in sql
+    assert "workflow_run_idempotency.idempotency_key_digest =" in sql
+    assert "LEFT OUTER JOIN workflow_run_replays" in sql
+    assert "workflow_run_replays.source_workflow_run_id" in sql
+    assert "workflow_run_replays.requested_scope" in sql
+
+
+def test_replay_idempotency_conversion_rejects_missing_or_malformed_lineage() -> None:
+    base = dict(
+        request_fingerprint="sha256:v1:fingerprint",
+        run_id=uuid4(),
+        workflow_definition_id=uuid4(),
+        workflow_version_id=uuid4(),
+        requested_by_principal_id=uuid4(),
+        status="pending",
+        created_at=datetime.now(UTC),
+        version_number=1,
+        task_count=2,
+        runnable_task_count=1,
+        blocked_task_count=1,
+    )
+    with pytest.raises(WorkflowRunReplayPersistenceInvariantViolation):
+        _existing_idempotent_replay(
+            SimpleNamespace(
+                **base,
+                source_workflow_run_id=None,
+                replay_mode=None,
+                requested_scope=None,
+            )
+        )
+    with pytest.raises(WorkflowRunReplayPersistenceInvariantViolation):
+        _existing_idempotent_replay(
+            SimpleNamespace(
+                **base,
+                source_workflow_run_id=uuid4(),
+                replay_mode=WorkflowReplayMode.FAILED_SUBGRAPH.value,
+                requested_scope={"failed_step_identifiers": ["beta", "alpha"]},
+            )
+        )
 
 
 def test_run_and_task_inspection_sql_is_owner_scoped_read_only_and_ordered() -> None:

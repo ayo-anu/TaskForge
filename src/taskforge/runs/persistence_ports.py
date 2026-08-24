@@ -25,6 +25,8 @@ from taskforge.runs.domain import (
     RunnableTransitionResult,
     SourceTaskRunState,
     StoredWorkflowRunExecutionEvent,
+    WorkflowReplayIdempotency,
+    WorkflowReplayMode,
     WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
     WorkflowRunExecutionEventResumeState,
@@ -80,6 +82,10 @@ class WorkflowRunRecordConflict(Exception):
 
 class WorkflowRunIdempotencyRecordConflict(Exception):
     """The scoped idempotency row already exists."""
+
+
+class WorkflowRunReplayPersistenceInvariantViolation(Exception):
+    """Persisted replay idempotency and lineage facts disagree."""
 
 
 @dataclass(frozen=True)
@@ -149,6 +155,15 @@ class ExistingIdempotentWorkflowRun:
     run: CreatedWorkflowRun
 
 
+@dataclass(frozen=True)
+class ExistingIdempotentWorkflowReplay:
+    request_fingerprint: str
+    source_workflow_run_id: UUID
+    mode: WorkflowReplayMode
+    requested_scope: dict[str, object]
+    run: CreatedWorkflowRun
+
+
 IdempotentCreationPreparation = (
     PreparedWorkflowRunCreation | ExistingIdempotentWorkflowRun
 )
@@ -167,6 +182,24 @@ class WorkflowRunTimestamps:
 
 
 class WorkflowRunCreationTransaction(Protocol):
+    async def prepare_replay_source(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+    ) -> PreparedFullWorkflowReplay | None: ...
+
+    async def load_replay_source_tasks(
+        self,
+        source_workflow_run_id: UUID,
+    ) -> tuple[SourceTaskRunState, ...]: ...
+
+    async def find_idempotent_replay(
+        self,
+        principal_id: UUID,
+        workflow_id: UUID,
+        key_digest: str,
+    ) -> ExistingIdempotentWorkflowReplay | None: ...
+
     async def prepare_failed_subgraph_replay(
         self,
         source_workflow_run_id: UUID,
@@ -210,6 +243,7 @@ class WorkflowRunCreationTransaction(Protocol):
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps: ...
 
     async def insert_failed_subgraph_replay(
@@ -219,6 +253,7 @@ class WorkflowRunCreationTransaction(Protocol):
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
         requested_scope: dict[str, object],
+        idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps: ...
 
     async def commit(self) -> None: ...
@@ -251,6 +286,13 @@ class WorkflowRunRepository(Protocol):
         workflow_id: UUID,
         key_digest: str,
     ) -> ExistingIdempotentWorkflowRun | None: ...
+
+    async def find_idempotent_replay(
+        self,
+        principal_id: UUID,
+        workflow_id: UUID,
+        key_digest: str,
+    ) -> ExistingIdempotentWorkflowReplay | None: ...
 
     async def get_run(
         self,

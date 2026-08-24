@@ -58,6 +58,10 @@ class WorkflowRunIdempotencyConflict(Exception):
     """A scoped idempotency key was reused for a different request."""
 
 
+class WorkflowReplayIdempotencyConflict(Exception):
+    """A replay-scoped idempotency key was reused for different semantics."""
+
+
 class InvalidWorkflowRunExecutionEvent(ValueError):
     """An execution event cannot be persisted safely."""
 
@@ -756,6 +760,18 @@ class WorkflowRunIdempotency:
 
 
 @dataclass(frozen=True, repr=False)
+class WorkflowReplayIdempotency:
+    key_digest: str
+    request_fingerprint: str
+
+    def __repr__(self) -> str:
+        return (
+            "WorkflowReplayIdempotency(key_digest=<redacted>, "
+            "request_fingerprint=<redacted>)"
+        )
+
+
+@dataclass(frozen=True, repr=False)
 class WorkflowRunCancellationIdempotency:
     key_digest: str
     request_fingerprint: str
@@ -891,6 +907,91 @@ def create_workflow_run_idempotency(
     )
 
 
+def create_workflow_replay_idempotency(
+    key: object,
+    *,
+    source_workflow_run_id: UUID,
+    requested_by_principal_id: UUID,
+    mode: WorkflowReplayMode,
+    requested_scope: dict[str, object],
+) -> WorkflowReplayIdempotency:
+    """Fingerprint structural replay intent without persisted run input."""
+    key_digest = create_workflow_replay_key_digest(key, source_workflow_run_id)
+    return create_workflow_replay_idempotency_from_digest(
+        key_digest,
+        source_workflow_run_id=source_workflow_run_id,
+        requested_by_principal_id=requested_by_principal_id,
+        mode=mode,
+        requested_scope=requested_scope,
+    )
+
+
+def create_workflow_replay_key_digest(
+    key: object,
+    source_workflow_run_id: UUID,
+) -> str:
+    """Validate and hash one opaque source-scoped replay key."""
+    if (
+        not isinstance(key, str)
+        or not 16 <= len(key) <= 128
+        or any(not 0x21 <= ord(character) <= 0x7E for character in key)
+    ):
+        raise InvalidWorkflowRunIdempotencyKey("idempotency key is invalid")
+    return _versioned_sha256(
+        b"taskforge:workflow-replay-idempotency-key:v1\0"
+        + source_workflow_run_id.bytes
+        + b"\0"
+        + key.encode("ascii")
+    )
+
+
+def create_workflow_replay_idempotency_from_digest(
+    key_digest: str,
+    *,
+    source_workflow_run_id: UUID,
+    requested_by_principal_id: UUID,
+    mode: WorkflowReplayMode,
+    requested_scope: dict[str, object],
+) -> WorkflowReplayIdempotency:
+    """Fingerprint canonical replay intent for one validated scoped key."""
+    if mode is WorkflowReplayMode.FULL:
+        if requested_scope != {}:
+            raise ValueError("full replay scope must be empty")
+        canonical_scope: dict[str, object] = {}
+    elif mode is WorkflowReplayMode.FAILED_SUBGRAPH:
+        roots = canonicalize_failed_subgraph_replay_request(
+            requested_scope.get("failed_step_identifiers")
+            if set(requested_scope) == {"failed_step_identifiers"}
+            else None
+        )
+        canonical_scope = {"failed_step_identifiers": list(roots)}
+        if requested_scope != canonical_scope:
+            raise InvalidFailedSubgraphReplayRequest
+    else:
+        raise ValueError("unsupported replay mode")
+    normalized_request = {
+        "operation": "workflow_run_replay",
+        "requested_by_principal_id": str(requested_by_principal_id),
+        "schema_version": 1,
+        "source_workflow_run_id": str(source_workflow_run_id),
+        "mode": mode.value,
+        "requested_scope": canonical_scope,
+    }
+    encoded = json.dumps(
+        normalized_request,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return WorkflowReplayIdempotency(
+        key_digest=key_digest,
+        request_fingerprint=_versioned_sha256(
+            b"taskforge:workflow-replay-request-fingerprint:v1\0" + encoded
+        ),
+    )
+
+
 def create_workflow_run_cancellation_command(
     workflow_run_id: UUID,
     requested_by_principal_id: UUID,
@@ -1017,7 +1118,9 @@ def materialize_failed_subgraph_replay_tasks(
     performed within the replay run. This is safe only while dependencies are
     control-flow-only and dispatch does not consume historical upstream outputs.
     """
-    requested = _validate_failed_replay_roots(requested_failed_step_identifiers)
+    requested = canonicalize_failed_subgraph_replay_request(
+        requested_failed_step_identifiers
+    )
     if source_status in (
         WorkflowRunStatus.PENDING,
         WorkflowRunStatus.RUNNING,
@@ -1090,7 +1193,7 @@ def materialize_failed_subgraph_replay_tasks(
             raise FailedSubgraphReplaySelectionInvalid
 
     closures = {root: _descendants(root, outgoing) for root in requested}
-    canonical = tuple(sorted(requested))
+    canonical = requested
     selected_set = set(canonical)
     for root in canonical:
         selected_set.update(closures[root])
@@ -1128,7 +1231,8 @@ def materialize_failed_subgraph_replay_tasks(
     )
 
 
-def _validate_failed_replay_roots(value: object) -> tuple[str, ...]:
+def canonicalize_failed_subgraph_replay_request(value: object) -> tuple[str, ...]:
+    """Validate and sort request-level roots without inspecting source state."""
     if not isinstance(value, (tuple, list)) or not value:
         raise InvalidFailedSubgraphReplayRequest
     if any(
@@ -1140,7 +1244,37 @@ def _validate_failed_replay_roots(value: object) -> tuple[str, ...]:
     requested = tuple(value)
     if len(set(requested)) != len(requested):
         raise InvalidFailedSubgraphReplayRequest
-    return requested
+    return tuple(sorted(requested))
+
+
+def reconstruct_failed_subgraph_selection(
+    snapshot: WorkflowRunVersionSnapshot,
+    canonical_failed_step_identifiers: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Reconstruct an accepted replay closure from immutable lineage and DAG."""
+    graph = validate_dag(
+        snapshot.step_identifiers,
+        tuple(
+            DAGEdge(
+                dependency.predecessor_identifier,
+                dependency.successor_identifier,
+            )
+            for dependency in snapshot.dependencies
+        ),
+    )
+    if not graph.is_valid or graph.topological_order is None:
+        raise WorkflowRunReplaySourceInvalid
+    topological = graph.topological_order
+    step_set = set(topological)
+    if any(root not in step_set for root in canonical_failed_step_identifiers):
+        raise WorkflowRunReplaySourceInvalid
+    outgoing: dict[str, set[str]] = {step: set() for step in topological}
+    for dependency in snapshot.dependencies:
+        outgoing[dependency.predecessor_identifier].add(dependency.successor_identifier)
+    selected = set(canonical_failed_step_identifiers)
+    for root in canonical_failed_step_identifiers:
+        selected.update(_descendants(root, outgoing))
+    return tuple(step for step in topological if step in selected)
 
 
 def _descendants(root: str, outgoing: dict[str, set[str]]) -> set[str]:

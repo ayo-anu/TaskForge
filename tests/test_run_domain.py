@@ -24,6 +24,7 @@ from taskforge.runs.domain import (
     RunnableTransitionResult,
     SourceTaskRunState,
     TaskRunStatus,
+    WorkflowReplayMode,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunReconciliationResult,
@@ -35,6 +36,8 @@ from taskforge.runs.domain import (
     WorkflowRunVersionSnapshot,
     WorkflowRunVersionStep,
     WorkflowVersionSnapshotInvalid,
+    canonicalize_failed_subgraph_replay_request,
+    create_workflow_replay_idempotency,
     create_workflow_run_idempotency,
     create_workflow_run_input,
     materialize_failed_subgraph_replay_tasks,
@@ -765,3 +768,83 @@ def test_version_step_rejects_timeout_outside_policy_domain(timeout: object) -> 
             "step",
             execution_timeout_seconds=timeout,  # type: ignore[arg-type]
         )
+
+
+def test_replay_idempotency_is_source_scoped_namespaced_and_redacted() -> None:
+    source = UUID(int=10)
+    principal = UUID(int=11)
+    replay = create_workflow_replay_idempotency(
+        "abcdefghijklmnop",
+        source_workflow_run_id=source,
+        requested_by_principal_id=principal,
+        mode=WorkflowReplayMode.FULL,
+        requested_scope={},
+    )
+    repeated = create_workflow_replay_idempotency(
+        "abcdefghijklmnop",
+        source_workflow_run_id=source,
+        requested_by_principal_id=principal,
+        mode=WorkflowReplayMode.FULL,
+        requested_scope={},
+    )
+    other_source = create_workflow_replay_idempotency(
+        "abcdefghijklmnop",
+        source_workflow_run_id=UUID(int=12),
+        requested_by_principal_id=principal,
+        mode=WorkflowReplayMode.FULL,
+        requested_scope={},
+    )
+    ordinary = idempotency_for(workflow_id=UUID(int=12), principal_id=principal)
+
+    assert replay == repeated
+    assert replay.key_digest != other_source.key_digest
+    assert replay.key_digest != ordinary.key_digest
+    assert "abcdefghijklmnop" not in repr(replay)
+    assert replay.request_fingerprint not in repr(replay)
+
+
+def test_replay_fingerprint_uses_canonical_structural_intent_only() -> None:
+    source, principal = UUID(int=20), UUID(int=21)
+    first_roots = canonicalize_failed_subgraph_replay_request(["beta", "alpha"])
+    reordered_roots = canonicalize_failed_subgraph_replay_request(["alpha", "beta"])
+    first = create_workflow_replay_idempotency(
+        "abcdefghijklmnop",
+        source_workflow_run_id=source,
+        requested_by_principal_id=principal,
+        mode=WorkflowReplayMode.FAILED_SUBGRAPH,
+        requested_scope={"failed_step_identifiers": list(first_roots)},
+    )
+    reordered = create_workflow_replay_idempotency(
+        "abcdefghijklmnop",
+        source_workflow_run_id=source,
+        requested_by_principal_id=principal,
+        mode=WorkflowReplayMode.FAILED_SUBGRAPH,
+        requested_scope={"failed_step_identifiers": list(reordered_roots)},
+    )
+    full = create_workflow_replay_idempotency(
+        "abcdefghijklmnop",
+        source_workflow_run_id=source,
+        requested_by_principal_id=principal,
+        mode=WorkflowReplayMode.FULL,
+        requested_scope={},
+    )
+    different_scope = create_workflow_replay_idempotency(
+        "abcdefghijklmnop",
+        source_workflow_run_id=source,
+        requested_by_principal_id=principal,
+        mode=WorkflowReplayMode.FAILED_SUBGRAPH,
+        requested_scope={"failed_step_identifiers": ["alpha"]},
+    )
+
+    assert first.request_fingerprint == reordered.request_fingerprint
+    assert (
+        len(
+            {
+                first.request_fingerprint,
+                full.request_fingerprint,
+                different_scope.request_fingerprint,
+            }
+        )
+        == 3
+    )
+    assert "alpha" not in first.request_fingerprint
