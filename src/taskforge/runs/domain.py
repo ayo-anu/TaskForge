@@ -81,6 +81,14 @@ class WorkflowRunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class WorkflowReplayMode(StrEnum):
+    FULL = "full"
+
+
+class WorkflowRunReplayNotEligible(Exception):
+    """The source workflow run has not reached a replayable terminal state."""
+
+
 class WorkflowRunCancellationOutcome(StrEnum):
     NEWLY_ACCEPTED = "newly_accepted"
     EXACT_RETRY = "exact_retry"
@@ -121,9 +129,7 @@ class WorkflowRunCancellationCaveat(StrEnum):
     PHYSICAL_EXECUTION_MAY_CONTINUE_AFTER_AUTHORITY_LOSS = (
         "physical_execution_may_continue_after_authority_loss"
     )
-    COMPLETED_TASK_OUTCOMES_ARE_PRESERVED = (
-        "completed_task_outcomes_are_preserved"
-    )
+    COMPLETED_TASK_OUTCOMES_ARE_PRESERVED = "completed_task_outcomes_are_preserved"
 
 
 @dataclass(frozen=True)
@@ -328,8 +334,7 @@ class WorkflowRunExecutionEventResumeState:
             if type(exists) is not bool:
                 raise ValueError("requested cursor existence must be boolean")
             expected_exists = (
-                earliest is not None
-                and earliest <= requested <= self.latest_cursor
+                earliest is not None and earliest <= requested <= self.latest_cursor
             )
             if exists is not expected_exists:
                 raise ValueError(
@@ -360,6 +365,19 @@ class CreatedWorkflowRun:
         if self.created_at.tzinfo is None:
             raise ValueError("run creation timestamp must be timezone-aware")
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class CreatedFullWorkflowReplay:
+    source_workflow_run_id: UUID
+    mode: WorkflowReplayMode
+    run: CreatedWorkflowRun
+
+    def __post_init__(self) -> None:
+        if self.mode is not WorkflowReplayMode.FULL:
+            raise ValueError("full workflow replay result must use full mode")
+        if self.source_workflow_run_id == self.run.id:
+            raise ValueError("workflow replay must create a distinct run")
 
 
 @dataclass(frozen=True)
@@ -742,6 +760,16 @@ def require_run_available(status: WorkflowDefinitionStatus) -> None:
     """Reject every definition state except enabled."""
     if status is not WorkflowDefinitionStatus.ENABLED:
         raise WorkflowRunTargetUnavailable(status)
+
+
+def require_full_replay_source_terminal(status: WorkflowRunStatus) -> None:
+    """Accept every immutable terminal workflow-run outcome for full replay."""
+    if status not in (
+        WorkflowRunStatus.SUCCEEDED,
+        WorkflowRunStatus.FAILED,
+        WorkflowRunStatus.CANCELLED,
+    ):
+        raise WorkflowRunReplayNotEligible
 
 
 def create_workflow_run_input(

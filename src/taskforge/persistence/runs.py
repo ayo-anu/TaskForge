@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 from collections.abc import Sequence
+from copy import deepcopy
 from datetime import datetime, timedelta
 from types import TracebackType
 from typing import Any
@@ -71,6 +72,7 @@ from taskforge.runs.persistence_ports import (
     IdempotentCreationPreparation,
     PersistedCancellationOutcome,
     PersistedWorkflowRunCancellation,
+    PreparedFullWorkflowReplay,
     PreparedWorkflowRunCreation,
     WorkflowRunCancellationPersistenceInvariantViolation,
     WorkflowRunExecutionEventInvariantViolation,
@@ -92,6 +94,7 @@ from taskforge.runs.schema import (
     workflow_run_cancellation_requests,
     workflow_run_idempotency,
     workflow_run_inputs,
+    workflow_run_replays,
     workflow_runs,
 )
 from taskforge.worker.results import (
@@ -819,6 +822,51 @@ class SQLAlchemyWorkflowRunCreationTransaction:
         snapshot = _creation_snapshot(version, step_rows, dependency_rows)
         return PreparedWorkflowRunCreation(workflow_id, status, snapshot)
 
+    async def prepare_full_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+    ) -> PreparedFullWorkflowReplay | None:
+        """Lock and load one owner-visible source and its exact immutable facts."""
+        session = self._required_session()
+        try:
+            source = (
+                await session.execute(
+                    _full_replay_source_lock_statement(
+                        source_workflow_run_id, owner_filter
+                    )
+                )
+            ).one_or_none()
+            if source is None:
+                return None
+            snapshot = await load_exact_workflow_version_snapshot(
+                session,
+                source.workflow_definition_id,
+                source.workflow_version_id,
+            )
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        if snapshot is None:
+            raise WorkflowRunRecordConflict
+        try:
+            source_status = WorkflowRunStatus(source.status)
+            definition_status = WorkflowDefinitionStatus(source.definition_status)
+        except ValueError as error:
+            raise WorkflowRunRecordConflict from error
+        return PreparedFullWorkflowReplay(
+            source_workflow_run_id=source_workflow_run_id,
+            source_status=source_status,
+            creation=PreparedWorkflowRunCreation(
+                source.workflow_definition_id,
+                definition_status,
+                snapshot,
+            ),
+            input_snapshot=WorkflowRunInput(
+                deepcopy(source.payload),
+                deepcopy(source.input_references),
+            ),
+        )
+
     async def prepare_idempotent_creation(
         self,
         workflow_id: UUID,
@@ -918,6 +966,36 @@ class SQLAlchemyWorkflowRunCreationTransaction:
         except IntegrityError as error:
             if _is_idempotency_scope_conflict(error):
                 raise WorkflowRunIdempotencyRecordConflict from error
+            raise WorkflowRunRecordConflict from error
+        except DBAPIError as error:
+            raise WorkflowRunPersistenceUnavailable from error
+        return timestamps
+
+    async def insert_full_replay(
+        self,
+        prepared: PreparedFullWorkflowReplay,
+        run: NewWorkflowRun,
+        input_snapshot: WorkflowRunInput,
+        task_run_values: tuple[NewTaskRun, ...],
+    ) -> WorkflowRunTimestamps:
+        session = self._required_session()
+        try:
+            timestamps = await insert_complete_workflow_run(
+                session,
+                prepared.creation,
+                run,
+                input_snapshot,
+                task_run_values,
+            )
+            await session.execute(
+                insert(workflow_run_replays).values(
+                    workflow_run_id=run.id,
+                    source_workflow_run_id=prepared.source_workflow_run_id,
+                    mode="full",
+                    requested_scope={},
+                )
+            )
+        except IntegrityError as error:
             raise WorkflowRunRecordConflict from error
         except DBAPIError as error:
             raise WorkflowRunPersistenceUnavailable from error
@@ -1073,6 +1151,38 @@ def _definition_lock_statement(
             workflow_definitions.c.owner_principal_id == owner_principal_id,
         )
         .with_for_update()
+    )
+
+
+def _full_replay_source_lock_statement(
+    source_workflow_run_id: UUID,
+    owner_filter: OwnerFilter,
+) -> Select[Any]:
+    conditions: list[Any] = [workflow_runs.c.id == source_workflow_run_id]
+    if not owner_filter.unrestricted:
+        conditions.append(
+            workflow_definitions.c.owner_principal_id == owner_filter.principal_id
+        )
+    return (
+        select(
+            workflow_runs.c.workflow_definition_id,
+            workflow_runs.c.workflow_version_id,
+            workflow_runs.c.status,
+            workflow_definitions.c.status.label("definition_status"),
+            workflow_run_inputs.c.payload,
+            workflow_run_inputs.c.input_references,
+        )
+        .select_from(
+            workflow_runs.join(
+                workflow_definitions,
+                workflow_definitions.c.id == workflow_runs.c.workflow_definition_id,
+            ).join(
+                workflow_run_inputs,
+                workflow_run_inputs.c.workflow_run_id == workflow_runs.c.id,
+            )
+        )
+        .where(*conditions)
+        .with_for_update(of=workflow_runs)
     )
 
 

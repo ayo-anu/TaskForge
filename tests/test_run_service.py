@@ -29,12 +29,14 @@ from taskforge.runs.domain import (
     NewWorkflowRun,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowReplayMode,
     WorkflowRunCancellationCommand,
     WorkflowRunEvaluationResult,
     WorkflowRunIdempotency,
     WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
     WorkflowRunReconciliationResult,
+    WorkflowRunReplayNotEligible,
     WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
     WorkflowRunVersionDependency,
@@ -47,6 +49,7 @@ from taskforge.runs.persistence_ports import (
     ExistingIdempotentWorkflowRun,
     IdempotentCreationPreparation,
     PersistedWorkflowRunCancellation,
+    PreparedFullWorkflowReplay,
     PreparedWorkflowRunCreation,
     WorkflowRunCreationTransaction,
     WorkflowRunCreationTransactionContext,
@@ -146,6 +149,18 @@ class FakeRepository:
         return self.suppression_result or CancellationPropagationResult(
             workflow_run_id, True, WorkflowRunStatus.RUNNING, (), ()
         )
+
+    async def settle_dispatched_tasks(
+        self, workflow_run_id: UUID
+    ) -> CancellationSettlementResult:
+        del workflow_run_id
+        raise AssertionError("cancellation settlement was not expected")
+
+    async def finalize_workflow_run_cancellation(
+        self, workflow_run_id: UUID
+    ) -> CancellationFinalizationResult:
+        del workflow_run_id
+        raise AssertionError("cancellation finalization was not expected")
 
     async def propagate_dependency_failures(
         self, workflow_run_id: UUID
@@ -473,7 +488,10 @@ def test_unexpected_and_cancellation_failures_are_not_normalized(
 
 
 class FakeCreationTransaction:
-    def __init__(self, prepared: IdempotentCreationPreparation | None) -> None:
+    def __init__(
+        self,
+        prepared: IdempotentCreationPreparation | PreparedFullWorkflowReplay | None,
+    ) -> None:
         self.prepared = prepared
         self.calls: list[tuple[object, ...]] = []
         self.inserted: (
@@ -488,6 +506,15 @@ class FakeCreationTransaction:
         ) = None
         self.failure_for: str | None = None
         self.failure: BaseException | None = None
+        self.replay_inserted: (
+            tuple[
+                PreparedFullWorkflowReplay,
+                NewWorkflowRun,
+                WorkflowRunInput,
+                tuple[NewTaskRun, ...],
+            ]
+            | None
+        ) = None
 
     async def __aenter__(self) -> WorkflowRunCreationTransaction:
         self._record("enter")
@@ -515,6 +542,18 @@ class FakeCreationTransaction:
             else None
         )
 
+    async def prepare_full_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+    ) -> PreparedFullWorkflowReplay | None:
+        self._record("prepare_full_replay", source_workflow_run_id, owner_filter)
+        return (
+            self.prepared
+            if isinstance(self.prepared, PreparedFullWorkflowReplay)
+            else None
+        )
+
     async def prepare_idempotent_creation(
         self,
         workflow_id: UUID,
@@ -531,7 +570,14 @@ class FakeCreationTransaction:
             selection,
             key_digest,
         )
-        return self.prepared
+        return (
+            self.prepared
+            if isinstance(
+                self.prepared,
+                (PreparedWorkflowRunCreation, ExistingIdempotentWorkflowRun),
+            )
+            else None
+        )
 
     async def insert_complete_run(
         self,
@@ -549,6 +595,18 @@ class FakeCreationTransaction:
             task_run_values,
             idempotency,
         )
+        now = datetime.now(UTC)
+        return WorkflowRunTimestamps(now, now)
+
+    async def insert_full_replay(
+        self,
+        prepared: PreparedFullWorkflowReplay,
+        run: NewWorkflowRun,
+        input_snapshot: WorkflowRunInput,
+        task_run_values: tuple[NewTaskRun, ...],
+    ) -> WorkflowRunTimestamps:
+        self._record("insert_full_replay")
+        self.replay_inserted = prepared, run, input_snapshot, task_run_values
         now = datetime.now(UTC)
         return WorkflowRunTimestamps(now, now)
 
@@ -621,6 +679,18 @@ class CreationRepository:
         del workflow_run_id
         raise AssertionError("cancellation suppression was not expected")
 
+    async def settle_dispatched_tasks(
+        self, workflow_run_id: UUID
+    ) -> CancellationSettlementResult:
+        del workflow_run_id
+        raise AssertionError("cancellation settlement was not expected")
+
+    async def finalize_workflow_run_cancellation(
+        self, workflow_run_id: UUID
+    ) -> CancellationFinalizationResult:
+        del workflow_run_id
+        raise AssertionError("cancellation finalization was not expected")
+
     async def propagate_dependency_failures(
         self, workflow_run_id: UUID
     ) -> DependencyFailurePropagationResult:
@@ -650,6 +720,103 @@ def prepared_creation(
         else None
     )
     return PreparedWorkflowRunCreation(workflow_id, status, snapshot)
+
+
+def prepared_full_replay(
+    status: WorkflowRunStatus,
+) -> PreparedFullWorkflowReplay:
+    return PreparedFullWorkflowReplay(
+        source_workflow_run_id=uuid4(),
+        source_status=status,
+        creation=prepared_creation(WorkflowDefinitionStatus.ARCHIVED),
+        input_snapshot=WorkflowRunInput(
+            {"ordinary": {"value": 1}},
+            {"database_password": {"secret_ref": "vault://taskforge/database"}},
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "source_status",
+    (
+        WorkflowRunStatus.SUCCEEDED,
+        WorkflowRunStatus.FAILED,
+        WorkflowRunStatus.CANCELLED,
+    ),
+)
+def test_full_replay_creates_fresh_complete_exact_version_graph(
+    source_status: WorkflowRunStatus,
+) -> None:
+    prepared = prepared_full_replay(source_status)
+    transaction = FakeCreationTransaction(prepared)
+    service = WorkflowRunService(CreationRepository(transaction))
+    requester_id = uuid4()
+
+    replay = asyncio.run(
+        service.create_full_replay(
+            prepared.source_workflow_run_id,
+            OwnerFilter.only(uuid4()),
+            requested_by_principal_id=requester_id,
+        )
+    )
+
+    assert replay.source_workflow_run_id == prepared.source_workflow_run_id
+    assert replay.mode is WorkflowReplayMode.FULL
+    assert replay.run.id != prepared.source_workflow_run_id
+    snapshot = prepared.creation.snapshot
+    assert snapshot is not None
+    assert replay.run.workflow_version_id == snapshot.workflow_version_id
+    assert replay.run.requested_by_principal_id == requester_id
+    assert transaction.replay_inserted is not None
+    _, inserted_run, copied_input, tasks = transaction.replay_inserted
+    assert inserted_run.id == replay.run.id
+    assert copied_input == prepared.input_snapshot
+    assert copied_input is not prepared.input_snapshot
+    assert [(task.step_identifier, task.status) for task in tasks] == [
+        ("leaf", TaskRunStatus.BLOCKED),
+        ("root", TaskRunStatus.RUNNABLE),
+    ]
+    assert len({task.id for task in tasks}) == 2
+    assert [call[0] for call in transaction.calls] == [
+        "enter",
+        "prepare_full_replay",
+        "insert_full_replay",
+        "commit",
+        "exit",
+    ]
+    rendered = repr(prepared) + repr(replay)
+    assert "ordinary" not in rendered
+    assert "vault://taskforge/database" not in rendered
+
+
+@pytest.mark.parametrize(
+    "source_status",
+    (
+        WorkflowRunStatus.PENDING,
+        WorkflowRunStatus.RUNNING,
+        WorkflowRunStatus.CANCELLING,
+    ),
+)
+def test_full_replay_rejects_nonterminal_source_without_writes(
+    source_status: WorkflowRunStatus,
+) -> None:
+    prepared = prepared_full_replay(source_status)
+    transaction = FakeCreationTransaction(prepared)
+
+    with pytest.raises(WorkflowRunReplayNotEligible):
+        asyncio.run(
+            WorkflowRunService(CreationRepository(transaction)).create_full_replay(
+                prepared.source_workflow_run_id,
+                OwnerFilter.all_owners(),
+                requested_by_principal_id=uuid4(),
+            )
+        )
+
+    assert [call[0] for call in transaction.calls] == [
+        "enter",
+        "prepare_full_replay",
+        "exit",
+    ]
 
 
 def test_create_run_inserts_one_pending_complete_graph_then_commits() -> None:

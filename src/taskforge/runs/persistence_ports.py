@@ -108,6 +108,22 @@ class PreparedWorkflowRunCreation:
     snapshot: WorkflowRunVersionSnapshot | None
 
 
+@dataclass(frozen=True, repr=False)
+class PreparedFullWorkflowReplay:
+    source_workflow_run_id: UUID
+    source_status: WorkflowRunStatus
+    creation: PreparedWorkflowRunCreation
+    input_snapshot: WorkflowRunInput
+
+    def __repr__(self) -> str:
+        return (
+            "PreparedFullWorkflowReplay("
+            f"source_workflow_run_id={self.source_workflow_run_id!r}, "
+            f"source_status={self.source_status!r}, creation={self.creation!r}, "
+            "input_snapshot=<redacted>)"
+        )
+
+
 @dataclass(frozen=True)
 class ExistingIdempotentWorkflowRun:
     request_fingerprint: str
@@ -132,6 +148,12 @@ class WorkflowRunTimestamps:
 
 
 class WorkflowRunCreationTransaction(Protocol):
+    async def prepare_full_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+    ) -> PreparedFullWorkflowReplay | None: ...
+
     async def prepare_creation_target(
         self,
         workflow_id: UUID,
@@ -155,6 +177,14 @@ class WorkflowRunCreationTransaction(Protocol):
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
         idempotency: WorkflowRunIdempotency | None = None,
+    ) -> WorkflowRunTimestamps: ...
+
+    async def insert_full_replay(
+        self,
+        prepared: PreparedFullWorkflowReplay,
+        run: NewWorkflowRun,
+        input_snapshot: WorkflowRunInput,
+        task_run_values: tuple[NewTaskRun, ...],
     ) -> WorkflowRunTimestamps: ...
 
     async def commit(self) -> None: ...

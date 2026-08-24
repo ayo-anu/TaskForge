@@ -12,6 +12,7 @@ from taskforge.runs.domain import (
     CancellationFinalizationResult,
     CancellationPropagationResult,
     CancellationSettlementResult,
+    CreatedFullWorkflowReplay,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
     InspectedTaskRun,
@@ -21,6 +22,7 @@ from taskforge.runs.domain import (
     ResolvedWorkflowVersion,
     RunnableTransitionResult,
     TaskRunStatus,
+    WorkflowReplayMode,
     WorkflowRunCancellationIdempotencyConflict,
     WorkflowRunCancellationOutcome,
     WorkflowRunCancellationResult,
@@ -36,11 +38,13 @@ from taskforge.runs.domain import (
     create_workflow_run_input,
     idempotency_fingerprints_match,
     materialize_initial_tasks,
+    require_full_replay_source_terminal,
     require_run_available,
 )
 from taskforge.runs.persistence_ports import (
     ExistingIdempotentWorkflowRun,
     PersistedCancellationOutcome,
+    PreparedFullWorkflowReplay,
     PreparedWorkflowRunCreation,
     RetryEventInspectionRepository,
     WorkflowRunCancellationPersistenceInvariantViolation,
@@ -85,9 +89,49 @@ class WorkflowRunCancellationInvariantError(Exception):
     """Durable cancellation facts are internally inconsistent."""
 
 
+class WorkflowRunReplayInvariantError(Exception):
+    """Durable replay source facts are internally inconsistent."""
+
+
 class WorkflowRunService:
     def __init__(self, repository: WorkflowRunRepository) -> None:
         self._repository = repository
+
+    async def create_full_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: OwnerFilter,
+        *,
+        requested_by_principal_id: UUID,
+    ) -> CreatedFullWorkflowReplay:
+        """Atomically create a fresh complete run from one exact terminal source."""
+        try:
+            async with self._repository.creation_transaction() as transaction:
+                prepared = await transaction.prepare_full_replay(
+                    source_workflow_run_id, owner_filter
+                )
+                if prepared is None:
+                    raise WorkflowRunNotFound
+                require_full_replay_source_terminal(prepared.source_status)
+                accepted_input = create_workflow_run_input(
+                    prepared.input_snapshot.payload,
+                    prepared.input_snapshot.input_references,
+                )
+                created = await _create_prepared_full_replay(
+                    transaction,
+                    prepared,
+                    accepted_input,
+                    requested_by_principal_id,
+                )
+        except WorkflowRunRecordConflict as error:
+            raise WorkflowRunPersistenceConflict from error
+        except WorkflowRunPersistenceUnavailable as error:
+            raise WorkflowRunServiceUnavailable from error
+        return CreatedFullWorkflowReplay(
+            source_workflow_run_id,
+            WorkflowReplayMode.FULL,
+            created,
+        )
 
     async def cancel_run(
         self,
@@ -652,6 +696,46 @@ async def _create_prepared_run(
         workflow_version_id=prepared.snapshot.workflow_version_id,
         version_number=prepared.snapshot.version_number,
         requested_by_principal_id=run.requested_by_principal_id,
+        status=WorkflowRunStatus.PENDING,
+        created_at=timestamps.created_at,
+        task_count=len(task_values),
+        runnable_task_count=runnable_count,
+        blocked_task_count=len(task_values) - runnable_count,
+    )
+
+
+async def _create_prepared_full_replay(
+    transaction: WorkflowRunCreationTransaction,
+    prepared: PreparedFullWorkflowReplay,
+    input_snapshot: WorkflowRunInput,
+    requested_by_principal_id: UUID,
+) -> CreatedWorkflowRun:
+    snapshot = prepared.creation.snapshot
+    if snapshot is None:
+        raise WorkflowRunReplayInvariantError
+    initial_tasks = materialize_initial_tasks(snapshot)
+    run = NewWorkflowRun(uuid4(), requested_by_principal_id)
+    task_values = tuple(
+        NewTaskRun(
+            uuid4(),
+            task.step_identifier,
+            task.status,
+            task.deadline_seconds,
+            task.execution_timeout_seconds,
+        )
+        for task in initial_tasks
+    )
+    timestamps = await transaction.insert_full_replay(
+        prepared, run, input_snapshot, task_values
+    )
+    await transaction.commit()
+    runnable_count = sum(task.status is TaskRunStatus.RUNNABLE for task in task_values)
+    return CreatedWorkflowRun(
+        id=run.id,
+        workflow_definition_id=prepared.creation.workflow_definition_id,
+        workflow_version_id=snapshot.workflow_version_id,
+        version_number=snapshot.version_number,
+        requested_by_principal_id=requested_by_principal_id,
         status=WorkflowRunStatus.PENDING,
         created_at=timestamps.created_at,
         task_count=len(task_values),
