@@ -31,6 +31,10 @@ class InvalidWorkerRegistration(ValueError):
 @dataclass(frozen=True)
 class WorkerRegistration:
     capabilities: tuple[str, ...]
+    correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_correlation_id(self.correlation_id)
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,10 @@ class WorkerCapabilityReplacement:
     """Complete session advertisement affecting future claim checks only."""
 
     capabilities: tuple[str, ...]
+    correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_correlation_id(self.correlation_id)
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,7 @@ class RegisteredWorkerSession:
 class WorkerHeartbeat:
     sequence: int
     accepting_work: bool
+    correlation_id: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -72,6 +81,14 @@ class WorkerHeartbeat:
             raise ValueError("heartbeat sequence must be a positive BIGINT")
         if not isinstance(self.accepting_work, bool):
             raise ValueError("heartbeat availability must be boolean")
+        _validate_correlation_id(self.correlation_id)
+
+
+def _validate_correlation_id(value: str | None) -> None:
+    if value is not None and not (
+        1 <= len(value) <= 128 and all(32 <= ord(char) <= 126 for char in value)
+    ):
+        raise ValueError("worker correlation ID is invalid")
 
 
 @dataclass(frozen=True)

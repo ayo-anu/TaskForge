@@ -196,6 +196,7 @@ async def register_worker_session(
         registered = await _runtime(request).worker_registration_service.register(
             authenticated_worker,
             tuple(body.capabilities),
+            correlation_id=cast(UUID, request.state.request_id),
         )
     except InvalidWorkerRegistration as error:
         return error_response(
@@ -247,6 +248,7 @@ async def replace_worker_session_capabilities(
             authenticated_worker,
             worker_session_id,
             tuple(body.capabilities),
+            correlation_id=cast(UUID, request.state.request_id),
         )
     except InvalidWorkerRegistration as error:
         return error_response(
@@ -437,6 +439,7 @@ async def heartbeat_worker_session(
             worker_session_id,
             sequence=body.sequence,
             accepting_work=body.accepting_work,
+            correlation_id=cast(UUID, request.state.request_id),
         )
     except WorkerHeartbeatRejected as error:
         raise HTTPException(

@@ -712,8 +712,26 @@ def test_creation_transaction_prepares_snapshot_in_locked_transaction() -> None:
 def test_complete_insert_returns_database_timestamps_and_commits() -> None:
     now = datetime.now(UTC)
     workflow_id, version_id = uuid4(), uuid4()
+    run = NewWorkflowRun(uuid4(), uuid4(), WorkflowRunStatus.PENDING)
     prepared_session = FakeSession(
-        [FakeResult([SimpleNamespace(created_at=now, updated_at=now)])]
+        [
+            FakeResult([SimpleNamespace(created_at=now, updated_at=now)]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult(
+                [
+                    SimpleNamespace(
+                        id=uuid4(),
+                        workflow_run_id=run.id,
+                        cursor=1,
+                        task_run_id=None,
+                        event_type="workflow_run.created",
+                        payload={},
+                        occurred_at=now,
+                    )
+                ]
+            ),
+        ]
     )
     prepared = PreparedWorkflowRunCreation(
         workflow_id,
@@ -722,7 +740,6 @@ def test_complete_insert_returns_database_timestamps_and_commits() -> None:
             workflow_id, version_id, 1, (WorkflowRunVersionStep("root"),), ()
         ),
     )
-    run = NewWorkflowRun(uuid4(), uuid4(), WorkflowRunStatus.PENDING)
 
     async def exercise() -> WorkflowRunTimestamps:
         async with transaction(prepared_session) as creation:
@@ -740,6 +757,7 @@ def test_complete_insert_returns_database_timestamps_and_commits() -> None:
     assert timestamps.created_at == now
     assert prepared_session.calls == [
         "begin",
+        "execute",
         "execute",
         "execute",
         "execute",

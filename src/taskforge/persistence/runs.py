@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from taskforge.identity.authorization import OwnerFilter
 from taskforge.persistence.execution_events import (
     append_status_changed_execution_event,
+    append_workflow_created_execution_event,
     append_workflow_replay_created_execution_event,
 )
 from taskforge.retries.domain import (
@@ -243,6 +244,7 @@ class SQLAlchemyWorkflowRunRepository:
                                 command.idempotency.request_fingerprint
                             ),
                             reason=command.reason,
+                            correlation_id=command.correlation_id,
                         )
                         .returning(*workflow_run_cancellation_requests.c)
                     )
@@ -1082,6 +1084,7 @@ class SQLAlchemyWorkflowRunCreationTransaction:
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        correlation_id: UUID | None = None,
         idempotency: WorkflowRunIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         snapshot = prepared.snapshot
@@ -1106,6 +1109,14 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                         workflow_run_id=run.id,
                     )
                 )
+            await append_workflow_created_execution_event(
+                session,
+                workflow_run_id=run.id,
+                workflow_definition_id=prepared.workflow_definition_id,
+                workflow_version_id=snapshot.workflow_version_id,
+                requested_by_principal_id=run.requested_by_principal_id,
+                correlation_id=correlation_id,
+            )
         except IntegrityError as error:
             if _is_idempotency_scope_conflict(error):
                 raise WorkflowRunIdempotencyRecordConflict from error

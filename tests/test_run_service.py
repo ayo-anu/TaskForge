@@ -663,6 +663,7 @@ class FakeCreationTransaction:
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        correlation_id: UUID | None = None,
         idempotency: WorkflowRunIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         self._record("insert_complete_run")

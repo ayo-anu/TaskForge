@@ -42,6 +42,9 @@ from taskforge.dead_letters.schema import (
     dead_letter_status,
 )
 from taskforge.identity.authorization import OwnerFilter
+from taskforge.persistence.execution_events import (
+    append_workflow_redrive_created_execution_event,
+)
 from taskforge.persistence.runs import (
     insert_complete_workflow_run,
     load_exact_workflow_version_snapshot,
@@ -304,6 +307,16 @@ class SQLAlchemyDeadLetterRepository:
                         .returning(*dead_letter_redrive_requests.c)
                     )
                 ).one()
+                await append_workflow_redrive_created_execution_event(
+                    session,
+                    workflow_run_id=target_run.id,
+                    dead_letter_item_id=item_id,
+                    source_workflow_run_id=source.workflow_run_id,
+                    source_task_run_id=source.task_run_id,
+                    source_task_attempt_id=source.source_task_attempt_id,
+                    requested_by_principal_id=operator_principal_id,
+                    correlation_id=correlation_id,
+                )
                 return _created_redrive(source, request_row)
         except (
             DeadLetterPersistenceInvariantViolation,

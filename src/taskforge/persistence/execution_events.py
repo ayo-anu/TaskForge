@@ -29,6 +29,67 @@ MAX_EXECUTION_EVENT_PAGE_SIZE = 1000
 WORKFLOW_RUN_STATUS_CHANGED = "workflow_run.status_changed"
 TASK_RUN_STATUS_CHANGED = "task_run.status_changed"
 WORKFLOW_RUN_REPLAY_CREATED = "workflow_run.replay_created"
+WORKFLOW_RUN_CREATED = "workflow_run.created"
+WORKFLOW_RUN_REDRIVE_CREATED = "workflow_run.redrive_created"
+
+
+async def append_workflow_created_execution_event(
+    session: AsyncSession,
+    *,
+    workflow_run_id: UUID,
+    workflow_definition_id: UUID,
+    workflow_version_id: UUID,
+    requested_by_principal_id: UUID,
+    correlation_id: UUID | None,
+) -> StoredWorkflowRunExecutionEvent:
+    payload: dict[str, Any] = {
+        "workflow_definition_id": str(workflow_definition_id),
+        "workflow_version_id": str(workflow_version_id),
+        "requested_by_principal_id": str(requested_by_principal_id),
+        "creation_kind": "ordinary",
+    }
+    if correlation_id is not None:
+        payload["correlation_id"] = str(correlation_id)
+    return await append_workflow_run_execution_event(
+        session,
+        NewWorkflowRunExecutionEvent(
+            uuid4(),
+            workflow_run_id,
+            None,
+            WORKFLOW_RUN_CREATED,
+            cast(JSONMapping, payload),
+        ),
+    )
+
+
+async def append_workflow_redrive_created_execution_event(
+    session: AsyncSession,
+    *,
+    workflow_run_id: UUID,
+    dead_letter_item_id: UUID,
+    source_workflow_run_id: UUID,
+    source_task_run_id: UUID,
+    source_task_attempt_id: UUID,
+    requested_by_principal_id: UUID,
+    correlation_id: UUID,
+) -> StoredWorkflowRunExecutionEvent:
+    return await append_workflow_run_execution_event(
+        session,
+        NewWorkflowRunExecutionEvent(
+            uuid4(),
+            workflow_run_id,
+            None,
+            WORKFLOW_RUN_REDRIVE_CREATED,
+            {
+                "dead_letter_item_id": str(dead_letter_item_id),
+                "source_workflow_run_id": str(source_workflow_run_id),
+                "source_task_run_id": str(source_task_run_id),
+                "source_task_attempt_id": str(source_task_attempt_id),
+                "requested_by_principal_id": str(requested_by_principal_id),
+                "correlation_id": str(correlation_id),
+            },
+        ),
+    )
 
 
 async def append_workflow_replay_created_execution_event(

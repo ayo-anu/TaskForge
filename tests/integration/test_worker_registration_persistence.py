@@ -37,7 +37,6 @@ from taskforge.worker.persistence_ports import (
     WorkerCapabilitySessionInactive,
     WorkerCapabilitySessionUnavailable,
     WorkerHeartbeatAuthorityRejected,
-    WorkerHeartbeatInvariantViolation,
     WorkerHeartbeatPersistenceUnavailable,
     WorkerHeartbeatReplayConflict,
     WorkerHeartbeatSequenceGap,
@@ -485,15 +484,23 @@ async def assert_heartbeat_sequence_and_replay_semantics(database_url: URL) -> N
             == before_history_count
         )
 
-        await connection.execute(
-            "DELETE FROM worker_heartbeats "
-            "WHERE worker_session_id = $1 AND sequence = 2",
-            session_id,
-        )
-        with pytest.raises(WorkerHeartbeatInvariantViolation):
-            await repository.apply_heartbeat(
-                authority, session_id, WorkerHeartbeat(2, True)
+        with pytest.raises(
+            asyncpg.PostgresError, match="heartbeat history is immutable"
+        ):
+            await connection.execute(
+                "DELETE FROM worker_heartbeats "
+                "WHERE worker_session_id = $1 AND sequence = 2",
+                session_id,
             )
+        replayed = await repository.apply_heartbeat(
+            authority, session_id, WorkerHeartbeat(2, True)
+        )
+        assert (
+            replayed.last_sequence,
+            replayed.last_seen_at,
+            replayed.accepting_work,
+            replayed.availability_changed_at,
+        ) == before_bounded_replay
         assert await health_snapshot(connection, session_id) == before_bounded_replay
     finally:
         await connection.close()
@@ -999,10 +1006,11 @@ async def assert_worker_inspection(database_url: URL) -> None:
             received_at = await visibility.fetchval("SELECT statement_timestamp()")
             await visibility.execute(
                 "INSERT INTO worker_heartbeats "
-                "(worker_session_id, sequence, received_at, accepting_work) "
-                "VALUES ($1, 3, $2, true)",
+                "(worker_session_id, worker_identity_id, sequence, received_at, accepting_work) "
+                "VALUES ($1, $3, 3, $2, true)",
                 session_ids[0],
                 received_at,
+                authority.worker_identity_id,
             )
             await visibility.execute(
                 "UPDATE worker_session_health SET last_sequence = 3, "

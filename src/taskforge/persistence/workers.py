@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import (
     DateTime,
@@ -24,8 +24,16 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Select
 
+from taskforge.audit.domain import (
+    AuditActor,
+    AuditActorKind,
+    AuditOutcome,
+    AuditRecord,
+    bounded_string_set,
+)
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.schema import worker_credentials, worker_identities
+from taskforge.persistence.audit import append_audit_record
 from taskforge.worker.domain import (
     InspectedWorkerHealth,
     InspectedWorkerHeartbeat,
@@ -151,6 +159,23 @@ class SQLAlchemyWorkerRegistrationRepository:
                         availability_changed_at=session_row.registered_at,
                     )
                 )
+                await append_audit_record(
+                    session,
+                    AuditRecord(
+                        uuid4(),
+                        AuditActor(
+                            AuditActorKind.WORKER,
+                            worker_identity_id=authenticated_worker.worker_identity_id,
+                            worker_session_id=session_id,
+                        ),
+                        "worker_session.registered",
+                        AuditOutcome.ACCEPTED,
+                        "worker_session",
+                        session_id,
+                        registration.correlation_id,
+                        {"capabilities": bounded_string_set(registration.capabilities)},
+                    ),
+                )
         except WorkerRegistrationAuthorityRejected:
             raise
         except IntegrityError as error:
@@ -226,6 +251,8 @@ class SQLAlchemyWorkerHeartbeatRepository:
                         insert(worker_heartbeats)
                         .values(
                             worker_session_id=worker_session_id,
+                            worker_identity_id=authenticated_worker.worker_identity_id,
+                            correlation_id=heartbeat.correlation_id,
                             sequence=heartbeat.sequence,
                             accepting_work=heartbeat.accepting_work,
                         )
@@ -403,6 +430,26 @@ class SQLAlchemyWorkerCapabilityRepository:
                             for capability in added
                         ],
                     )
+                await append_audit_record(
+                    session,
+                    AuditRecord(
+                        uuid4(),
+                        AuditActor(
+                            AuditActorKind.WORKER,
+                            worker_identity_id=authenticated_worker.worker_identity_id,
+                            worker_session_id=worker_session_id,
+                        ),
+                        "worker_session.capabilities_replaced",
+                        AuditOutcome.ACCEPTED,
+                        "worker_session",
+                        worker_session_id,
+                        replacement.correlation_id,
+                        {
+                            "added": bounded_string_set(added),
+                            "removed": bounded_string_set(removed),
+                        },
+                    ),
+                )
                 return ReplacedWorkerCapabilities(
                     worker_session_id, replacement.capabilities
                 )

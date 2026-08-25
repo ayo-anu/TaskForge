@@ -47,6 +47,7 @@ class PersistableTaskResult:
     failure_kind: TaskExecutionFailureKind | None
     output: JSONValue
     result_fingerprint: str
+    correlation_id: str | None = None
 
     def __repr__(self) -> str:
         return (

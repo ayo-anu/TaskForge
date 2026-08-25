@@ -6,14 +6,22 @@ from collections.abc import Sequence
 from datetime import datetime
 from types import TracebackType
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, insert, or_, select, text, update
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.audit.domain import (
+    AuditActor,
+    AuditActorKind,
+    AuditOutcome,
+    AuditRecord,
+    bounded_string_set,
+)
 from taskforge.identity.schema import api_principals
+from taskforge.persistence.audit import append_audit_record
 from taskforge.workflows.domain import (
     DraftDependency,
     DraftWorkflowStep,
@@ -383,7 +391,9 @@ class SQLAlchemyWorkflowUnitOfWork:
         if row.disabled_at is not None:
             raise WorkflowOwnerRecordDisabled
 
-    async def insert_definition(self, workflow: WorkflowDraft) -> WorkflowTimestamps:
+    async def insert_definition(
+        self, workflow: WorkflowDraft, correlation_id: str | None = None
+    ) -> WorkflowTimestamps:
         try:
             row = (
                 await self._required_session().execute(
@@ -406,6 +416,25 @@ class SQLAlchemyWorkflowUnitOfWork:
             raise WorkflowRecordConflict from error
         except DBAPIError as error:
             raise WorkflowPersistenceUnavailable from error
+        await append_audit_record(
+            self._required_session(),
+            AuditRecord(
+                uuid4(),
+                AuditActor(
+                    AuditActorKind.API_PRINCIPAL,
+                    api_principal_id=workflow.owner_principal_id,
+                ),
+                "workflow.created",
+                AuditOutcome.ACCEPTED,
+                "workflow",
+                workflow.id,
+                correlation_id,
+                {
+                    "step_count": len(workflow.steps),
+                    "dependency_count": len(workflow.dependencies),
+                },
+            ),
+        )
         return WorkflowTimestamps(row.created_at, row.updated_at)
 
     async def insert_steps(
@@ -559,6 +588,7 @@ class SQLAlchemyWorkflowUnitOfWork:
         self,
         workflow_id: UUID,
         status: WorkflowDefinitionStatus,
+        correlation_id: str | None = None,
     ) -> None:
         self._require_availability_lock(workflow_id)
         try:
@@ -574,6 +604,26 @@ class SQLAlchemyWorkflowUnitOfWork:
             raise WorkflowPersistenceUnavailable from error
         if updated_id != workflow_id:
             raise WorkflowRecordConflict
+        owner_id = await self._required_session().scalar(
+            select(workflow_definitions.c.owner_principal_id).where(
+                workflow_definitions.c.id == workflow_id
+            )
+        )
+        if not isinstance(owner_id, UUID):
+            raise WorkflowRecordConflict
+        await append_audit_record(
+            self._required_session(),
+            AuditRecord(
+                uuid4(),
+                AuditActor(AuditActorKind.API_PRINCIPAL, api_principal_id=owner_id),
+                "workflow.availability_changed",
+                AuditOutcome.ACCEPTED,
+                "workflow",
+                workflow_id,
+                correlation_id,
+                {"new_status": status.value},
+            ),
+        )
 
     async def next_version_number(self, workflow_id: UUID) -> int:
         """Read MAX only after this transaction holds the definition lock."""
@@ -595,6 +645,7 @@ class SQLAlchemyWorkflowUnitOfWork:
         version_id: UUID,
         version_number: int,
         workflow: WorkflowDraft,
+        correlation_id: str | None = None,
     ) -> datetime:
         self._require_publication_lock(workflow.id)
         try:
@@ -616,6 +667,28 @@ class SQLAlchemyWorkflowUnitOfWork:
             raise WorkflowPersistenceUnavailable from error
         if not isinstance(published_at, datetime):
             raise RuntimeError("database did not return a publication timestamp")
+        await append_audit_record(
+            self._required_session(),
+            AuditRecord(
+                uuid4(),
+                AuditActor(
+                    AuditActorKind.API_PRINCIPAL,
+                    api_principal_id=workflow.owner_principal_id,
+                ),
+                "workflow.version_published",
+                AuditOutcome.ACCEPTED,
+                "workflow",
+                workflow.id,
+                correlation_id,
+                {
+                    "workflow_version_id": str(version_id),
+                    "version_number": version_number,
+                    "steps": bounded_string_set(
+                        tuple(step.identifier for step in workflow.steps)
+                    ),
+                },
+            ),
+        )
         return published_at
 
     async def insert_version_steps(

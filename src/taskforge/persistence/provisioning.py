@@ -4,12 +4,19 @@ from __future__ import annotations
 
 from datetime import datetime
 from types import TracebackType
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import Table, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.audit.domain import (
+    AuditActor,
+    AuditActorKind,
+    AuditOutcome,
+    AuditRecord,
+    bounded_string_set,
+)
 from taskforge.identity.authorization import Role
 from taskforge.identity.provisioning_ports import (
     CredentialRecordNotFound,
@@ -24,6 +31,7 @@ from taskforge.identity.schema import (
     worker_credentials,
     worker_identities,
 )
+from taskforge.persistence.audit import append_audit_record
 
 
 class SQLAlchemyProvisioningRepository:
@@ -68,6 +76,9 @@ class SQLAlchemyProvisioningUnitOfWork:
             )
         except IntegrityError as error:
             raise DuplicateIdentityRecord from error
+        await self._audit(
+            "identity.api_principal_created", "api_principal", principal_id
+        )
 
     async def assign_api_roles(
         self,
@@ -81,6 +92,12 @@ class SQLAlchemyProvisioningUnitOfWork:
                 for role in sorted(roles, key=lambda item: item.value)
             ],
         )
+        await self._audit(
+            "identity.api_roles_assigned",
+            "api_principal",
+            principal_id,
+            {"roles": bounded_string_set(frozenset(role.value for role in roles))},
+        )
 
     async def create_worker_identity(self, worker_id: UUID, name: str) -> None:
         try:
@@ -89,6 +106,7 @@ class SQLAlchemyProvisioningUnitOfWork:
             )
         except IntegrityError as error:
             raise DuplicateIdentityRecord from error
+        await self._audit("identity.worker_created", "worker_identity", worker_id)
 
     async def add_api_credential(
         self,
@@ -106,6 +124,9 @@ class SQLAlchemyProvisioningUnitOfWork:
                 expires_at=expires_at,
             )
         )
+        await self._audit(
+            "identity.api_credential_added", "api_credential", credential_id
+        )
 
     async def add_worker_credential(
         self,
@@ -122,6 +143,9 @@ class SQLAlchemyProvisioningUnitOfWork:
                 credential_verifier=credential_verifier,
                 expires_at=expires_at,
             )
+        )
+        await self._audit(
+            "identity.worker_credential_added", "worker_credential", credential_id
         )
 
     async def revoke_api_credential(
@@ -145,6 +169,9 @@ class SQLAlchemyProvisioningUnitOfWork:
         )
         if result.scalar_one_or_none() is None:
             raise CredentialRecordNotFound
+        await self._audit(
+            "identity.api_credential_revoked", "api_credential", credential_id
+        )
 
     async def revoke_worker_credential(
         self,
@@ -167,6 +194,30 @@ class SQLAlchemyProvisioningUnitOfWork:
         )
         if result.scalar_one_or_none() is None:
             raise CredentialRecordNotFound
+        await self._audit(
+            "identity.worker_credential_revoked", "worker_credential", credential_id
+        )
+
+    async def _audit(
+        self,
+        action: str,
+        resource_type: str,
+        resource_id: UUID,
+        provenance: dict[str, object] | None = None,
+    ) -> None:
+        await append_audit_record(
+            self._required_session(),
+            AuditRecord(
+                uuid4(),
+                AuditActor(AuditActorKind.SYSTEM, system_component="bootstrap"),
+                action,
+                AuditOutcome.ACCEPTED,
+                resource_type,
+                resource_id,
+                None,
+                provenance or {},
+            ),
+        )
 
     async def commit(self) -> None:
         await self._required_session().commit()

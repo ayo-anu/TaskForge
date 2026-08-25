@@ -162,6 +162,9 @@ def test_claim_event_metadata_matches_the_immutable_event_migration() -> None:
         "id",
         "task_attempt_id",
         "generation",
+        "worker_identity_id",
+        "worker_session_id",
+        "correlation_id",
         "event_type",
         "occurred_at",
         "previous_lease_expires_at",
@@ -181,9 +184,20 @@ def test_claim_event_metadata_matches_the_immutable_event_migration() -> None:
             ),
             "RESTRICT",
             "RESTRICT",
-        )
+        ),
+        (
+            "fk_task_claim_events_worker_session_identity",
+            ("worker_session_id", "worker_identity_id"),
+            ("worker_sessions.id", "worker_sessions.worker_identity_id"),
+            "RESTRICT",
+            "RESTRICT",
+        ),
     }
     assert _event_check_shapes() == {
+        (
+            "ck_task_claim_events_actor_attribution",
+            "worker_identity_id IS NOT NULL AND worker_session_id IS NOT NULL",
+        ),
         (
             "ck_task_claim_events_event_type_valid",
             "event_type IN ('claim_acquired', 'lease_renewed')",

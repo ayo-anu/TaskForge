@@ -31,7 +31,9 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Select
 
+from taskforge.audit.domain import AuditActor, AuditActorKind, AuditOutcome, AuditRecord
 from taskforge.dead_letters.domain import DeadLetterReason
+from taskforge.persistence.audit import append_audit_record
 from taskforge.persistence.dead_letters import (
     DeadLetterPersistenceInvariantViolation,
     ensure_dead_letter,
@@ -276,6 +278,22 @@ class SQLAlchemyStaleWorkerSessionRecoveryRepository:
                 ).one_or_none()
                 if ended is None or ended.ended_at != ended_at:
                     raise StaleWorkerSessionRecoveryPersistenceInvariantViolation
+                await append_audit_record(
+                    session,
+                    AuditRecord(
+                        uuid4(),
+                        AuditActor(
+                            AuditActorKind.SYSTEM,
+                            system_component="stale_worker_session_recovery",
+                        ),
+                        "worker_session.ended_stale",
+                        AuditOutcome.ACCEPTED,
+                        "worker_session",
+                        candidate.worker_session_id,
+                        None,
+                        {"last_sequence": candidate.last_sequence},
+                    ),
+                )
                 return EndedStaleWorkerSession(ended_at)
         except StaleWorkerSessionRecoveryPersistenceInvariantViolation:
             raise
@@ -587,6 +605,10 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                     id=uuid4(),
                     task_run_id=prepared.task_run_id,
                     event_type=RetryEventType.RETRY_SCHEDULED.value,
+                    actor_component="expired_claim_recovery",
+                    correlation_id=await _dispatch_correlation(
+                        session, prepared.dispatch_id
+                    ),
                     failed_attempt_number=prepared.attempt_number,
                     retry_attempt_number=attempt.attempt_number,
                     next_eligible_at=attempt.next_eligible_at,
@@ -635,6 +657,10 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                     id=uuid4(),
                     task_run_id=prepared.task_run_id,
                     event_type=RetryEventType.RETRY_NOT_SCHEDULED.value,
+                    actor_component="expired_claim_recovery",
+                    correlation_id=await _dispatch_correlation(
+                        session, prepared.dispatch_id
+                    ),
                     failed_attempt_number=prepared.attempt_number,
                     decision_reason=reason.value,
                 )
@@ -727,6 +753,10 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                     worker_session_id=prepared.worker_session_id,
                     dispatch_id=prepared.dispatch_id,
                     event_type="result_recovered",
+                    actor_component="cancellation_recovery",
+                    correlation_id=await _dispatch_correlation(
+                        session, prepared.dispatch_id
+                    ),
                     result_kind=TaskExecutionResultKind.CANCELLATION.value,
                     failure_kind=None,
                     result_fingerprint=fingerprint,
@@ -788,6 +818,10 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                     worker_session_id=prepared.worker_session_id,
                     dispatch_id=prepared.dispatch_id,
                     event_type="result_recovered",
+                    actor_component="expired_claim_recovery",
+                    correlation_id=await _dispatch_correlation(
+                        session, prepared.dispatch_id
+                    ),
                     result_kind=TaskExecutionResultKind.RETRYABLE_FAILURE.value,
                     failure_kind=TaskExecutionFailureKind.CLAIM_EXPIRED.value,
                     result_fingerprint=fingerprint,
@@ -808,6 +842,15 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
         if self._context is None:
             raise RuntimeError("recovery transaction is not active")
         return self._context
+
+
+async def _dispatch_correlation(session: AsyncSession, dispatch_id: UUID) -> str | None:
+    value = await session.scalar(
+        select(task_dispatch_outbox.c.payload["correlation_id"].astext).where(
+            task_dispatch_outbox.c.id == dispatch_id
+        )
+    )
+    return value if isinstance(value, str) else None
 
 
 async def _append_recovery_status_event(

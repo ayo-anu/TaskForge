@@ -307,7 +307,9 @@ async def create_workflow(
             dependencies=dependencies,
             execution_policy=body.execution_policy,
         )
-        stored = await runtime.workflow_service.create(workflow)
+        stored = await runtime.workflow_service.create(
+            workflow, correlation_id=cast(UUID, request.state.request_id)
+        )
     except WorkflowValidationError as error:
         if error.graph_result is not None:
             return _graph_validation_error(request, error.graph_result.issues)
@@ -384,6 +386,7 @@ async def publish_workflow(
         published = await _runtime(request).workflow_service.publish(
             workflow_id,
             owner_principal_id=context.principal_id,
+            correlation_id=cast(UUID, request.state.request_id),
         )
     except WorkflowValidationError as error:
         if error.graph_result is not None:

@@ -113,7 +113,9 @@ class FakeTransaction:
     async def require_enabled_owner(self, owner_principal_id: UUID) -> None:
         self._record("require_enabled_owner", owner_principal_id)
 
-    async def insert_definition(self, workflow: WorkflowDraft) -> WorkflowTimestamps:
+    async def insert_definition(
+        self, workflow: WorkflowDraft, correlation_id: str | None = None
+    ) -> WorkflowTimestamps:
         self._record("insert_definition", workflow.id)
         return self.timestamps
 
@@ -157,6 +159,7 @@ class FakeTransaction:
         self,
         workflow_id: UUID,
         status: WorkflowDefinitionStatus,
+        correlation_id: str | None = None,
     ) -> None:
         self._record("update_availability", workflow_id, status)
 
@@ -169,6 +172,7 @@ class FakeTransaction:
         version_id: UUID,
         version_number: int,
         workflow: WorkflowDraft,
+        correlation_id: str | None = None,
     ) -> datetime:
         self._record("insert_version", version_id, version_number, workflow)
         return self.published_at

@@ -26,7 +26,7 @@ from taskforge.claims.persistence_ports import (
     TaskClaimPersistenceUnavailable,
     TaskClaimRenewalExpired,
 )
-from taskforge.claims.service import TaskClaimService
+from taskforge.claims.service import TaskClaimService, TaskClaimServiceUnavailable
 from taskforge.identity.authorization import OwnerFilter
 from taskforge.persistence.claims import (
     SQLAlchemyTaskClaimInspectionRepository,
@@ -151,7 +151,7 @@ async def exercise_acquisition_events(
     )
     assert await event_count(setup, contested_dispatch.task_attempt_id) == 1
 
-    rejected_dispatch = await add_dispatched_task(setup, status="runnable")
+    rejected_dispatch = await add_dispatched_task(setup, status="succeeded")
     with pytest.raises(TaskClaimRejected):
         await service.claim_task(
             worker.authenticated, worker.session_id, rejected_dispatch
@@ -166,7 +166,7 @@ async def exercise_acquisition_event_failure(
     dispatch = await add_dispatched_task(setup)
     await install_event_failure_trigger(setup, "claim_acquired")
     try:
-        with pytest.raises(TaskClaimPersistenceUnavailable):
+        with pytest.raises(TaskClaimServiceUnavailable):
             await service.claim_task(worker.authenticated, worker.session_id, dispatch)
     finally:
         await remove_event_failure_trigger(setup)
@@ -307,12 +307,15 @@ async def exercise_atomic_visibility(
         )
         await writer.execute(
             "INSERT INTO task_claim_events "
-            "(id, task_attempt_id, generation, event_type, occurred_at, "
-            "lease_expires_at) VALUES ($1, $2, 1, 'claim_acquired', $3, $4)",
+            "(id, task_attempt_id, generation, worker_identity_id, "
+            "worker_session_id, event_type, occurred_at, lease_expires_at) "
+            "VALUES ($1, $2, 1, $5, $6, 'claim_acquired', $3, $4)",
             uuid4(),
             dispatch.task_attempt_id,
             row["acquired_at"],
             row["lease_expires_at"],
+            worker.authenticated.worker_identity_id,
+            worker.session_id,
         )
         observation_sql = (
             "SELECT count(*) FROM task_attempt_claims c JOIN task_claim_events e "

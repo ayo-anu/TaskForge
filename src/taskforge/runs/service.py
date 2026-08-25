@@ -5,7 +5,16 @@ from __future__ import annotations
 from typing import cast
 from uuid import UUID, uuid4
 
+from taskforge.audit.domain import (
+    AuditActor,
+    AuditActorKind,
+    AuditOutcome,
+    AuditRecord,
+    AuditRejected,
+    bounded_string_set,
+)
 from taskforge.identity.authorization import OwnerFilter
+from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.retries.domain import InspectedRetryEventPage, RetryEventCursor
 from taskforge.runs.domain import (
     MAX_WORKFLOW_RECONCILIATION_ITERATIONS,
@@ -16,9 +25,14 @@ from taskforge.runs.domain import (
     CreatedFullWorkflowReplay,
     CreatedWorkflowRun,
     DependencyFailurePropagationResult,
+    FailedSubgraphReplaySelectionInvalid,
     InitialTaskRun,
     InspectedTaskRun,
     InspectedWorkflowRun,
+    InvalidFailedSubgraphReplayRequest,
+    InvalidWorkflowRunCancellationIdempotencyKey,
+    InvalidWorkflowRunCancellationReason,
+    InvalidWorkflowRunIdempotencyKey,
     NewTaskRun,
     NewWorkflowRun,
     ResolvedWorkflowVersion,
@@ -35,6 +49,7 @@ from taskforge.runs.domain import (
     WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
     WorkflowRunReconciliationResult,
+    WorkflowRunReplayNotEligible,
     WorkflowRunReplaySourceInvalid,
     WorkflowRunStatus,
     WorkflowVersionSelection,
@@ -107,9 +122,70 @@ class WorkflowRunReplayInvariantError(Exception):
     """Durable replay source facts are internally inconsistent."""
 
 
+_REPLAY_AUDIT_REASONS: dict[type[Exception], str] = {
+    InvalidWorkflowRunIdempotencyKey: "invalid_idempotency_key",
+    WorkflowRunNotFound: "source_not_visible",
+    WorkflowRunReplayNotEligible: "source_not_replayable",
+    InvalidFailedSubgraphReplayRequest: "invalid_failed_subgraph_request",
+    FailedSubgraphReplaySelectionInvalid: "failed_subgraph_invalid",
+    WorkflowReplayIdempotencyConflict: "idempotency_conflict",
+    WorkflowRunPersistenceConflict: "persistence_conflict",
+}
+_CANCELLATION_AUDIT_REASONS: dict[type[Exception], str] = {
+    InvalidWorkflowRunCancellationIdempotencyKey: "invalid_idempotency_key",
+    InvalidWorkflowRunCancellationReason: "invalid_reason",
+    WorkflowRunNotFound: "workflow_run_not_visible",
+    WorkflowRunCancellationIdempotencyConflict: "idempotency_conflict",
+}
+_RUN_CREATION_AUDIT_REASONS: dict[type[Exception], str] = {
+    WorkflowRunIdempotencyConflict: "idempotency_conflict",
+}
+
+
 class WorkflowRunService:
-    def __init__(self, repository: WorkflowRunRepository) -> None:
+    def __init__(
+        self,
+        repository: WorkflowRunRepository,
+        rejected_audit: RejectedAuditRecorder | None = None,
+    ) -> None:
         self._repository = repository
+        self._rejected_audit = rejected_audit
+
+    async def _audit_replay_rejection(
+        self,
+        error: Exception,
+        source_id: UUID,
+        principal_id: UUID,
+        correlation_id: UUID,
+        failed_steps: object = None,
+    ) -> None:
+        if self._rejected_audit is None:
+            return
+        reason = _REPLAY_AUDIT_REASONS[type(error)]
+        provenance: dict[str, object] = {}
+        if isinstance(failed_steps, (list, tuple)) and all(
+            isinstance(item, str) for item in failed_steps
+        ):
+            provenance["failed_steps"] = bounded_string_set(tuple(failed_steps))
+        try:
+            await self._rejected_audit.record(
+                AuditRecord(
+                    uuid4(),
+                    AuditActor(
+                        AuditActorKind.API_PRINCIPAL,
+                        api_principal_id=principal_id,
+                    ),
+                    "workflow_run.replay",
+                    AuditOutcome.REJECTED,
+                    "workflow_run",
+                    source_id,
+                    str(correlation_id),
+                    provenance,
+                    reason,
+                )
+            )
+        except AuditRejected as audit_error:
+            raise WorkflowRunServiceUnavailable from audit_error
 
     async def create_full_replay(
         self,
@@ -142,9 +218,21 @@ class WorkflowRunService:
         except WorkflowRunReplayPersistenceInvariantViolation as error:
             raise WorkflowRunReplayInvariantError from error
         except WorkflowRunRecordConflict as error:
-            raise WorkflowRunPersistenceConflict from error
+            rejection = WorkflowRunPersistenceConflict()
+            await self._audit_replay_rejection(
+                rejection,
+                source_workflow_run_id,
+                requested_by_principal_id,
+                correlation_id,
+            )
+            raise rejection from error
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
+        except (WorkflowRunNotFound, WorkflowRunReplayNotEligible) as error:
+            await self._audit_replay_rejection(
+                error, source_workflow_run_id, requested_by_principal_id, correlation_id
+            )
+            raise
         return CreatedFullWorkflowReplay(
             source_workflow_run_id,
             WorkflowReplayMode.FULL,
@@ -202,15 +290,41 @@ class WorkflowRunService:
         except WorkflowRunIdempotencyRecordConflict:
             assert prepared is not None
             assert idempotency is not None
-            return await self._recover_idempotent_full_replay(
-                prepared, requested_by_principal_id, idempotency
-            )
+            try:
+                return await self._recover_idempotent_full_replay(
+                    prepared, requested_by_principal_id, idempotency
+                )
+            except WorkflowReplayIdempotencyConflict as error:
+                await self._audit_replay_rejection(
+                    error,
+                    source_workflow_run_id,
+                    requested_by_principal_id,
+                    correlation_id,
+                )
+                raise
         except WorkflowRunReplayPersistenceInvariantViolation as error:
             raise WorkflowRunReplayInvariantError from error
         except WorkflowRunRecordConflict as error:
-            raise WorkflowRunPersistenceConflict from error
+            rejection = WorkflowRunPersistenceConflict()
+            await self._audit_replay_rejection(
+                rejection,
+                source_workflow_run_id,
+                requested_by_principal_id,
+                correlation_id,
+            )
+            raise rejection from error
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
+        except (
+            WorkflowRunNotFound,
+            WorkflowRunReplayNotEligible,
+            InvalidWorkflowRunIdempotencyKey,
+            WorkflowReplayIdempotencyConflict,
+        ) as error:
+            await self._audit_replay_rejection(
+                error, source_workflow_run_id, requested_by_principal_id, correlation_id
+            )
+            raise
         return CreatedFullWorkflowReplay(
             source_workflow_run_id, WorkflowReplayMode.FULL, created
         )
@@ -260,9 +374,30 @@ class WorkflowRunService:
         except WorkflowRunReplayPersistenceInvariantViolation as error:
             raise WorkflowRunReplayInvariantError from error
         except WorkflowRunRecordConflict as error:
-            raise WorkflowRunPersistenceConflict from error
+            rejection = WorkflowRunPersistenceConflict()
+            await self._audit_replay_rejection(
+                rejection,
+                source_workflow_run_id,
+                requested_by_principal_id,
+                correlation_id,
+                failed_step_identifiers,
+            )
+            raise rejection from error
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
+        except (
+            WorkflowRunNotFound,
+            InvalidFailedSubgraphReplayRequest,
+            FailedSubgraphReplaySelectionInvalid,
+        ) as error:
+            await self._audit_replay_rejection(
+                error,
+                source_workflow_run_id,
+                requested_by_principal_id,
+                correlation_id,
+                failed_step_identifiers,
+            )
+            raise
         return CreatedFailedSubgraphWorkflowReplay(
             source_workflow_run_id,
             WorkflowReplayMode.FAILED_SUBGRAPH,
@@ -357,15 +492,48 @@ class WorkflowRunService:
             assert prepared is not None
             assert idempotency is not None
             assert canonical_roots is not None
-            return await self._recover_idempotent_failed_subgraph_replay(
-                prepared, requested_by_principal_id, idempotency, canonical_roots
-            )
+            try:
+                return await self._recover_idempotent_failed_subgraph_replay(
+                    prepared, requested_by_principal_id, idempotency, canonical_roots
+                )
+            except WorkflowReplayIdempotencyConflict as error:
+                await self._audit_replay_rejection(
+                    error,
+                    source_workflow_run_id,
+                    requested_by_principal_id,
+                    correlation_id,
+                    canonical_roots,
+                )
+                raise
         except WorkflowRunReplayPersistenceInvariantViolation as error:
             raise WorkflowRunReplayInvariantError from error
         except WorkflowRunRecordConflict as error:
-            raise WorkflowRunPersistenceConflict from error
+            rejection = WorkflowRunPersistenceConflict()
+            await self._audit_replay_rejection(
+                rejection,
+                source_workflow_run_id,
+                requested_by_principal_id,
+                correlation_id,
+                failed_step_identifiers,
+            )
+            raise rejection from error
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
+        except (
+            WorkflowRunNotFound,
+            InvalidFailedSubgraphReplayRequest,
+            FailedSubgraphReplaySelectionInvalid,
+            InvalidWorkflowRunIdempotencyKey,
+            WorkflowReplayIdempotencyConflict,
+        ) as error:
+            await self._audit_replay_rejection(
+                error,
+                source_workflow_run_id,
+                requested_by_principal_id,
+                correlation_id,
+                failed_step_identifiers,
+            )
+            raise
         return CreatedFailedSubgraphWorkflowReplay(
             source_workflow_run_id,
             WorkflowReplayMode.FAILED_SUBGRAPH,
@@ -427,25 +595,56 @@ class WorkflowRunService:
         requested_by_principal_id: UUID,
         idempotency_key: object,
         reason: object,
+        correlation_id: UUID | None = None,
     ) -> WorkflowRunCancellationResult:
         """Accept or replay one owner-scoped workflow cancellation intention."""
-        command = create_workflow_run_cancellation_command(
-            workflow_run_id,
-            requested_by_principal_id,
-            idempotency_key=idempotency_key,
-            reason=reason,
-        )
         try:
+            command = create_workflow_run_cancellation_command(
+                workflow_run_id,
+                requested_by_principal_id,
+                idempotency_key=idempotency_key,
+                reason=reason,
+                correlation_id=correlation_id,
+            )
             persisted = await self._repository.cancel_run(
                 workflow_run_id, owner_filter, command
             )
+        except (
+            InvalidWorkflowRunCancellationIdempotencyKey,
+            InvalidWorkflowRunCancellationReason,
+        ) as error:
+            await self._audit_command_rejection(
+                error,
+                action="workflow_run.cancel",
+                resource_id=workflow_run_id,
+                principal_id=requested_by_principal_id,
+                correlation_id=correlation_id,
+                reasons=_CANCELLATION_AUDIT_REASONS,
+            )
+            raise
         except WorkflowRunCancellationPersistenceInvariantViolation as error:
             raise WorkflowRunCancellationInvariantError from error
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
         if persisted is None:
+            await self._audit_command_rejection(
+                WorkflowRunNotFound(),
+                action="workflow_run.cancel",
+                resource_id=workflow_run_id,
+                principal_id=requested_by_principal_id,
+                correlation_id=correlation_id,
+                reasons=_CANCELLATION_AUDIT_REASONS,
+            )
             raise WorkflowRunNotFound
         if persisted.outcome is PersistedCancellationOutcome.IDEMPOTENCY_CONFLICT:
+            await self._audit_command_rejection(
+                WorkflowRunCancellationIdempotencyConflict(),
+                action="workflow_run.cancel",
+                resource_id=workflow_run_id,
+                principal_id=requested_by_principal_id,
+                correlation_id=correlation_id,
+                reasons=_CANCELLATION_AUDIT_REASONS,
+            )
             raise WorkflowRunCancellationIdempotencyConflict
         outcome = WorkflowRunCancellationOutcome(persisted.outcome.value)
         disclosed = (
@@ -463,6 +662,39 @@ class WorkflowRunService:
             persisted.status,
             disclosed,
         )
+
+    async def _audit_command_rejection(
+        self,
+        error: Exception,
+        *,
+        action: str,
+        resource_id: UUID,
+        principal_id: UUID,
+        correlation_id: UUID | None,
+        reasons: dict[type[Exception], str],
+        provenance: dict[str, object] | None = None,
+        resource_type: str = "workflow_run",
+    ) -> None:
+        if self._rejected_audit is None:
+            return
+        try:
+            await self._rejected_audit.record(
+                AuditRecord(
+                    uuid4(),
+                    AuditActor(
+                        AuditActorKind.API_PRINCIPAL, api_principal_id=principal_id
+                    ),
+                    action,
+                    AuditOutcome.REJECTED,
+                    resource_type,
+                    resource_id,
+                    str(correlation_id) if correlation_id else None,
+                    provenance or {},
+                    reasons[type(error)],
+                )
+            )
+        except AuditRejected as audit_error:
+            raise WorkflowRunServiceUnavailable from audit_error
 
     async def resolve_version(
         self,
@@ -822,6 +1054,7 @@ class WorkflowRunService:
         requested_by_principal_id: UUID,
         selection: WorkflowVersionSelection,
         input_snapshot: WorkflowRunInput,
+        correlation_id: UUID | None = None,
     ) -> CreatedWorkflowRun:
         """Atomically create one pending run and its complete initial task graph."""
         accepted_input = create_workflow_run_input(
@@ -845,6 +1078,7 @@ class WorkflowRunService:
                     accepted_input,
                     requested_by_principal_id,
                     run=run,
+                    correlation_id=correlation_id,
                 )
         except WorkflowRunRecordConflict as error:
             raise WorkflowRunPersistenceConflict from error
@@ -861,6 +1095,7 @@ class WorkflowRunService:
         selection: WorkflowVersionSelection,
         input_snapshot: WorkflowRunInput,
         idempotency_key: object,
+        correlation_id: UUID | None = None,
     ) -> CreatedWorkflowRun:
         """Create or replay one scoped idempotent workflow run."""
         accepted_input = create_workflow_run_input(
@@ -892,14 +1127,38 @@ class WorkflowRunService:
                     preparation,
                     accepted_input,
                     requested_by_principal_id,
+                    correlation_id=correlation_id,
                     idempotency=idempotency,
                 )
-        except WorkflowRunIdempotencyRecordConflict:
-            return await self._recover_idempotency_conflict(
-                requested_by_principal_id,
-                workflow_id,
-                idempotency,
+        except WorkflowRunIdempotencyConflict as error:
+            await self._audit_command_rejection(
+                error,
+                action="workflow_run.create",
+                resource_id=workflow_id,
+                resource_type="workflow",
+                principal_id=requested_by_principal_id,
+                correlation_id=correlation_id,
+                reasons=_RUN_CREATION_AUDIT_REASONS,
             )
+            raise
+        except WorkflowRunIdempotencyRecordConflict:
+            try:
+                return await self._recover_idempotency_conflict(
+                    requested_by_principal_id,
+                    workflow_id,
+                    idempotency,
+                )
+            except WorkflowRunIdempotencyConflict as error:
+                await self._audit_command_rejection(
+                    error,
+                    action="workflow_run.create",
+                    resource_id=workflow_id,
+                    resource_type="workflow",
+                    principal_id=requested_by_principal_id,
+                    correlation_id=correlation_id,
+                    reasons=_RUN_CREATION_AUDIT_REASONS,
+                )
+                raise
         except WorkflowRunRecordConflict as error:
             raise WorkflowRunPersistenceConflict from error
         except WorkflowRunPersistenceUnavailable as error:
@@ -1011,6 +1270,7 @@ async def _create_prepared_run(
     requested_by_principal_id: UUID,
     *,
     run: NewWorkflowRun | None = None,
+    correlation_id: UUID | None = None,
     idempotency: WorkflowRunIdempotency | None = None,
 ) -> CreatedWorkflowRun:
     require_run_available(prepared.status)
@@ -1037,6 +1297,7 @@ async def _create_prepared_run(
         run,
         input_snapshot,
         task_values,
+        correlation_id,
         idempotency,
     )
     await transaction.commit()

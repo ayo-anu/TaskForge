@@ -256,6 +256,7 @@ def test_sqlalchemy_repository_maps_idempotent_and_differential_replacements() -
             Result(scalars=("documents", "notifications.email")),
             Result(),
             Result(),
+            Result(),
         ]
     )
     changed_repository = SQLAlchemyWorkerCapabilityRepository(

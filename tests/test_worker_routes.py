@@ -109,6 +109,7 @@ class RegistrationServiceStub:
         self,
         authenticated_worker: AuthenticatedWorker,
         capabilities: tuple[str, ...],
+        correlation_id: UUID | None = None,
     ) -> RegisteredWorkerSession:
         self.calls.append((authenticated_worker, capabilities))
         if self.error is not None:
@@ -130,6 +131,7 @@ class HeartbeatServiceStub:
         *,
         sequence: int,
         accepting_work: bool,
+        correlation_id: UUID | None = None,
     ) -> WorkerHealthProjection:
         self.calls.append(
             (authenticated_worker, worker_session_id, sequence, accepting_work)
@@ -149,6 +151,7 @@ class CapabilityServiceStub:
         authenticated_worker: AuthenticatedWorker,
         worker_session_id: UUID,
         capabilities: tuple[str, ...],
+        correlation_id: UUID | None = None,
     ) -> ReplacedWorkerCapabilities:
         self.calls.append((authenticated_worker, worker_session_id, capabilities))
         if self.error:

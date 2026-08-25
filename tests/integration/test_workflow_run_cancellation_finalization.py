@@ -152,9 +152,7 @@ async def _verify(database_url: URL) -> None:
 
         # Inspection exposes only canonical metadata, recovery count, and caveats.
         inspected_id = await _create_cancelling_run(service, workflow_id, owner_id)
-        inspected = await service.get_run(
-            inspected_id, owner_principal_id=owner_id
-        )
+        inspected = await service.get_run(inspected_id, owner_principal_id=owner_id)
         assert inspected.cancellation is not None
         assert inspected.cancellation.requested_by_principal_id == owner_id
         assert inspected.cancellation.reason == "operator requested"

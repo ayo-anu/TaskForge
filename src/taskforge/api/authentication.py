@@ -25,6 +25,7 @@ from taskforge.identity.credentials import (
     parse_presented_credential,
 )
 from taskforge.identity.principals import PrincipalProfileService
+from taskforge.persistence.audit import RejectedAuditUnitOfWork
 from taskforge.persistence.authentication import (
     SQLAlchemyAPICredentialRepository,
     SQLAlchemyWorkerCredentialRepository,
@@ -142,17 +143,21 @@ def build_authentication_runtime(
         workflow_service=WorkflowService(
             SQLAlchemyWorkflowRepository(sessions),
             task_type_registry,
+            RejectedAuditUnitOfWork(sessions),
         ),
         workflow_run_service=WorkflowRunService(
-            SQLAlchemyWorkflowRunRepository(sessions)
+            SQLAlchemyWorkflowRunRepository(sessions),
+            RejectedAuditUnitOfWork(sessions),
         ),
         task_type_registry=task_type_registry,
         worker_registration_service=WorkerRegistrationService(
             SQLAlchemyWorkerRegistrationRepository(sessions),
             task_type_registry,
+            rejected_audit=RejectedAuditUnitOfWork(sessions),
         ),
         worker_heartbeat_service=WorkerHeartbeatService(
-            SQLAlchemyWorkerHeartbeatRepository(sessions)
+            SQLAlchemyWorkerHeartbeatRepository(sessions),
+            RejectedAuditUnitOfWork(sessions),
         ),
         worker_inspection_service=WorkerInspectionService(
             SQLAlchemyWorkerInspectionRepository(sessions),
@@ -164,11 +169,15 @@ def build_authentication_runtime(
         worker_capability_service=WorkerCapabilityService(
             SQLAlchemyWorkerCapabilityRepository(sessions),
             task_type_registry,
+            rejected_audit=RejectedAuditUnitOfWork(sessions),
         ),
         task_claim_inspection_service=TaskClaimInspectionService(
             SQLAlchemyTaskClaimInspectionRepository(sessions)
         ),
-        dead_letter_service=DeadLetterService(SQLAlchemyDeadLetterRepository(sessions)),
+        dead_letter_service=DeadLetterService(
+            SQLAlchemyDeadLetterRepository(sessions),
+            RejectedAuditUnitOfWork(sessions),
+        ),
         workflow_run_execution_event_repository=(
             SQLAlchemyWorkflowRunExecutionEventRepository(sessions)
         ),

@@ -252,6 +252,7 @@ async def start_workflow_run(
                 requested_by_principal_id=context.principal_id,
                 selection=selection,
                 input_snapshot=input_snapshot,
+                correlation_id=cast(UUID, request.state.request_id),
             )
         else:
             created = await service.create_idempotent_run(
@@ -261,6 +262,7 @@ async def start_workflow_run(
                 selection=selection,
                 input_snapshot=input_snapshot,
                 idempotency_key=idempotency_key,
+                correlation_id=cast(UUID, request.state.request_id),
             )
     except InvalidWorkflowRunInput as error:
         return _input_validation_error(request, error)
@@ -404,6 +406,7 @@ async def cancel_workflow_run(
             requested_by_principal_id=context.principal_id,
             idempotency_key=idempotency_key,
             reason=body.reason,
+            correlation_id=cast(UUID, request.state.request_id),
         )
     except InvalidWorkflowRunCancellationIdempotencyKey:
         return _cancellation_idempotency_key_validation_error(request)

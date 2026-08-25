@@ -133,7 +133,9 @@ class WorkflowServiceStub:
         self.version_get_calls: list[tuple[UUID, int, UUID]] = []
         self.list_calls: list[tuple[UUID, int, WorkflowPageCursor | None]] = []
 
-    async def create(self, workflow: WorkflowDraft) -> StoredWorkflowDraft:
+    async def create(
+        self, workflow: WorkflowDraft, *, correlation_id: UUID | None = None
+    ) -> StoredWorkflowDraft:
         if self.create_error:
             raise self.create_error
         self.created.append(workflow)
@@ -165,7 +167,11 @@ class WorkflowServiceStub:
         return self.page
 
     async def publish(
-        self, workflow_id: UUID, *, owner_principal_id: UUID
+        self,
+        workflow_id: UUID,
+        *,
+        owner_principal_id: UUID,
+        correlation_id: UUID | None = None,
     ) -> PublishedWorkflowVersion:
         self.publish_calls.append((workflow_id, owner_principal_id))
         if self.publish_error:

@@ -62,6 +62,14 @@ def check_texts(table: Table) -> set[str]:
     }
 
 
+def check_text_by_name(table: Table, name: str) -> str:
+    return next(
+        str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint) and constraint.name == name
+    )
+
+
 def test_shared_metadata_registers_run_dispatch_and_claim_foundation_tables() -> None:
     assert {
         "workflow_runs",
@@ -78,7 +86,7 @@ def test_shared_metadata_registers_run_dispatch_and_claim_foundation_tables() ->
         "workflow_run_execution_events",
         "workflow_run_replays",
     } <= set(metadata.tables)
-    assert not any("audit" in table_name for table_name in metadata.tables)
+    assert "audit_records" in metadata.tables
 
 
 def test_run_statuses_use_native_enums_without_database_defaults() -> None:
@@ -277,6 +285,7 @@ def test_cancellation_request_is_one_immutable_intention_per_run() -> None:
         "idempotency_key_digest",
         "request_fingerprint",
         "reason",
+        "correlation_id",
         "requested_at",
     )
     assert foreign_key_shapes(workflow_run_cancellation_requests) == {
@@ -302,6 +311,8 @@ def test_retry_events_use_task_scoped_attempt_foreign_keys_and_server_time() -> 
         "id",
         "task_run_id",
         "event_type",
+        "actor_component",
+        "correlation_id",
         "failed_attempt_number",
         "retry_attempt_number",
         "next_eligible_at",
@@ -330,6 +341,23 @@ def test_retry_events_use_task_scoped_attempt_foreign_keys_and_server_time() -> 
         "uq_task_retry_events_not_scheduled_attempt",
         "ix_task_retry_events_task_run_id_occurred_at_id",
     }
+
+
+def test_result_and_retry_actor_component_constraints_match_migration_contract() -> (
+    None
+):
+    assert check_text_by_name(
+        task_result_events, "ck_task_result_events_actor_component_valid"
+    ) == (
+        "actor_component IS NULL OR actor_component IN "
+        "('expired_claim_recovery','cancellation_recovery')"
+    )
+    assert check_text_by_name(
+        task_retry_events, "ck_task_retry_events_actor_component_valid"
+    ) == (
+        "actor_component IS NOT NULL AND actor_component IN "
+        "('retry_transition','retry_dispatch','expired_claim_recovery')"
+    )
 
 
 def test_every_new_constraint_and_index_has_a_deterministic_name() -> None:

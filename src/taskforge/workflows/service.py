@@ -4,11 +4,20 @@ from __future__ import annotations
 
 from uuid import UUID, uuid4
 
+from taskforge.audit.domain import (
+    AuditActor,
+    AuditActorKind,
+    AuditOutcome,
+    AuditRecord,
+    AuditRejected,
+)
+from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.workflows.dag_validation import DAGEdge, validate_dag
 from taskforge.workflows.domain import (
     PublishedWorkflowVersion,
     WorkflowAvailabilityIntent,
     WorkflowAvailabilityResult,
+    WorkflowAvailabilityTransitionRejected,
     WorkflowDraft,
     WorkflowVersionSnapshot,
     availability_requires_published_version,
@@ -61,16 +70,30 @@ class InvalidWorkflowListQuery(ValueError):
     """A workflow list request is not valid."""
 
 
+_WORKFLOW_AUDIT_REASONS: dict[type[Exception], str] = {
+    WorkflowValidationError: "workflow_invalid",
+    WorkflowNotFound: "workflow_not_visible",
+    WorkflowOwnerRecordNotFound: "owner_not_found",
+    WorkflowOwnerRecordDisabled: "owner_disabled",
+    WorkflowRecordConflict: "persistence_conflict",
+    WorkflowAvailabilityTransitionRejected: "availability_transition_rejected",
+}
+
+
 class WorkflowService:
     def __init__(
         self,
         repository: WorkflowRepository,
         task_types: TaskTypeRegistry,
+        rejected_audit: RejectedAuditRecorder | None = None,
     ) -> None:
         self._repository = repository
         self._task_types = task_types
+        self._rejected_audit = rejected_audit
 
-    async def create(self, workflow: WorkflowDraft) -> StoredWorkflowDraft:
+    async def create(
+        self, workflow: WorkflowDraft, *, correlation_id: UUID | None = None
+    ) -> StoredWorkflowDraft:
         graph_result = validate_dag(
             tuple(step.identifier for step in workflow.steps),
             tuple(
@@ -82,20 +105,69 @@ class WorkflowService:
             ),
         )
         if not graph_result.is_valid:
-            raise WorkflowValidationError.from_graph(graph_result)
-        dependencies = _resolve_dependencies(workflow)
+            error = WorkflowValidationError.from_graph(graph_result)
+            await self._audit_rejection(
+                error,
+                action="workflow.create",
+                workflow_id=workflow.id,
+                principal_id=workflow.owner_principal_id,
+                correlation_id=correlation_id,
+                provenance={
+                    "step_count": len(workflow.steps),
+                    "dependency_count": len(workflow.dependencies),
+                },
+            )
+            raise error
+        try:
+            dependencies = _resolve_dependencies(workflow)
+        except WorkflowValidationError as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.create",
+                workflow_id=workflow.id,
+                principal_id=workflow.owner_principal_id,
+                correlation_id=correlation_id,
+                provenance={
+                    "step_count": len(workflow.steps),
+                    "dependency_count": len(workflow.dependencies),
+                },
+            )
+            raise
         try:
             async with self._repository.transaction() as transaction:
                 await transaction.require_enabled_owner(workflow.owner_principal_id)
-                timestamps = await transaction.insert_definition(workflow)
+                timestamps = await transaction.insert_definition(
+                    workflow, str(correlation_id) if correlation_id else None
+                )
                 await transaction.insert_steps(workflow.id, workflow.steps)
                 await transaction.insert_dependencies(workflow.id, dependencies)
                 await transaction.commit()
         except WorkflowOwnerRecordNotFound as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.create",
+                workflow_id=workflow.id,
+                principal_id=workflow.owner_principal_id,
+                correlation_id=correlation_id,
+            )
             raise WorkflowOwnerNotFound from error
         except WorkflowOwnerRecordDisabled as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.create",
+                workflow_id=workflow.id,
+                principal_id=workflow.owner_principal_id,
+                correlation_id=correlation_id,
+            )
             raise WorkflowOwnerDisabled from error
         except WorkflowRecordConflict as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.create",
+                workflow_id=workflow.id,
+                principal_id=workflow.owner_principal_id,
+                correlation_id=correlation_id,
+            )
             raise WorkflowPersistenceConflict from error
         except WorkflowPersistenceUnavailable as error:
             raise WorkflowServiceUnavailable from error
@@ -127,6 +199,7 @@ class WorkflowService:
         workflow_id: UUID,
         *,
         owner_principal_id: UUID,
+        correlation_id: UUID | None = None,
     ) -> PublishedWorkflowVersion:
         """Revalidate and atomically snapshot one owner-scoped draft."""
         version_id = uuid4()
@@ -148,6 +221,7 @@ class WorkflowService:
                     version_id,
                     version_number,
                     validated,
+                    str(correlation_id) if correlation_id else None,
                 )
                 await transaction.insert_version_steps(
                     version_id,
@@ -167,11 +241,41 @@ class WorkflowService:
                 )
                 await transaction.commit()
         except WorkflowOwnerRecordNotFound as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.publish",
+                workflow_id=workflow_id,
+                principal_id=owner_principal_id,
+                correlation_id=correlation_id,
+            )
             raise WorkflowOwnerNotFound from error
         except WorkflowOwnerRecordDisabled as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.publish",
+                workflow_id=workflow_id,
+                principal_id=owner_principal_id,
+                correlation_id=correlation_id,
+            )
             raise WorkflowOwnerDisabled from error
         except WorkflowRecordConflict as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.publish",
+                workflow_id=workflow_id,
+                principal_id=owner_principal_id,
+                correlation_id=correlation_id,
+            )
             raise WorkflowPersistenceConflict from error
+        except (WorkflowNotFound, WorkflowValidationError) as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.publish",
+                workflow_id=workflow_id,
+                principal_id=owner_principal_id,
+                correlation_id=correlation_id,
+            )
+            raise
         except WorkflowPersistenceUnavailable as error:
             raise WorkflowServiceUnavailable from error
         return PublishedWorkflowVersion(
@@ -187,6 +291,7 @@ class WorkflowService:
         *,
         owner_principal_id: UUID,
         intent: WorkflowAvailabilityIntent,
+        correlation_id: UUID | None = None,
     ) -> WorkflowAvailabilityResult:
         """Apply one owner-scoped availability change transactionally."""
         try:
@@ -214,17 +319,82 @@ class WorkflowService:
                     has_published_version=has_published_version,
                 )
                 if result.changed:
-                    await transaction.update_availability(workflow_id, result.status)
+                    await transaction.update_availability(
+                        workflow_id,
+                        result.status,
+                        str(correlation_id) if correlation_id else None,
+                    )
                 await transaction.commit()
         except WorkflowOwnerRecordNotFound as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.availability_change",
+                workflow_id=workflow_id,
+                principal_id=owner_principal_id,
+                correlation_id=correlation_id,
+            )
             raise WorkflowOwnerNotFound from error
         except WorkflowOwnerRecordDisabled as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.availability_change",
+                workflow_id=workflow_id,
+                principal_id=owner_principal_id,
+                correlation_id=correlation_id,
+            )
             raise WorkflowOwnerDisabled from error
         except WorkflowRecordConflict as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.availability_change",
+                workflow_id=workflow_id,
+                principal_id=owner_principal_id,
+                correlation_id=correlation_id,
+            )
             raise WorkflowPersistenceConflict from error
+        except (WorkflowNotFound, WorkflowAvailabilityTransitionRejected) as error:
+            await self._audit_rejection(
+                error,
+                action="workflow.availability_change",
+                workflow_id=workflow_id,
+                principal_id=owner_principal_id,
+                correlation_id=correlation_id,
+            )
+            raise
         except WorkflowPersistenceUnavailable as error:
             raise WorkflowServiceUnavailable from error
         return result
+
+    async def _audit_rejection(
+        self,
+        error: Exception,
+        *,
+        action: str,
+        workflow_id: UUID,
+        principal_id: UUID,
+        correlation_id: UUID | None,
+        provenance: dict[str, object] | None = None,
+    ) -> None:
+        if self._rejected_audit is None:
+            return
+        try:
+            await self._rejected_audit.record(
+                AuditRecord(
+                    uuid4(),
+                    AuditActor(
+                        AuditActorKind.API_PRINCIPAL, api_principal_id=principal_id
+                    ),
+                    action,
+                    AuditOutcome.REJECTED,
+                    "workflow",
+                    workflow_id,
+                    str(correlation_id) if correlation_id else None,
+                    provenance or {},
+                    _WORKFLOW_AUDIT_REASONS[type(error)],
+                )
+            )
+        except AuditRejected as audit_error:
+            raise WorkflowServiceUnavailable from audit_error
 
     async def list(
         self,

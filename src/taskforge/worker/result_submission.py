@@ -7,11 +7,19 @@ import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
+from taskforge.audit.domain import (
+    AuditActor,
+    AuditActorKind,
+    AuditOutcome,
+    AuditRecord,
+    AuditRejected,
+)
 from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import TaskClaimResultAuthority
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.worker.result_persistence_ports import (
     PersistableTaskResult,
     PersistedTaskResultOutcome,
@@ -68,6 +76,14 @@ class TaskResultInvariantError(Exception): ...
 class TaskResultServiceUnavailable(Exception): ...
 
 
+_RESULT_AUDIT_REASONS: dict[type[Exception], str] = {
+    TaskResultAuthorityRejected: "worker_authority_rejected",
+    TaskResultNotFound: "result_target_not_found",
+    TaskResultInvalidState: "invalid_task_state",
+    TaskResultInvalidOutput: "result_invalid_output",
+}
+
+
 @dataclass(frozen=True, repr=False)
 class TaskResultSubmissionRequest:
     dispatch_id: UUID
@@ -76,10 +92,16 @@ class TaskResultSubmissionRequest:
     claim_generation: int
     result_authority: TaskClaimResultAuthority
     result: TaskExecutionResult
+    correlation_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.claim_generation) is not int or self.claim_generation <= 0:
             raise ValueError("claim generation must be positive")
+        if self.correlation_id is not None and not (
+            1 <= len(self.correlation_id) <= 128
+            and all(32 <= ord(char) <= 126 for char in self.correlation_id)
+        ):
+            raise ValueError("result correlation ID is invalid")
 
     def __repr__(self) -> str:
         return (
@@ -102,9 +124,11 @@ class TaskResultSubmissionService:
         self,
         repository: TaskResultRepository,
         authority_issuer: TaskClaimResultAuthorityIssuer,
+        rejected_audit: RejectedAuditRecorder | None = None,
     ) -> None:
         self._repository = repository
         self._authority_issuer = authority_issuer
+        self._rejected_audit = rejected_audit
 
     async def submit_result(
         self,
@@ -119,18 +143,40 @@ class TaskResultSubmissionService:
             task_attempt_id=request.task_attempt_id,
             generation=request.claim_generation,
         ):
-            raise TaskResultAuthorityRejected
-        persistable = prepare_task_result(request)
+            error = TaskResultAuthorityRejected()
+            await self._audit_rejection(
+                authenticated_worker, worker_session_id, request, error
+            )
+            raise error
+        try:
+            persistable = prepare_task_result(request)
+        except TaskResultInvalidOutput as error:
+            await self._audit_rejection(
+                authenticated_worker, worker_session_id, request, error
+            )
+            raise
         try:
             persisted = await self._repository.submit_result(
                 authenticated_worker, worker_session_id, persistable
             )
         except TaskResultPersistenceNotFound as error:
-            raise TaskResultNotFound from error
+            rejection: Exception = TaskResultNotFound()
+            await self._audit_rejection(
+                authenticated_worker, worker_session_id, request, rejection
+            )
+            raise rejection from error
         except TaskResultPersistenceInvalidState as error:
-            raise TaskResultInvalidState from error
+            rejection = TaskResultInvalidState()
+            await self._audit_rejection(
+                authenticated_worker, worker_session_id, request, rejection
+            )
+            raise rejection from error
         except TaskResultPersistenceAuthorityRejected as error:
-            raise TaskResultAuthorityRejected from error
+            rejection = TaskResultAuthorityRejected()
+            await self._audit_rejection(
+                authenticated_worker, worker_session_id, request, rejection
+            )
+            raise rejection from error
         except TaskResultPersistenceInvariantViolation as error:
             raise TaskResultInvariantError from error
         except TaskResultPersistenceUnavailable as error:
@@ -143,6 +189,36 @@ class TaskResultSubmissionService:
             TaskResultSubmissionOutcome(persisted.outcome.value),
             persisted.task_attempt_id,
         )
+
+    async def _audit_rejection(
+        self,
+        worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        request: TaskResultSubmissionRequest,
+        error: Exception,
+    ) -> None:
+        if self._rejected_audit is None:
+            return
+        try:
+            await self._rejected_audit.record(
+                AuditRecord(
+                    uuid4(),
+                    AuditActor(
+                        AuditActorKind.WORKER,
+                        worker_identity_id=worker.worker_identity_id,
+                        worker_session_id=worker_session_id,
+                    ),
+                    "task_result.submit",
+                    AuditOutcome.REJECTED,
+                    "task_attempt",
+                    request.task_attempt_id,
+                    request.correlation_id,
+                    {"claim_generation": request.claim_generation},
+                    _RESULT_AUDIT_REASONS[type(error)],
+                )
+            )
+        except AuditRejected as audit_error:
+            raise TaskResultServiceUnavailable from audit_error
 
 
 def prepare_task_result(
@@ -168,6 +244,7 @@ def prepare_task_result(
         request.result.failure_kind,
         output,
         fingerprint,
+        request.correlation_id,
     )
 
 

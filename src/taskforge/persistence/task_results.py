@@ -186,6 +186,7 @@ class SQLAlchemyTaskResultRepository:
                             raise TaskResultPersistenceInvariantViolation
                         await _append_event(
                             session,
+                            authenticated_worker.worker_identity_id,
                             worker_session_id,
                             result,
                             "result_stale_rejected",
@@ -197,6 +198,7 @@ class SQLAlchemyTaskResultRepository:
                     if accepted.claim_generation != result.claim_generation:
                         await _append_event(
                             session,
+                            authenticated_worker.worker_identity_id,
                             worker_session_id,
                             result,
                             "result_stale_rejected",
@@ -211,6 +213,7 @@ class SQLAlchemyTaskResultRepository:
                     )
                     await _append_event(
                         session,
+                        authenticated_worker.worker_identity_id,
                         worker_session_id,
                         result,
                         (
@@ -251,6 +254,7 @@ class SQLAlchemyTaskResultRepository:
                 if stale:
                     await _append_event(
                         session,
+                        authenticated_worker.worker_identity_id,
                         worker_session_id,
                         result,
                         "result_stale_rejected",
@@ -335,7 +339,11 @@ class SQLAlchemyTaskResultRepository:
                 if terminated is None:
                     raise TaskResultPersistenceInvariantViolation
                 await _append_event(
-                    session, worker_session_id, result, "result_accepted"
+                    session,
+                    authenticated_worker.worker_identity_id,
+                    worker_session_id,
+                    result,
+                    "result_accepted",
                 )
                 if result.result_kind is TaskExecutionResultKind.PERMANENT_FAILURE:
                     try:
@@ -416,6 +424,7 @@ def _target_task_status(
 
 async def _append_event(
     session: AsyncSession,
+    worker_identity_id: UUID,
     worker_session_id: UUID,
     result: PersistableTaskResult,
     event_type: str,
@@ -426,6 +435,8 @@ async def _append_event(
             task_attempt_id=result.task_attempt_id,
             claim_generation=result.claim_generation,
             worker_session_id=worker_session_id,
+            worker_identity_id=worker_identity_id,
+            correlation_id=result.correlation_id,
             dispatch_id=result.dispatch_id,
             event_type=event_type,
             result_kind=result.result_kind.value,

@@ -789,6 +789,7 @@ class WorkflowRunCancellationCommand:
     requested_by_principal_id: UUID
     reason: str | None
     idempotency: WorkflowRunCancellationIdempotency
+    correlation_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -998,6 +999,7 @@ def create_workflow_run_cancellation_command(
     *,
     idempotency_key: object,
     reason: object,
+    correlation_id: UUID | None = None,
 ) -> WorkflowRunCancellationCommand:
     """Normalize and fingerprint one cancellation command before persistence."""
     if (
@@ -1041,6 +1043,7 @@ def create_workflow_run_cancellation_command(
                 b"taskforge:workflow-run-cancellation-request:v1\0" + encoded
             ).hexdigest(),
         ),
+        correlation_id,
     )
 
 

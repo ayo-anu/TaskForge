@@ -7,9 +7,11 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     String,
     Table,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -36,6 +38,9 @@ worker_sessions = Table(
     CheckConstraint(
         "ended_at IS NULL OR ended_at >= registered_at",
         name="ended_not_before_registration",
+    ),
+    UniqueConstraint(
+        "id", "worker_identity_id", name="uq_worker_sessions_id_worker_identity_id"
     ),
 )
 Index(
@@ -125,5 +130,15 @@ worker_heartbeats = Table(
         server_default=text("statement_timestamp()"),
     ),
     Column("accepting_work", Boolean, nullable=False),
+    Column("worker_identity_id", UUID(as_uuid=True), nullable=True),
+    Column("correlation_id", String(128), nullable=True),
+    ForeignKeyConstraint(
+        ("worker_session_id", "worker_identity_id"),
+        ("worker_sessions.id", "worker_sessions.worker_identity_id"),
+        name="fk_worker_heartbeats_worker_session_identity",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
     CheckConstraint("sequence > 0", name="sequence_positive"),
+    CheckConstraint("worker_identity_id IS NOT NULL", name="actor_attribution"),
 )

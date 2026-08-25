@@ -199,6 +199,7 @@ workflow_run_cancellation_requests = Table(
     Column("idempotency_key_digest", String(64), nullable=False),
     Column("request_fingerprint", String(64), nullable=False),
     Column("reason", Text, nullable=True),
+    Column("correlation_id", UUID(as_uuid=True), nullable=True),
     Column(
         "requested_at",
         DateTime(timezone=True),
@@ -537,6 +538,9 @@ task_claim_events = Table(
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("task_attempt_id", UUID(as_uuid=True), nullable=False),
     Column("generation", BigInteger, nullable=False),
+    Column("worker_identity_id", UUID(as_uuid=True), nullable=True),
+    Column("worker_session_id", UUID(as_uuid=True), nullable=True),
+    Column("correlation_id", String(128), nullable=True),
     Column("event_type", String(32), nullable=False),
     Column("occurred_at", DateTime(timezone=True), nullable=False),
     Column("previous_lease_expires_at", DateTime(timezone=True), nullable=True),
@@ -544,6 +548,10 @@ task_claim_events = Table(
     CheckConstraint(
         "event_type IN ('claim_acquired', 'lease_renewed')",
         name="event_type_valid",
+    ),
+    CheckConstraint(
+        "worker_identity_id IS NOT NULL AND worker_session_id IS NOT NULL",
+        name="actor_attribution",
     ),
     CheckConstraint(
         "(event_type = 'claim_acquired' "
@@ -561,6 +569,13 @@ task_claim_events = Table(
             "task_attempt_claims.generation",
         ),
         name="fk_task_claim_events_claim_generation",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ("worker_session_id", "worker_identity_id"),
+        ("worker_sessions.id", "worker_sessions.worker_identity_id"),
+        name="fk_task_claim_events_worker_session_identity",
         onupdate="RESTRICT",
         ondelete="RESTRICT",
     ),
@@ -583,6 +598,9 @@ task_result_events = Table(
         ),
         nullable=False,
     ),
+    Column("worker_identity_id", UUID(as_uuid=True), nullable=True),
+    Column("actor_component", String(32), nullable=True),
+    Column("correlation_id", String(128), nullable=True),
     Column(
         "dispatch_id",
         UUID(as_uuid=True),
@@ -613,6 +631,29 @@ task_result_events = Table(
         name="fk_task_result_events_claim_generation",
         onupdate="RESTRICT",
         ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ("worker_session_id", "worker_identity_id"),
+        ("worker_sessions.id", "worker_sessions.worker_identity_id"),
+        name="fk_task_result_events_worker_session_identity",
+        onupdate="RESTRICT",
+        ondelete="RESTRICT",
+    ),
+    CheckConstraint(
+        "(event_type IN ('result_accepted','result_replayed',"
+        "'result_conflict_rejected','result_stale_rejected') AND "
+        "worker_identity_id IS NOT NULL AND actor_component IS NULL) OR "
+        "(event_type='result_recovered' AND worker_identity_id IS NULL AND "
+        "((result_kind='retryable_failure' AND failure_kind='claim_expired' AND "
+        "actor_component='expired_claim_recovery') OR "
+        "(result_kind='cancellation' AND failure_kind IS NULL AND "
+        "actor_component='cancellation_recovery')))",
+        name="actor_contract",
+    ),
+    CheckConstraint(
+        "actor_component IS NULL OR actor_component IN "
+        "('expired_claim_recovery','cancellation_recovery')",
+        name="actor_component_valid",
     ),
     CheckConstraint("claim_generation > 0", name="claim_generation_positive"),
     CheckConstraint(
@@ -647,6 +688,8 @@ task_retry_events = Table(
     Column("id", UUID(as_uuid=True), primary_key=True),
     Column("task_run_id", UUID(as_uuid=True), nullable=False),
     Column("event_type", String(32), nullable=False),
+    Column("actor_component", String(32), nullable=True),
+    Column("correlation_id", String(128), nullable=True),
     Column("failed_attempt_number", Integer, nullable=True),
     Column("retry_attempt_number", Integer, nullable=True),
     Column("next_eligible_at", DateTime(timezone=True), nullable=True),
@@ -681,6 +724,11 @@ task_retry_events = Table(
     CheckConstraint(
         "event_type IN ('retry_scheduled', 'retry_dispatched', 'retry_not_scheduled')",
         name="event_type_valid",
+    ),
+    CheckConstraint(
+        "actor_component IS NOT NULL AND actor_component IN "
+        "('retry_transition','retry_dispatch','expired_claim_recovery')",
+        name="actor_component_valid",
     ),
     CheckConstraint(
         "(event_type = 'retry_scheduled' AND failed_attempt_number IS NOT NULL "

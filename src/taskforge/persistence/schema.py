@@ -1,5 +1,6 @@
 """Register every relational schema with Taskforge's shared metadata."""
 
+from taskforge.audit import schema as audit_schema
 from taskforge.dead_letters import schema as dead_letter_schema
 from taskforge.identity import schema as identity_schema
 from taskforge.persistence.metadata import metadata
@@ -11,6 +12,7 @@ __all__ = ["metadata"]
 
 # These imports intentionally register their tables with the shared metadata.
 assert dead_letter_schema.dead_letter_items is not None
+assert audit_schema.audit_records is not None
 assert identity_schema.api_principals is not None
 assert run_schema.workflow_runs is not None
 assert worker_schema.worker_sessions is not None

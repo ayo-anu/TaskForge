@@ -297,6 +297,7 @@ class SQLAlchemyRetryTransitionTransaction:
                     id=uuid4(),
                     task_run_id=task_run_id,
                     event_type=event_type.value,
+                    actor_component="retry_transition",
                     failed_attempt_number=failed_attempt_number,
                     retry_attempt_number=retry_attempt_number,
                     next_eligible_at=next_eligible_at,
@@ -707,6 +708,8 @@ class SQLAlchemyDueRetryDispatchTransaction:
                     id=uuid4(),
                     task_run_id=prepared.task_run_id,
                     event_type=RetryEventType.RETRY_DISPATCHED.value,
+                    actor_component="retry_dispatch",
+                    correlation_id=payload.get("correlation_id"),
                     retry_attempt_number=prepared.attempt_number,
                 )
             )

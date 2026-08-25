@@ -129,7 +129,7 @@ class WorkflowTransaction(Protocol):
     async def require_enabled_owner(self, owner_principal_id: UUID) -> None: ...
 
     async def insert_definition(
-        self, workflow: WorkflowDraft
+        self, workflow: WorkflowDraft, correlation_id: str | None = None
     ) -> WorkflowTimestamps: ...
 
     async def insert_steps(
@@ -156,6 +156,7 @@ class WorkflowTransaction(Protocol):
         self,
         workflow_id: UUID,
         status: WorkflowDefinitionStatus,
+        correlation_id: str | None = None,
     ) -> None: ...
 
     async def lock_draft_for_publication(
@@ -173,6 +174,7 @@ class WorkflowTransaction(Protocol):
         version_id: UUID,
         version_number: int,
         workflow: WorkflowDraft,
+        correlation_id: str | None = None,
     ) -> datetime: ...
 
     async def insert_version_steps(

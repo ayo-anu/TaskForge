@@ -1,7 +1,14 @@
 """Application service for atomic task claim acquisition."""
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
+from taskforge.audit.domain import (
+    AuditActor,
+    AuditActorKind,
+    AuditOutcome,
+    AuditRecord,
+    AuditRejected,
+)
 from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import (
     InspectedTaskClaim,
@@ -25,6 +32,10 @@ from taskforge.claims.persistence_ports import (
     TaskClaimInvariantViolation,
     TaskClaimNotEligible,
     TaskClaimPersistenceUnavailable,
+    TaskClaimRenewalExpired,
+    TaskClaimRenewalRecovered,
+    TaskClaimRenewalStale,
+    TaskClaimRenewalTaskInactive,
     TaskClaimRepository,
     TaskClaimSessionInactive,
     TaskClaimSessionUnavailable,
@@ -33,6 +44,7 @@ from taskforge.claims.persistence_ports import (
 from taskforge.dispatch.envelope import DispatchEnvelope
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.authorization import OwnerFilter
+from taskforge.persistence.audit import RejectedAuditRecorder
 
 _ACQUISITION_REJECTION_REASONS: dict[type[Exception], TaskClaimRejectionReason] = {
     TaskClaimDispatchRejected: TaskClaimRejectionReason.INVALID_DISPATCH,
@@ -46,6 +58,13 @@ _ACQUISITION_REJECTION_REASONS: dict[type[Exception], TaskClaimRejectionReason] 
     TaskClaimAlreadyOwned: TaskClaimRejectionReason.ALREADY_AUTHORITATIVE,
 }
 _EXPECTED_ACQUISITION_REJECTIONS = tuple(_ACQUISITION_REJECTION_REASONS)
+_RENEWAL_AUDIT_REASONS: dict[type[Exception], str] = {
+    TaskClaimRenewalExpired: "claim_expired",
+    TaskClaimRenewalRecovered: "claim_recovered",
+    TaskClaimRenewalStale: "stale_claim",
+    TaskClaimRenewalTaskInactive: "task_inactive",
+}
+_EXPECTED_RENEWAL_REJECTIONS = tuple(_RENEWAL_AUDIT_REASONS)
 
 
 class TaskClaimServiceInvariantError(Exception):
@@ -63,12 +82,14 @@ class TaskClaimService:
         authority_issuer: TaskClaimResultAuthorityIssuer,
         *,
         lease_seconds: int,
+        rejected_audit: RejectedAuditRecorder | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("claim lease duration must be positive")
         self._repository = repository
         self._authority_issuer = authority_issuer
         self._lease_seconds = lease_seconds
+        self._rejected_audit = rejected_audit
 
     async def claim_task(
         self,
@@ -84,9 +105,17 @@ class TaskClaimService:
                 lease_seconds=self._lease_seconds,
             )
         except _EXPECTED_ACQUISITION_REJECTIONS as error:
-            raise TaskClaimRejected(
-                _ACQUISITION_REJECTION_REASONS[type(error)]
-            ) from error
+            reason = _ACQUISITION_REJECTION_REASONS[type(error)]
+            await self._audit_rejection(
+                authenticated_worker,
+                worker_session_id,
+                action="task_claim.acquire",
+                reason_code=reason.value,
+                task_attempt_id=dispatch.task_attempt_id,
+                correlation_id=dispatch.correlation_id,
+                provenance={"attempt_number": dispatch.attempt_number},
+            )
+            raise TaskClaimRejected(reason) from error
         except TaskClaimInvariantViolation as error:
             raise TaskClaimServiceInvariantError from error
         except TaskClaimPersistenceUnavailable as error:
@@ -106,11 +135,57 @@ class TaskClaimService:
         authenticated_worker: AuthenticatedWorker,
         request: TaskClaimRenewalRequest,
     ) -> TaskClaimRenewalResult:
-        return await self._repository.renew_claim(
-            authenticated_worker,
-            request,
-            lease_seconds=self._lease_seconds,
-        )
+        try:
+            return await self._repository.renew_claim(
+                authenticated_worker,
+                request,
+                lease_seconds=self._lease_seconds,
+            )
+        except _EXPECTED_RENEWAL_REJECTIONS as error:
+            await self._audit_rejection(
+                authenticated_worker,
+                request.worker_session_id,
+                action="task_claim.renew",
+                reason_code=_RENEWAL_AUDIT_REASONS[type(error)],
+                task_attempt_id=request.task_attempt_id,
+                correlation_id=request.correlation_id,
+                provenance={"claim_generation": request.generation},
+            )
+            raise
+
+    async def _audit_rejection(
+        self,
+        worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        *,
+        action: str,
+        reason_code: str,
+        task_attempt_id: UUID,
+        correlation_id: str | None,
+        provenance: dict[str, object],
+    ) -> None:
+        if self._rejected_audit is None:
+            return
+        try:
+            await self._rejected_audit.record(
+                AuditRecord(
+                    uuid4(),
+                    AuditActor(
+                        AuditActorKind.WORKER,
+                        worker_identity_id=worker.worker_identity_id,
+                        worker_session_id=worker_session_id,
+                    ),
+                    action,
+                    AuditOutcome.REJECTED,
+                    "task_attempt",
+                    task_attempt_id,
+                    correlation_id,
+                    provenance,
+                    reason_code,
+                )
+            )
+        except AuditRejected as error:
+            raise TaskClaimServiceUnavailable from error
 
 
 class TaskClaimInspectionService:

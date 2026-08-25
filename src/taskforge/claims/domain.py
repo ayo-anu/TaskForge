@@ -120,6 +120,7 @@ class TaskClaimRenewalRequest:
     generation: int
     worker_session_id: UUID
     expected_lease_expires_at: datetime
+    correlation_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.generation <= 0:
@@ -128,6 +129,11 @@ class TaskClaimRenewalRequest:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("expected lease expiry must be timezone-aware")
         object.__setattr__(self, "expected_lease_expires_at", value.astimezone(UTC))
+        if self.correlation_id is not None and not (
+            1 <= len(self.correlation_id) <= 128
+            and all(32 <= ord(char) <= 126 for char in self.correlation_id)
+        ):
+            raise ValueError("renewal correlation ID is invalid")
 
 
 @dataclass(frozen=True)

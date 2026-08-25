@@ -180,6 +180,7 @@ class WorkerExecutionConsumer:
                     envelope.task_run_id,
                     envelope.task_attempt_id,
                     issued.claim.generation,
+                    envelope.correlation_id,
                 ),
             )
         except (
@@ -262,6 +263,7 @@ class WorkerExecutionConsumer:
                     issued.claim.generation,
                     issued.result_authority,
                     result,
+                    envelope.correlation_id,
                 ),
             )
         except (

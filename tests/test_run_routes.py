@@ -206,6 +206,7 @@ class RunServiceStub:
         requested_by_principal_id: UUID,
         selection: WorkflowVersionSelection,
         input_snapshot: WorkflowRunInput,
+        correlation_id: UUID | None = None,
     ) -> CreatedWorkflowRun:
         self.calls.append(
             (
@@ -229,6 +230,7 @@ class RunServiceStub:
         selection: WorkflowVersionSelection,
         input_snapshot: WorkflowRunInput,
         idempotency_key: object,
+        correlation_id: UUID | None = None,
     ) -> CreatedWorkflowRun:
         self.calls.append(
             (
@@ -363,6 +365,7 @@ class RunServiceStub:
         requested_by_principal_id: UUID,
         idempotency_key: str | None,
         reason: str | None,
+        correlation_id: UUID | None = None,
     ) -> WorkflowRunCancellationResult:
         self.calls.append(
             (

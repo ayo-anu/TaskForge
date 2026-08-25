@@ -45,7 +45,7 @@ def test_worker_sessions_are_distinct_process_incarnations() -> None:
     assert _check_texts(worker_sessions) == {
         "ended_at IS NULL OR ended_at >= registered_at"
     }
-    assert not any(
+    assert any(
         constraint.__class__.__name__ == "UniqueConstraint"
         for constraint in worker_sessions.constraints
     )
@@ -105,10 +105,21 @@ def test_heartbeat_history_is_compact_and_session_scoped() -> None:
         "sequence",
         "received_at",
         "accepting_work",
+        "worker_identity_id",
+        "correlation_id",
     }
-    assert _check_texts(worker_heartbeats) == {"sequence > 0"}
+    assert _check_texts(worker_heartbeats) == {
+        "sequence > 0",
+        "worker_identity_id IS NOT NULL",
+    }
     assert _foreign_key_shapes(worker_heartbeats) == {
-        (("worker_session_id",), ("worker_sessions.id",), "RESTRICT", "RESTRICT")
+        (("worker_session_id",), ("worker_sessions.id",), "RESTRICT", "RESTRICT"),
+        (
+            ("worker_session_id", "worker_identity_id"),
+            ("worker_sessions.id", "worker_sessions.worker_identity_id"),
+            "RESTRICT",
+            "RESTRICT",
+        ),
     }
     assert worker_heartbeats.indexes == set()
 
