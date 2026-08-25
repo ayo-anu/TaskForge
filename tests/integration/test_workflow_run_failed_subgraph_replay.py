@@ -6,7 +6,7 @@ import asyncio
 import os
 from collections.abc import Callable, Coroutine
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
@@ -206,11 +206,13 @@ async def verify_graph_and_exact_version(database_url: URL) -> None:
                 .where(workflow_definitions.c.id == workflow_id)
                 .values(status="archived")
             )
+        correlation_id = uuid4()
         replay = await service.create_failed_subgraph_replay(
             source_id,
             OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             failed_step_identifiers=("right", "b", "left"),
+            correlation_id=correlation_id,
         )
         assert replay.run.workflow_version_id == version_id
         assert replay.run.workflow_version_id != newer_version_id
@@ -235,7 +237,7 @@ async def verify_graph_and_exact_version(database_url: URL) -> None:
         assert not {row.id for row in source_before}.intersection(
             row.id for row in target
         )
-        assert await execution_counts(sessions, replay.run.id) == (0, 0, 0, 0, 0)
+        assert await execution_counts(sessions, replay.run.id) == (0, 0, 0, 0, 1)
         assert await task_projection(sessions, source_id) == source_before
         async with sessions() as session:
             lineage = (
@@ -245,6 +247,23 @@ async def verify_graph_and_exact_version(database_url: URL) -> None:
                     )
                 )
             ).one()
+            event = (
+                await session.execute(
+                    select(workflow_run_execution_events).where(
+                        workflow_run_execution_events.c.workflow_run_id == replay.run.id
+                    )
+                )
+            ).one()
+            assert event.cursor == 1
+            assert event.task_run_id is None
+            assert event.event_type == "workflow_run.replay_created"
+            assert event.payload == {
+                "source_workflow_run_id": str(lineage.source_workflow_run_id),
+                "replay_mode": lineage.mode,
+                "requested_scope": lineage.requested_scope,
+                "requested_by_principal_id": str(owner_id),
+                "correlation_id": str(correlation_id),
+            }
             source_input = (
                 await session.execute(
                     select(workflow_run_inputs).where(
@@ -298,6 +317,7 @@ async def verify_eligibility_integrity_and_authorization(database_url: URL) -> N
             OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             failed_step_identifiers=("leaf",),
+            correlation_id=uuid4(),
         )
         assert accepted.selected_step_identifiers == ("leaf",)
         with pytest.raises(WorkflowRunNotFound):
@@ -306,12 +326,14 @@ async def verify_eligibility_integrity_and_authorization(database_url: URL) -> N
                 OwnerFilter.only(other_id),
                 requested_by_principal_id=other_id,
                 failed_step_identifiers=("leaf",),
+                correlation_id=uuid4(),
             )
         unrestricted = await service.create_failed_subgraph_replay(
             simple.id,
             OwnerFilter.all_owners(),
             requested_by_principal_id=other_id,
             failed_step_identifiers=("leaf",),
+            correlation_id=uuid4(),
         )
         assert unrestricted.run.requested_by_principal_id == other_id
 
@@ -322,6 +344,7 @@ async def verify_eligibility_integrity_and_authorization(database_url: URL) -> N
                 OwnerFilter.only(owner_id),
                 requested_by_principal_id=owner_id,
                 failed_step_identifiers=("root",),
+                correlation_id=uuid4(),
             )
 
         owner, workflow_id, _ = await seed_failure_graph(sessions)
@@ -337,6 +360,7 @@ async def verify_eligibility_integrity_and_authorization(database_url: URL) -> N
             OwnerFilter.only(owner),
             requested_by_principal_id=owner,
             failed_step_identifiers=("b", "left", "right"),
+            correlation_id=uuid4(),
         )
         assert valid_cancelled.run.task_count == 7
         await set_statuses(sessions, cancelled, independent="cancelled")
@@ -346,6 +370,7 @@ async def verify_eligibility_integrity_and_authorization(database_url: URL) -> N
                 OwnerFilter.only(owner),
                 requested_by_principal_id=owner,
                 failed_step_identifiers=("b", "left", "right"),
+                correlation_id=uuid4(),
             )
 
         for status in (
@@ -370,6 +395,7 @@ async def verify_eligibility_integrity_and_authorization(database_url: URL) -> N
                     OwnerFilter.only(owner_id),
                     requested_by_principal_id=owner_id,
                     failed_step_identifiers=("leaf",),
+                    correlation_id=uuid4(),
                 )
     finally:
         await engine.dispose()
@@ -418,6 +444,7 @@ async def verify_concurrency_and_terminalization(database_url: URL) -> None:
                     OwnerFilter.only(owner_id),
                     requested_by_principal_id=owner_id,
                     failed_step_identifiers=("leaf",),
+                    correlation_id=uuid4(),
                 )
             )
             await asyncio.sleep(0)
@@ -433,6 +460,7 @@ async def verify_concurrency_and_terminalization(database_url: URL) -> None:
                     OwnerFilter.only(owner_id),
                     requested_by_principal_id=owner_id,
                     failed_step_identifiers=("leaf",),
+                    correlation_id=uuid4(),
                 )
                 for _ in range(3)
             )
@@ -484,6 +512,7 @@ async def verify_atomic_rollback(database_url: URL) -> None:
                     OwnerFilter.only(owner_id),
                     requested_by_principal_id=owner_id,
                     failed_step_identifiers=("leaf",),
+                    correlation_id=uuid4(),
                 )
             after = await replay_row_counts(sessions)
             assert after == before

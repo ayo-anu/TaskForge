@@ -130,7 +130,7 @@ async def projection(
 
 async def replay_counts(
     sessions: async_sessionmaker[AsyncSession],
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     async with sessions() as session:
         values = []
         for table in (
@@ -138,10 +138,11 @@ async def replay_counts(
             workflow_run_inputs,
             task_runs,
             workflow_run_replays,
+            workflow_run_execution_events,
         ):
             value = await session.scalar(select(func.count()).select_from(table))
             values.append(int(value or 0))
-    return values[0], values[1], values[2], values[3]
+    return values[0], values[1], values[2], values[3], values[4]
 
 
 async def verify_terminal_sources_and_exact_version(database_url: URL) -> None:
@@ -169,10 +170,12 @@ async def verify_terminal_sources_and_exact_version(database_url: URL) -> None:
             WorkflowRunStatus.FAILED,
             WorkflowRunStatus.CANCELLED,
         ):
+            correlation_id = uuid4()
             replay = await service.create_full_replay(
                 source_ids[status],
                 OwnerFilter.only(owner_id),
                 requested_by_principal_id=owner_id,
+                correlation_id=correlation_id,
             )
             assert replay.run.id != source_ids[status]
             assert replay.run.workflow_version_id == version_one_id
@@ -207,6 +210,35 @@ async def verify_terminal_sources_and_exact_version(database_url: URL) -> None:
                 assert lineage.source_workflow_run_id == source_ids[status]
                 assert lineage.mode == "full"
                 assert lineage.requested_scope == {}
+                event = (
+                    await session.execute(
+                        select(workflow_run_execution_events).where(
+                            workflow_run_execution_events.c.workflow_run_id
+                            == replay.run.id
+                        )
+                    )
+                ).one()
+                assert event.cursor == 1
+                assert event.task_run_id is None
+                assert event.event_type == "workflow_run.replay_created"
+                assert event.payload == {
+                    "source_workflow_run_id": str(lineage.source_workflow_run_id),
+                    "replay_mode": lineage.mode,
+                    "requested_scope": lineage.requested_scope,
+                    "requested_by_principal_id": str(owner_id),
+                    "correlation_id": str(correlation_id),
+                }
+                rendered_payload = str(event.payload)
+                for sensitive in (
+                    "ordinary",
+                    "database_password",
+                    "vault://",
+                    "idempotency",
+                    "fingerprint",
+                    "output",
+                    "failure",
+                ):
+                    assert sensitive not in rendered_payload
         for status in (
             WorkflowRunStatus.PENDING,
             WorkflowRunStatus.RUNNING,
@@ -217,6 +249,7 @@ async def verify_terminal_sources_and_exact_version(database_url: URL) -> None:
                     source_ids[status],
                     OwnerFilter.only(owner_id),
                     requested_by_principal_id=owner_id,
+                    correlation_id=uuid4(),
                 )
     finally:
         await engine.dispose()
@@ -268,12 +301,14 @@ async def verify_preservation_and_owner_visibility(database_url: URL) -> None:
                 source_id,
                 OwnerFilter.only(owner_id),
                 requested_by_principal_id=owner_id,
+                correlation_id=uuid4(),
             )
             targets.append(replay.run.id)
             _, target_input, _, attempts, cancellations, events = await projection(
                 sessions, replay.run.id
             )
-            assert attempts == cancellations == events == 0
+            assert attempts == cancellations == 0
+            assert events == 1
             assert target_input.payload == source_before[source_id][1].payload
             assert (
                 target_input.input_references
@@ -301,11 +336,13 @@ async def verify_preservation_and_owner_visibility(database_url: URL) -> None:
                 failed_source,
                 OwnerFilter.only(other_owner_id),
                 requested_by_principal_id=other_owner_id,
+                correlation_id=uuid4(),
             )
         unrestricted = await service.create_full_replay(
             failed_source,
             OwnerFilter.all_owners(),
             requested_by_principal_id=other_owner_id,
+            correlation_id=uuid4(),
         )
         assert unrestricted.run.requested_by_principal_id == other_owner_id
         assert len(set(targets)) == 2
@@ -328,6 +365,7 @@ async def verify_concurrent_requests(database_url: URL) -> None:
                     source_id,
                     OwnerFilter.only(owner_id),
                     requested_by_principal_id=owner_id,
+                    correlation_id=uuid4(),
                 )
                 for _ in range(3)
             )
@@ -344,6 +382,18 @@ async def verify_concurrent_requests(database_url: URL) -> None:
                     .select_from(workflow_run_replays)
                     .where(
                         workflow_run_replays.c.workflow_run_id.in_(
+                            item.run.id for item in concurrent
+                        )
+                    )
+                )
+                == 3
+            )
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(workflow_run_execution_events)
+                    .where(
+                        workflow_run_execution_events.c.workflow_run_id.in_(
                             item.run.id for item in concurrent
                         )
                     )
@@ -380,6 +430,7 @@ async def verify_terminalization_serialization(database_url: URL) -> None:
                     source_id,
                     OwnerFilter.only(owner_id),
                     requested_by_principal_id=owner_id,
+                    correlation_id=uuid4(),
                 )
             )
             await asyncio.sleep(0)
@@ -423,6 +474,7 @@ async def verify_atomic_rollback(database_url: URL) -> None:
                     source_id,
                     OwnerFilter.only(owner_id),
                     requested_by_principal_id=owner_id,
+                    correlation_id=uuid4(),
                 )
             assert await replay_counts(sessions) == before_failure
         finally:
@@ -433,6 +485,40 @@ async def verify_atomic_rollback(database_url: URL) -> None:
                     )
                 )
                 await session.execute(text("DROP FUNCTION reject_test_full_replay()"))
+        async with sessions.begin() as session:
+            await session.execute(
+                text(
+                    "CREATE FUNCTION reject_test_replay_event() RETURNS trigger "
+                    "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected event'; "
+                    "END; $$"
+                )
+            )
+            await session.execute(
+                text(
+                    "CREATE TRIGGER trg_reject_test_replay_event BEFORE INSERT ON "
+                    "workflow_run_execution_events FOR EACH ROW WHEN "
+                    "(NEW.event_type = 'workflow_run.replay_created') EXECUTE "
+                    "FUNCTION reject_test_replay_event()"
+                )
+            )
+        try:
+            with pytest.raises(WorkflowRunServiceUnavailable):
+                await service.create_full_replay(
+                    source_id,
+                    OwnerFilter.only(owner_id),
+                    requested_by_principal_id=owner_id,
+                    correlation_id=uuid4(),
+                )
+            assert await replay_counts(sessions) == before_failure
+        finally:
+            async with sessions.begin() as session:
+                await session.execute(
+                    text(
+                        "DROP TRIGGER trg_reject_test_replay_event ON "
+                        "workflow_run_execution_events"
+                    )
+                )
+                await session.execute(text("DROP FUNCTION reject_test_replay_event()"))
     finally:
         await engine.dispose()
 

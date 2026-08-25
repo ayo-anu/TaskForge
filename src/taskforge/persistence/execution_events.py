@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, func, insert, literal, select
@@ -15,6 +15,7 @@ from taskforge.runs.domain import (
     InvalidWorkflowRunExecutionEvent,
     NewWorkflowRunExecutionEvent,
     StoredWorkflowRunExecutionEvent,
+    WorkflowReplayMode,
     WorkflowRunExecutionEventResumeState,
 )
 from taskforge.runs.persistence_ports import (
@@ -22,10 +23,42 @@ from taskforge.runs.persistence_ports import (
     WorkflowRunExecutionEventPersistenceUnavailable,
 )
 from taskforge.runs.schema import workflow_run_execution_events, workflow_runs
+from taskforge.workflows.task_types import JSONMapping
 
 MAX_EXECUTION_EVENT_PAGE_SIZE = 1000
 WORKFLOW_RUN_STATUS_CHANGED = "workflow_run.status_changed"
 TASK_RUN_STATUS_CHANGED = "task_run.status_changed"
+WORKFLOW_RUN_REPLAY_CREATED = "workflow_run.replay_created"
+
+
+async def append_workflow_replay_created_execution_event(
+    session: AsyncSession,
+    *,
+    workflow_run_id: UUID,
+    source_workflow_run_id: UUID,
+    mode: WorkflowReplayMode,
+    requested_scope: dict[str, object],
+    requested_by_principal_id: UUID,
+    correlation_id: UUID,
+) -> StoredWorkflowRunExecutionEvent:
+    """Append immutable replay provenance through the caller's transaction."""
+    try:
+        event = NewWorkflowRunExecutionEvent(
+            uuid4(),
+            workflow_run_id,
+            None,
+            WORKFLOW_RUN_REPLAY_CREATED,
+            {
+                "source_workflow_run_id": str(source_workflow_run_id),
+                "replay_mode": mode.value,
+                "requested_scope": cast(JSONMapping, requested_scope),
+                "requested_by_principal_id": str(requested_by_principal_id),
+                "correlation_id": str(correlation_id),
+            },
+        )
+    except InvalidWorkflowRunExecutionEvent as error:
+        raise WorkflowRunExecutionEventInvariantViolation from error
+    return await append_workflow_run_execution_event(session, event)
 
 
 async def append_status_changed_execution_event(

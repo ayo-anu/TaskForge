@@ -527,6 +527,7 @@ class FakeCreationTransaction:
                 NewWorkflowRun,
                 WorkflowRunInput,
                 tuple[NewTaskRun, ...],
+                UUID,
                 WorkflowReplayIdempotency | None,
             ]
             | None
@@ -538,6 +539,7 @@ class FakeCreationTransaction:
                 WorkflowRunInput,
                 tuple[NewTaskRun, ...],
                 dict[str, object],
+                UUID,
                 WorkflowReplayIdempotency | None,
             ]
             | None
@@ -680,6 +682,7 @@ class FakeCreationTransaction:
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        correlation_id: UUID,
         idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         self._record("insert_full_replay")
@@ -688,6 +691,7 @@ class FakeCreationTransaction:
             run,
             input_snapshot,
             task_run_values,
+            correlation_id,
             idempotency,
         )
         now = datetime.now(UTC)
@@ -700,6 +704,7 @@ class FakeCreationTransaction:
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
         requested_scope: dict[str, object],
+        correlation_id: UUID,
         idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         self._record("insert_failed_subgraph_replay")
@@ -709,6 +714,7 @@ class FakeCreationTransaction:
             input_snapshot,
             task_run_values,
             requested_scope,
+            correlation_id,
             idempotency,
         )
         now = datetime.now(UTC)
@@ -886,6 +892,7 @@ def test_failed_subgraph_replay_creates_carried_forward_complete_graph() -> None
             OwnerFilter.only(uuid4()),
             requested_by_principal_id=requester_id,
             failed_step_identifiers=("leaf",),
+            correlation_id=uuid4(),
         )
     )
 
@@ -893,7 +900,9 @@ def test_failed_subgraph_replay_creates_carried_forward_complete_graph() -> None
     assert replay.canonical_failed_step_identifiers == ("leaf",)
     assert replay.selected_step_identifiers == ("leaf",)
     assert transaction.failed_replay_inserted is not None
-    _, run, copied_input, tasks, scope, idempotency = transaction.failed_replay_inserted
+    _, run, copied_input, tasks, scope, _, idempotency = (
+        transaction.failed_replay_inserted
+    )
     assert run.id == replay.run.id != prepared.source_workflow_run_id
     assert copied_input == prepared.input_snapshot
     assert copied_input is not prepared.input_snapshot
@@ -937,6 +946,7 @@ def test_full_replay_creates_fresh_complete_exact_version_graph(
             prepared.source_workflow_run_id,
             OwnerFilter.only(uuid4()),
             requested_by_principal_id=requester_id,
+            correlation_id=uuid4(),
         )
     )
 
@@ -948,7 +958,7 @@ def test_full_replay_creates_fresh_complete_exact_version_graph(
     assert replay.run.workflow_version_id == snapshot.workflow_version_id
     assert replay.run.requested_by_principal_id == requester_id
     assert transaction.replay_inserted is not None
-    _, inserted_run, copied_input, tasks, idempotency = transaction.replay_inserted
+    _, inserted_run, copied_input, tasks, _, idempotency = transaction.replay_inserted
     assert inserted_run.id == replay.run.id
     assert copied_input == prepared.input_snapshot
     assert copied_input is not prepared.input_snapshot
@@ -990,6 +1000,7 @@ def test_full_replay_rejects_nonterminal_source_without_writes(
                 prepared.source_workflow_run_id,
                 OwnerFilter.all_owners(),
                 requested_by_principal_id=uuid4(),
+                correlation_id=uuid4(),
             )
         )
 
@@ -1709,6 +1720,7 @@ def test_first_idempotent_full_replay_inserts_atomic_idempotency_fact() -> None:
             OwnerFilter.all_owners(),
             requested_by_principal_id=requester,
             idempotency_key="replay-key-00001",
+            correlation_id=uuid4(),
         )
     )
 
@@ -1767,6 +1779,7 @@ def test_failed_replay_hit_uses_canonical_scope_without_new_admission(
             requested_by_principal_id=requester,
             failed_step_identifiers=["leaf"],
             idempotency_key="replay-key-00001",
+            correlation_id=uuid4(),
         )
     )
 
@@ -1794,6 +1807,7 @@ def test_failed_replay_invalid_key_precedes_invalid_root_request() -> None:
                 requested_by_principal_id=uuid4(),
                 failed_step_identifiers=[],
                 idempotency_key="short",
+                correlation_id=uuid4(),
             )
         )
 
@@ -1831,6 +1845,7 @@ def test_idempotent_replay_conflict_and_corrupt_lineage_are_distinct() -> None:
                 OwnerFilter.all_owners(),
                 requested_by_principal_id=requester,
                 idempotency_key="replay-key-00001",
+                correlation_id=uuid4(),
             )
         )
 
@@ -1859,6 +1874,7 @@ def test_replay_idempotency_uniqueness_loss_recovers_committed_winner() -> None:
             OwnerFilter.all_owners(),
             requested_by_principal_id=requester,
             idempotency_key="replay-key-00001",
+            correlation_id=uuid4(),
         )
     )
 
@@ -1884,6 +1900,7 @@ def test_replay_idempotency_missing_uniqueness_winner_is_persistence_conflict() 
                 OwnerFilter.all_owners(),
                 requested_by_principal_id=uuid4(),
                 idempotency_key="replay-key-00001",
+                correlation_id=uuid4(),
             )
         )
 
@@ -1903,5 +1920,23 @@ def test_replay_idempotency_corrupt_persisted_lineage_is_invariant_error() -> No
                 OwnerFilter.all_owners(),
                 requested_by_principal_id=uuid4(),
                 idempotency_key="replay-key-00001",
+                correlation_id=uuid4(),
+            )
+        )
+
+
+def test_keyless_replay_event_invariant_failure_is_normalized() -> None:
+    prepared = prepared_full_replay(WorkflowRunStatus.FAILED)
+    transaction = FakeCreationTransaction(prepared)
+    transaction.failure_for = "insert_full_replay"
+    transaction.failure = WorkflowRunReplayPersistenceInvariantViolation()
+
+    with pytest.raises(WorkflowRunReplayInvariantError):
+        asyncio.run(
+            WorkflowRunService(CreationRepository(transaction)).create_full_replay(
+                prepared.source_workflow_run_id,
+                OwnerFilter.all_owners(),
+                requested_by_principal_id=uuid4(),
+                correlation_id=uuid4(),
             )
         )

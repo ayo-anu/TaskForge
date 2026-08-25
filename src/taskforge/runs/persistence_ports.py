@@ -243,6 +243,7 @@ class WorkflowRunCreationTransaction(Protocol):
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        correlation_id: UUID,
         idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps: ...
 
@@ -253,6 +254,7 @@ class WorkflowRunCreationTransaction(Protocol):
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
         requested_scope: dict[str, object],
+        correlation_id: UUID,
         idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps: ...
 

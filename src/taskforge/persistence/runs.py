@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 from collections.abc import Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import TracebackType
 from typing import Any
@@ -29,7 +30,10 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.identity.authorization import OwnerFilter
-from taskforge.persistence.execution_events import append_status_changed_execution_event
+from taskforge.persistence.execution_events import (
+    append_status_changed_execution_event,
+    append_workflow_replay_created_execution_event,
+)
 from taskforge.retries.domain import (
     InspectedRetryEvent,
     InspectedRetryEventPage,
@@ -122,6 +126,15 @@ from taskforge.workflows.schema import (
 
 POSTGRES_UNIQUE_VIOLATION = "23505"
 IDEMPOTENCY_SCOPE_CONSTRAINT = "pk_workflow_run_idempotency"
+
+
+@dataclass(frozen=True)
+class _ReplayProvenance:
+    source_workflow_run_id: UUID
+    mode: WorkflowReplayMode
+    requested_scope: dict[str, object]
+    requested_by_principal_id: UUID
+    correlation_id: UUID
 
 
 class SQLAlchemyWorkflowRunRepository:
@@ -1107,6 +1120,7 @@ class SQLAlchemyWorkflowRunCreationTransaction:
         run: NewWorkflowRun,
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
+        correlation_id: UUID,
         idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         session = self._required_session()
@@ -1118,18 +1132,23 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                 input_snapshot,
                 task_run_values,
             )
-            await session.execute(
-                insert(workflow_run_replays).values(
-                    workflow_run_id=run.id,
-                    source_workflow_run_id=prepared.source_workflow_run_id,
-                    mode="full",
-                    requested_scope={},
-                )
+            provenance = _ReplayProvenance(
+                prepared.source_workflow_run_id,
+                WorkflowReplayMode.FULL,
+                {},
+                run.requested_by_principal_id,
+                correlation_id,
             )
+            await _insert_replay_lineage(session, run.id, provenance)
             if idempotency is not None:
                 await _insert_run_idempotency(
                     session, prepared.creation, run, idempotency
                 )
+            await _append_replay_created_event(session, run.id, provenance)
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise WorkflowRunReplayPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise WorkflowRunPersistenceUnavailable from error
         except IntegrityError as error:
             if _is_idempotency_scope_conflict(error):
                 raise WorkflowRunIdempotencyRecordConflict from error
@@ -1145,6 +1164,7 @@ class SQLAlchemyWorkflowRunCreationTransaction:
         input_snapshot: WorkflowRunInput,
         task_run_values: tuple[NewTaskRun, ...],
         requested_scope: dict[str, object],
+        correlation_id: UUID,
         idempotency: WorkflowReplayIdempotency | None = None,
     ) -> WorkflowRunTimestamps:
         session = self._required_session()
@@ -1156,18 +1176,23 @@ class SQLAlchemyWorkflowRunCreationTransaction:
                 input_snapshot,
                 task_run_values,
             )
-            await session.execute(
-                insert(workflow_run_replays).values(
-                    workflow_run_id=run.id,
-                    source_workflow_run_id=prepared.source_workflow_run_id,
-                    mode="failed_subgraph",
-                    requested_scope=requested_scope,
-                )
+            provenance = _ReplayProvenance(
+                prepared.source_workflow_run_id,
+                WorkflowReplayMode.FAILED_SUBGRAPH,
+                requested_scope,
+                run.requested_by_principal_id,
+                correlation_id,
             )
+            await _insert_replay_lineage(session, run.id, provenance)
             if idempotency is not None:
                 await _insert_run_idempotency(
                     session, prepared.creation, run, idempotency
                 )
+            await _append_replay_created_event(session, run.id, provenance)
+        except WorkflowRunExecutionEventInvariantViolation as error:
+            raise WorkflowRunReplayPersistenceInvariantViolation from error
+        except WorkflowRunExecutionEventPersistenceUnavailable as error:
+            raise WorkflowRunPersistenceUnavailable from error
         except IntegrityError as error:
             if _is_idempotency_scope_conflict(error):
                 raise WorkflowRunIdempotencyRecordConflict from error
@@ -1326,6 +1351,37 @@ async def _insert_run_idempotency(
             request_fingerprint=idempotency.request_fingerprint,
             workflow_run_id=run.id,
         )
+    )
+
+
+async def _insert_replay_lineage(
+    session: AsyncSession,
+    workflow_run_id: UUID,
+    provenance: _ReplayProvenance,
+) -> None:
+    await session.execute(
+        insert(workflow_run_replays).values(
+            workflow_run_id=workflow_run_id,
+            source_workflow_run_id=provenance.source_workflow_run_id,
+            mode=provenance.mode.value,
+            requested_scope=provenance.requested_scope,
+        )
+    )
+
+
+async def _append_replay_created_event(
+    session: AsyncSession,
+    workflow_run_id: UUID,
+    provenance: _ReplayProvenance,
+) -> None:
+    await append_workflow_replay_created_execution_event(
+        session,
+        workflow_run_id=workflow_run_id,
+        source_workflow_run_id=provenance.source_workflow_run_id,
+        mode=provenance.mode,
+        requested_scope=provenance.requested_scope,
+        requested_by_principal_id=provenance.requested_by_principal_id,
+        correlation_id=provenance.correlation_id,
     )
 
 

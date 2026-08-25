@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 from uuid import uuid4
 
+import asyncpg
 import httpx2
 import pytest
 from alembic import command
@@ -26,13 +28,19 @@ from taskforge.identity.schema import (
 from taskforge.persistence.database import build_async_engine
 from taskforge.runs.schema import (
     task_runs,
+    workflow_run_execution_events,
     workflow_run_idempotency,
     workflow_run_inputs,
+    workflow_run_replays,
     workflow_runs,
 )
 from taskforge.workflows.schema import workflow_definitions
 from taskforge.workflows.task_types import TaskTypeDefinition, TaskTypeRegistry
-from tests.integration.postgresql import migration_database_url, temporary_database
+from tests.integration.postgresql import (
+    asyncpg_dsn,
+    migration_database_url,
+    temporary_database,
+)
 from tests.integration.test_authentication_persistence import settings_for
 from tests.integration.test_protected_principal_route import AlwaysReady
 from tests.integration.test_workflow_routes import (
@@ -205,6 +213,60 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
             hidden_tasks = await client.get(
                 f"{keyed.headers['Location']}/tasks", headers=other_headers
             )
+            listener = await asyncpg.connect(asyncpg_dsn(database_url))
+            notifications: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+
+            def notified(
+                connection: asyncpg.Connection[asyncpg.Record],
+                pid: int,
+                channel: str,
+                payload: str,
+            ) -> None:
+                del connection, pid, channel
+                notifications.put_nowait(json.loads(payload))
+
+            await listener.add_listener(
+                "taskforge_workflow_run_execution_events", notified
+            )
+            replay_headers = {
+                **owner_headers,
+                "Idempotency-Key": "workflow-replay-route-0001",
+            }
+            full_replay = await client.post(
+                f"/api/v1/workflow-runs/{keyed.json()['id']}/replay",
+                json={"mode": "full"},
+                headers=replay_headers,
+            )
+            async with asyncio.timeout(5):
+                notification = await notifications.get()
+            assert notification == {"workflow_run_id": full_replay.json()["id"]}
+            full_replay_retry = await client.post(
+                f"/api/v1/workflow-runs/{keyed.json()['id']}/replay",
+                json={"mode": "full"},
+                headers=replay_headers,
+            )
+            replay_conflict = await client.post(
+                f"/api/v1/workflow-runs/{keyed.json()['id']}/replay",
+                json={
+                    "mode": "failed_subgraph",
+                    "failed_step_identifiers": ["root"],
+                },
+                headers=replay_headers,
+            )
+            failed_replay = await client.post(
+                f"/api/v1/workflow-runs/{keyed.json()['id']}/replay",
+                json={
+                    "mode": "failed_subgraph",
+                    "failed_step_identifiers": ["root"],
+                },
+                headers=owner_headers,
+            )
+            hidden_replay = await client.post(
+                f"/api/v1/workflow-runs/{keyed.json()['id']}/replay",
+                json={"mode": "full"},
+                headers=other_headers,
+            )
+            await listener.close()
 
     assert workflow.status_code == 201
     assert keyless.status_code == keyed.status_code == replay.status_code == 201
@@ -224,10 +286,66 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
         "root",
     ]
     assert hidden_run.status_code == hidden_tasks.status_code == 404
+    assert full_replay.status_code == full_replay_retry.status_code == 201
+    assert full_replay.json()["id"] == full_replay_retry.json()["id"]
+    assert full_replay.json()["source_workflow_run_id"] == keyed.json()["id"]
+    assert full_replay.json()["mode"] == "full"
+    assert replay_conflict.status_code == 409
+    assert replay_conflict.json()["error"]["code"] == "idempotency_conflict"
+    assert failed_replay.status_code == 201
+    assert failed_replay.json()["failed_step_identifiers"] == ["root"]
+    assert "selected_step_identifiers" not in failed_replay.json()
+    assert hidden_replay.status_code == 404
 
     verification_engine = build_async_engine(settings)
     try:
         async with verification_engine.connect() as connection:
+            replay_target_id = full_replay.json()["id"]
+            lineage = (
+                await connection.execute(
+                    select(workflow_run_replays).where(
+                        workflow_run_replays.c.workflow_run_id == replay_target_id
+                    )
+                )
+            ).one()
+            events = (
+                await connection.execute(
+                    select(workflow_run_execution_events).where(
+                        workflow_run_execution_events.c.workflow_run_id
+                        == replay_target_id
+                    )
+                )
+            ).all()
+            assert len(events) == 1
+            event = events[0]
+            assert event.cursor == 1
+            assert event.task_run_id is None
+            assert event.event_type == "workflow_run.replay_created"
+            assert event.payload["source_workflow_run_id"] == str(
+                lineage.source_workflow_run_id
+            )
+            assert event.payload["replay_mode"] == lineage.mode
+            assert event.payload["requested_scope"] == lineage.requested_scope
+            assert event.payload["requested_by_principal_id"] == str(owner_id)
+            assert (
+                event.payload["correlation_id"] == full_replay.headers["X-Request-ID"]
+            )
+            cursors = (
+                await connection.execute(
+                    select(
+                        workflow_runs.c.id,
+                        workflow_runs.c.last_execution_event_cursor,
+                    ).where(
+                        workflow_runs.c.id.in_((keyed.json()["id"], replay_target_id))
+                    )
+                )
+            ).all()
+            assert {
+                str(row.id): row.last_execution_event_cursor for row in cursors
+            } == {
+                keyed.json()["id"]: 0,
+                replay_target_id: 1,
+            }
             counts = [
                 int(
                     await connection.scalar(select(func.count()).select_from(table))
@@ -242,7 +360,7 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
             ]
     finally:
         await verification_engine.dispose()
-    assert counts == [2, 2, 4, 1]
+    assert counts == [4, 4, 8, 2]
 
 
 def test_workflow_run_routes_are_atomic_idempotent_and_owner_scoped() -> None:

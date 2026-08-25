@@ -6,7 +6,7 @@ import base64
 import binascii
 import json
 from datetime import UTC, datetime
-from typing import Annotated, Any, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, cast
 from uuid import UUID
 
 from fastapi import (
@@ -32,10 +32,14 @@ from taskforge.retries.domain import (
     RetryNotScheduledReason,
 )
 from taskforge.runs.domain import (
+    CreatedFailedSubgraphWorkflowReplay,
+    CreatedFullWorkflowReplay,
     CreatedWorkflowRun,
     ExplicitWorkflowVersion,
+    FailedSubgraphReplaySelectionInvalid,
     InspectedTaskRun,
     InspectedWorkflowRun,
+    InvalidFailedSubgraphReplayRequest,
     InvalidWorkflowRunCancellationIdempotencyKey,
     InvalidWorkflowRunCancellationReason,
     InvalidWorkflowRunIdempotencyKey,
@@ -43,11 +47,14 @@ from taskforge.runs.domain import (
     LatestWorkflowVersion,
     RunFailureReason,
     TaskRunStatus,
+    WorkflowReplayIdempotencyConflict,
+    WorkflowReplayMode,
     WorkflowRunCancellationCaveat,
     WorkflowRunCancellationIdempotencyConflict,
     WorkflowRunCancellationOutcome,
     WorkflowRunCancellationResult,
     WorkflowRunIdempotencyConflict,
+    WorkflowRunReplayNotEligible,
     WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
     create_workflow_run_input,
@@ -58,6 +65,7 @@ from taskforge.runs.service import (
     WorkflowRunInspectionInvariantError,
     WorkflowRunNotFound,
     WorkflowRunPersistenceConflict,
+    WorkflowRunReplayInvariantError,
     WorkflowRunService,
     WorkflowRunServiceUnavailable,
     WorkflowRunTargetNotFound,
@@ -81,6 +89,25 @@ class CancelWorkflowRunRequest(BaseModel):
     reason: str | None = None
 
 
+class FullWorkflowReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal[WorkflowReplayMode.FULL]
+
+
+class FailedSubgraphWorkflowReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal[WorkflowReplayMode.FAILED_SUBGRAPH]
+    failed_step_identifiers: Annotated[list[str], Field(min_length=1, max_length=256)]
+
+
+WorkflowReplayRequest = Annotated[
+    FullWorkflowReplayRequest | FailedSubgraphWorkflowReplayRequest,
+    Field(discriminator="mode"),
+]
+
+
 class CancelWorkflowRunResponse(BaseModel):
     workflow_run_id: UUID
     outcome: WorkflowRunCancellationOutcome
@@ -98,6 +125,12 @@ class StartedWorkflowRunResponse(BaseModel):
     requested_by_principal_id: UUID
     status: WorkflowRunStatus
     created_at: datetime
+
+
+class WorkflowReplayResponse(StartedWorkflowRunResponse):
+    source_workflow_run_id: UUID
+    mode: WorkflowReplayMode
+    failed_step_identifiers: tuple[str, ...] | None = None
 
 
 class WorkflowRunResponse(StartedWorkflowRunResponse):
@@ -250,6 +283,100 @@ async def start_workflow_run(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
     response.headers["Location"] = f"/api/v1/workflow-runs/{created.id}"
     return _started_run_response(created)
+
+
+@router.post(
+    "/api/v1/workflow-runs/{source_workflow_run_id}/replay",
+    response_model=WorkflowReplayResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=COMMON_RESPONSES,
+)
+async def replay_workflow_run(
+    source_workflow_run_id: UUID,
+    body: WorkflowReplayRequest,
+    request: Request,
+    response: Response,
+    context: Annotated[
+        AuthorizationContext,
+        Depends(require_permission(Permission.OPERATE_WORKFLOW)),
+    ],
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", max_length=128),
+    ] = None,
+) -> WorkflowReplayResponse | Response:
+    service = _runtime(request).workflow_run_service
+    owner_filter = context.owner_filter_for(Permission.OPERATE_WORKFLOW)
+    correlation_id = cast(UUID, request.state.request_id)
+    replay: CreatedFullWorkflowReplay | CreatedFailedSubgraphWorkflowReplay
+    try:
+        if isinstance(body, FullWorkflowReplayRequest):
+            if idempotency_key is None:
+                replay = await service.create_full_replay(
+                    source_workflow_run_id,
+                    owner_filter,
+                    requested_by_principal_id=context.principal_id,
+                    correlation_id=correlation_id,
+                )
+            else:
+                replay = await service.create_idempotent_full_replay(
+                    source_workflow_run_id,
+                    owner_filter,
+                    requested_by_principal_id=context.principal_id,
+                    idempotency_key=idempotency_key,
+                    correlation_id=correlation_id,
+                )
+        elif idempotency_key is None:
+            replay = await service.create_failed_subgraph_replay(
+                source_workflow_run_id,
+                owner_filter,
+                requested_by_principal_id=context.principal_id,
+                failed_step_identifiers=body.failed_step_identifiers,
+                correlation_id=correlation_id,
+            )
+        else:
+            replay = await service.create_idempotent_failed_subgraph_replay(
+                source_workflow_run_id,
+                owner_filter,
+                requested_by_principal_id=context.principal_id,
+                failed_step_identifiers=body.failed_step_identifiers,
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+            )
+    except InvalidWorkflowRunIdempotencyKey:
+        return _idempotency_key_validation_error(request)
+    except InvalidFailedSubgraphReplayRequest:
+        return _failed_subgraph_replay_validation_error(request)
+    except WorkflowRunNotFound as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
+    except WorkflowRunReplayNotEligible:
+        return _replay_conflict_error(
+            request,
+            code="workflow_run_not_replayable",
+            message="The workflow run is not eligible for the requested replay.",
+        )
+    except FailedSubgraphReplaySelectionInvalid:
+        return _replay_conflict_error(
+            request,
+            code="failed_subgraph_replay_invalid",
+            message="The requested failed-task replay is not dependency-safe.",
+        )
+    except WorkflowReplayIdempotencyConflict:
+        return _replay_conflict_error(
+            request,
+            code="idempotency_conflict",
+            message="The idempotency key conflicts with an earlier request.",
+        )
+    except WorkflowRunReplayInvariantError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        ) from error
+    except WorkflowRunPersistenceConflict as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT) from error
+    except WorkflowRunServiceUnavailable as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE) from error
+    response.headers["Location"] = f"/api/v1/workflow-runs/{replay.run.id}"
+    return _workflow_replay_response(replay)
 
 
 @router.post(
@@ -463,6 +590,29 @@ def _started_run_response(run: CreatedWorkflowRun) -> StartedWorkflowRunResponse
     )
 
 
+def _workflow_replay_response(
+    replay: CreatedFullWorkflowReplay | CreatedFailedSubgraphWorkflowReplay,
+) -> WorkflowReplayResponse:
+    run = replay.run
+    failed_step_identifiers = (
+        replay.canonical_failed_step_identifiers
+        if isinstance(replay, CreatedFailedSubgraphWorkflowReplay)
+        else None
+    )
+    return WorkflowReplayResponse(
+        id=run.id,
+        workflow_definition_id=run.workflow_definition_id,
+        workflow_version_id=run.workflow_version_id,
+        version_number=run.version_number,
+        requested_by_principal_id=run.requested_by_principal_id,
+        status=run.status,
+        created_at=run.created_at,
+        source_workflow_run_id=replay.source_workflow_run_id,
+        mode=replay.mode,
+        failed_step_identifiers=failed_step_identifiers,
+    )
+
+
 def _cancellation_response(
     result: WorkflowRunCancellationResult,
 ) -> CancelWorkflowRunResponse:
@@ -647,6 +797,31 @@ def _idempotency_key_validation_error(request: Request) -> Response:
                 message="Idempotency-Key is invalid.",
             ),
         ),
+    )
+
+
+def _failed_subgraph_replay_validation_error(request: Request) -> Response:
+    return error_response(
+        request,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        code="validation_failed",
+        message="The request is invalid.",
+        details=(
+            ErrorDetail(
+                code="invalid_failed_step_identifiers",
+                path=["body", "failed_step_identifiers"],
+                message="Failed step identifiers are invalid.",
+            ),
+        ),
+    )
+
+
+def _replay_conflict_error(request: Request, *, code: str, message: str) -> Response:
+    return error_response(
+        request,
+        status_code=status.HTTP_409_CONFLICT,
+        code=code,
+        message=message,
     )
 
 

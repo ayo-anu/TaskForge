@@ -12,12 +12,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.persistence.execution_events import (
     MAX_EXECUTION_EVENT_PAGE_SIZE,
+    WORKFLOW_RUN_REPLAY_CREATED,
     SQLAlchemyWorkflowRunExecutionEventRepository,
+    append_workflow_replay_created_execution_event,
 )
 from taskforge.runs.domain import (
     InvalidWorkflowRunExecutionEvent,
     NewWorkflowRunExecutionEvent,
     StoredWorkflowRunExecutionEvent,
+    WorkflowReplayMode,
     WorkflowRunExecutionEventResumeState,
 )
 from taskforge.workflows.task_types import JSONMapping
@@ -40,6 +43,63 @@ def test_new_execution_event_validates_and_snapshots_payload() -> None:
         NewWorkflowRunExecutionEvent(
             uuid4(), uuid4(), None, "task_run.status_changed", cast(Any, [])
         )
+
+
+def test_replay_created_event_uses_bounded_redacted_structural_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[NewWorkflowRunExecutionEvent] = []
+    target_id, source_id, principal_id, correlation_id = (
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        uuid4(),
+    )
+
+    async def capture(
+        session: AsyncSession, event: NewWorkflowRunExecutionEvent
+    ) -> StoredWorkflowRunExecutionEvent:
+        del session
+        captured.append(event)
+        return StoredWorkflowRunExecutionEvent(
+            event.id,
+            event.workflow_run_id,
+            1,
+            event.task_run_id,
+            event.event_type,
+            event.payload,
+            datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(
+        "taskforge.persistence.execution_events.append_workflow_run_execution_event",
+        capture,
+    )
+    scope = {"failed_step_identifiers": ["alpha"]}
+    stored = asyncio.run(
+        append_workflow_replay_created_execution_event(
+            cast(AsyncSession, object()),
+            workflow_run_id=target_id,
+            source_workflow_run_id=source_id,
+            mode=WorkflowReplayMode.FAILED_SUBGRAPH,
+            requested_scope=scope,
+            requested_by_principal_id=principal_id,
+            correlation_id=correlation_id,
+        )
+    )
+    scope["secret"] = "must-not-be-copied"
+
+    assert stored.workflow_run_id == target_id
+    assert stored.task_run_id is None
+    assert stored.event_type == WORKFLOW_RUN_REPLAY_CREATED
+    assert captured[0].payload == {
+        "source_workflow_run_id": str(source_id),
+        "replay_mode": "failed_subgraph",
+        "requested_scope": {"failed_step_identifiers": ["alpha"]},
+        "requested_by_principal_id": str(principal_id),
+        "correlation_id": str(correlation_id),
+    }
+    assert "payload=<redacted>" in repr(captured[0])
 
 
 def test_stored_execution_event_requires_cursor_and_server_time_shape() -> None:

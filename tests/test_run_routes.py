@@ -30,21 +30,28 @@ from taskforge.retries.domain import (
 )
 from taskforge.runs.domain import (
     AcceptedWorkflowRunCancellation,
+    CreatedFailedSubgraphWorkflowReplay,
+    CreatedFullWorkflowReplay,
     CreatedWorkflowRun,
     ExplicitWorkflowVersion,
+    FailedSubgraphReplaySelectionInvalid,
     InspectedTaskRun,
     InspectedWorkflowRun,
     InspectedWorkflowRunCancellation,
+    InvalidFailedSubgraphReplayRequest,
     InvalidWorkflowRunCancellationIdempotencyKey,
     InvalidWorkflowRunIdempotencyKey,
     LatestWorkflowVersion,
     TaskRunStatus,
+    WorkflowReplayIdempotencyConflict,
+    WorkflowReplayMode,
     WorkflowRunCancellationCaveat,
     WorkflowRunCancellationIdempotencyConflict,
     WorkflowRunCancellationOutcome,
     WorkflowRunCancellationResult,
     WorkflowRunIdempotencyConflict,
     WorkflowRunInput,
+    WorkflowRunReplayNotEligible,
     WorkflowRunStatus,
     WorkflowRunTargetUnavailable,
     WorkflowVersionSelection,
@@ -54,6 +61,7 @@ from taskforge.runs.service import (
     WorkflowRunCancellationInvariantError,
     WorkflowRunNotFound,
     WorkflowRunPersistenceConflict,
+    WorkflowRunReplayInvariantError,
     WorkflowRunServiceUnavailable,
     WorkflowRunTargetNotFound,
     WorkflowVersionUnavailable,
@@ -175,6 +183,16 @@ class RunServiceStub:
                 now,
             ),
         )
+        self.full_replay = CreatedFullWorkflowReplay(
+            uuid4(), WorkflowReplayMode.FULL, self.created
+        )
+        self.failed_replay = CreatedFailedSubgraphWorkflowReplay(
+            self.full_replay.source_workflow_run_id,
+            WorkflowReplayMode.FAILED_SUBGRAPH,
+            ("alpha", "beta"),
+            ("alpha", "beta", "downstream"),
+            self.created,
+        )
 
     def _raise(self) -> None:
         if self.error is not None:
@@ -225,6 +243,110 @@ class RunServiceStub:
         )
         self._raise()
         return self.created
+
+    async def create_full_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: object,
+        *,
+        requested_by_principal_id: UUID,
+        correlation_id: UUID,
+    ) -> CreatedFullWorkflowReplay:
+        self.calls.append(
+            (
+                "create_full_replay",
+                source_workflow_run_id,
+                owner_filter,
+                requested_by_principal_id,
+                correlation_id,
+            )
+        )
+        self._raise()
+        return CreatedFullWorkflowReplay(
+            source_workflow_run_id, WorkflowReplayMode.FULL, self.created
+        )
+
+    async def create_idempotent_full_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: object,
+        *,
+        requested_by_principal_id: UUID,
+        idempotency_key: object,
+        correlation_id: UUID,
+    ) -> CreatedFullWorkflowReplay:
+        self.calls.append(
+            (
+                "create_idempotent_full_replay",
+                source_workflow_run_id,
+                owner_filter,
+                requested_by_principal_id,
+                idempotency_key,
+                correlation_id,
+            )
+        )
+        self._raise()
+        return CreatedFullWorkflowReplay(
+            source_workflow_run_id, WorkflowReplayMode.FULL, self.created
+        )
+
+    async def create_failed_subgraph_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: object,
+        *,
+        requested_by_principal_id: UUID,
+        failed_step_identifiers: object,
+        correlation_id: UUID,
+    ) -> CreatedFailedSubgraphWorkflowReplay:
+        self.calls.append(
+            (
+                "create_failed_subgraph_replay",
+                source_workflow_run_id,
+                owner_filter,
+                requested_by_principal_id,
+                failed_step_identifiers,
+                correlation_id,
+            )
+        )
+        self._raise()
+        return CreatedFailedSubgraphWorkflowReplay(
+            source_workflow_run_id,
+            WorkflowReplayMode.FAILED_SUBGRAPH,
+            ("alpha", "beta"),
+            ("alpha", "beta", "downstream"),
+            self.created,
+        )
+
+    async def create_idempotent_failed_subgraph_replay(
+        self,
+        source_workflow_run_id: UUID,
+        owner_filter: object,
+        *,
+        requested_by_principal_id: UUID,
+        failed_step_identifiers: object,
+        idempotency_key: object,
+        correlation_id: UUID,
+    ) -> CreatedFailedSubgraphWorkflowReplay:
+        self.calls.append(
+            (
+                "create_idempotent_failed_subgraph_replay",
+                source_workflow_run_id,
+                owner_filter,
+                requested_by_principal_id,
+                failed_step_identifiers,
+                idempotency_key,
+                correlation_id,
+            )
+        )
+        self._raise()
+        return CreatedFailedSubgraphWorkflowReplay(
+            source_workflow_run_id,
+            WorkflowReplayMode.FAILED_SUBGRAPH,
+            ("alpha", "beta"),
+            ("alpha", "beta", "downstream"),
+            self.created,
+        )
 
     async def get_run(
         self, run_id: UUID, *, owner_principal_id: UUID
@@ -413,6 +535,199 @@ def test_supplied_key_uses_idempotent_explicit_path_without_normalization() -> N
     assert service.calls[0][0] == "create_idempotent"
     assert isinstance(service.calls[0][4], ExplicitWorkflowVersion)
     assert service.calls[0][6] == key
+
+
+def test_full_replay_route_is_owner_scoped_and_returns_safe_creation_facts() -> None:
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    source_id = uuid4()
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{source_id}/replay",
+        runtime.api_credential,
+        json={"mode": "full"},
+    )
+
+    assert response.status_code == 201
+    assert response.headers["Location"].endswith(str(service.run_id))
+    call = service.calls[0]
+    assert call[0:2] == ("create_full_replay", source_id)
+    assert call[2].principal_id == runtime.principal_id
+    assert call[3] == runtime.principal_id
+    assert isinstance(call[4], UUID)
+    assert response.json() == {
+        "id": str(service.run_id),
+        "workflow_definition_id": str(service.workflow_id),
+        "workflow_version_id": str(service.version_id),
+        "version_number": 2,
+        "requested_by_principal_id": str(runtime.principal_id),
+        "status": "pending",
+        "created_at": service.created.created_at.isoformat().replace("+00:00", "Z"),
+        "source_workflow_run_id": str(source_id),
+        "mode": "full",
+        "failed_step_identifiers": None,
+    }
+
+
+def test_failed_replay_route_uses_optional_key_and_hides_derived_closure() -> None:
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    source_id = uuid4()
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{source_id}/replay",
+        runtime.api_credential,
+        headers={"Idempotency-Key": "replay-route-key-0001"},
+        json={
+            "mode": "failed_subgraph",
+            "failed_step_identifiers": ["beta", "alpha"],
+        },
+    )
+
+    assert response.status_code == 201
+    call = service.calls[0]
+    assert call[0] == "create_idempotent_failed_subgraph_replay"
+    assert call[4] == ["beta", "alpha"]
+    assert call[5] == "replay-route-key-0001"
+    assert response.json()["failed_step_identifiers"] == ["alpha", "beta"]
+    assert "selected_step_identifiers" not in response.json()
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        {"mode": "full", "failed_step_identifiers": ["alpha"]},
+        {"mode": "failed_subgraph", "failed_step_identifiers": []},
+        {"mode": "unknown"},
+    ),
+)
+def test_replay_route_rejects_structurally_invalid_bodies(body: object) -> None:
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{uuid4()}/replay",
+        runtime.api_credential,
+        json=body,
+    )
+
+    assert response.status_code == 422
+    assert service.calls == []
+
+
+def test_replay_route_enforces_operator_authentication_boundary() -> None:
+    app, runtime, service = make_app(frozenset({Role.VIEWER.value}))
+    path = f"/api/v1/workflow-runs/{uuid4()}/replay"
+
+    forbidden = request(
+        app, "POST", path, runtime.api_credential, json={"mode": "full"}
+    )
+    worker = request(
+        app, "POST", path, runtime.worker_credential, json={"mode": "full"}
+    )
+    unauthenticated = request(app, "POST", path, "", json={"mode": "full"})
+
+    assert forbidden.status_code == 403
+    assert worker.status_code == 401
+    assert unauthenticated.status_code == 401
+    assert service.calls == []
+
+
+def test_replay_route_uses_unrestricted_owner_filter_for_administrator() -> None:
+    app, runtime, service = make_app(frozenset({Role.ADMINISTRATOR.value}))
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{uuid4()}/replay",
+        runtime.api_credential,
+        json={"mode": "full"},
+    )
+
+    assert response.status_code == 201
+    assert service.calls[0][2].unrestricted is True
+
+
+def test_replay_route_maps_scoped_missing_source_to_confidential_not_found() -> None:
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    service.error = WorkflowRunNotFound()
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{uuid4()}/replay",
+        runtime.api_credential,
+        json={"mode": "full"},
+    )
+
+    assert response.status_code == 404
+    assert "owner" not in response.text.lower()
+
+
+@pytest.mark.parametrize(
+    ("error", "body", "expected_status", "expected_code"),
+    (
+        (
+            InvalidWorkflowRunIdempotencyKey(),
+            {"mode": "full"},
+            422,
+            "validation_failed",
+        ),
+        (
+            InvalidFailedSubgraphReplayRequest(),
+            {"mode": "failed_subgraph", "failed_step_identifiers": ["root"]},
+            422,
+            "validation_failed",
+        ),
+        (
+            WorkflowRunReplayNotEligible(),
+            {"mode": "full"},
+            409,
+            "workflow_run_not_replayable",
+        ),
+        (
+            FailedSubgraphReplaySelectionInvalid(),
+            {"mode": "failed_subgraph", "failed_step_identifiers": ["root"]},
+            409,
+            "failed_subgraph_replay_invalid",
+        ),
+        (
+            WorkflowReplayIdempotencyConflict(),
+            {"mode": "full"},
+            409,
+            "idempotency_conflict",
+        ),
+        (
+            WorkflowRunReplayInvariantError(),
+            {"mode": "full"},
+            500,
+            "internal_error",
+        ),
+    ),
+)
+def test_replay_route_maps_domain_errors_safely(
+    error: Exception,
+    body: dict[str, object],
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    service.error = error
+
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{uuid4()}/replay",
+        runtime.api_credential,
+        headers={"Idempotency-Key": "valid-replay-key-0001"},
+        json=body,
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["error"]["code"] == expected_code
 
 
 def test_authorized_cancellation_is_owner_scoped_and_returns_canonical_request() -> (

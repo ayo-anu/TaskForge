@@ -117,6 +117,7 @@ class WorkflowRunService:
         owner_filter: OwnerFilter,
         *,
         requested_by_principal_id: UUID,
+        correlation_id: UUID,
     ) -> CreatedFullWorkflowReplay:
         """Atomically create a fresh complete run from one exact terminal source."""
         try:
@@ -136,7 +137,10 @@ class WorkflowRunService:
                     prepared,
                     accepted_input,
                     requested_by_principal_id,
+                    correlation_id,
                 )
+        except WorkflowRunReplayPersistenceInvariantViolation as error:
+            raise WorkflowRunReplayInvariantError from error
         except WorkflowRunRecordConflict as error:
             raise WorkflowRunPersistenceConflict from error
         except WorkflowRunPersistenceUnavailable as error:
@@ -154,6 +158,7 @@ class WorkflowRunService:
         *,
         requested_by_principal_id: UUID,
         idempotency_key: object,
+        correlation_id: UUID,
     ) -> CreatedFullWorkflowReplay:
         """Create or recover one requester/source-scoped full replay."""
         prepared: PreparedFullWorkflowReplay | None = None
@@ -191,6 +196,7 @@ class WorkflowRunService:
                     prepared,
                     accepted_input,
                     requested_by_principal_id,
+                    correlation_id,
                     idempotency=idempotency,
                 )
         except WorkflowRunIdempotencyRecordConflict:
@@ -216,6 +222,7 @@ class WorkflowRunService:
         *,
         requested_by_principal_id: UUID,
         failed_step_identifiers: object,
+        correlation_id: UUID,
     ) -> CreatedFailedSubgraphWorkflowReplay:
         """Create one fresh dependency-safe replay of requested failed roots."""
         try:
@@ -248,7 +255,10 @@ class WorkflowRunService:
                     requested_by_principal_id,
                     selection.initial_tasks,
                     selection.requested_scope,
+                    correlation_id,
                 )
+        except WorkflowRunReplayPersistenceInvariantViolation as error:
+            raise WorkflowRunReplayInvariantError from error
         except WorkflowRunRecordConflict as error:
             raise WorkflowRunPersistenceConflict from error
         except WorkflowRunPersistenceUnavailable as error:
@@ -269,6 +279,7 @@ class WorkflowRunService:
         requested_by_principal_id: UUID,
         failed_step_identifiers: object,
         idempotency_key: object,
+        correlation_id: UUID,
     ) -> CreatedFailedSubgraphWorkflowReplay:
         """Create or recover one requester/source-scoped failed replay."""
         prepared: PreparedFullWorkflowReplay | None = None
@@ -339,6 +350,7 @@ class WorkflowRunService:
                     requested_by_principal_id,
                     selection.initial_tasks,
                     selection.requested_scope,
+                    correlation_id,
                     idempotency=idempotency,
                 )
         except WorkflowRunIdempotencyRecordConflict:
@@ -1048,6 +1060,7 @@ async def _create_prepared_full_replay(
     prepared: PreparedFullWorkflowReplay,
     input_snapshot: WorkflowRunInput,
     requested_by_principal_id: UUID,
+    correlation_id: UUID,
     *,
     idempotency: WorkflowReplayIdempotency | None = None,
 ) -> CreatedWorkflowRun:
@@ -1067,7 +1080,7 @@ async def _create_prepared_full_replay(
         for task in initial_tasks
     )
     timestamps = await transaction.insert_full_replay(
-        prepared, run, input_snapshot, task_values, idempotency
+        prepared, run, input_snapshot, task_values, correlation_id, idempotency
     )
     await transaction.commit()
     runnable_count = sum(task.status is TaskRunStatus.RUNNABLE for task in task_values)
@@ -1092,6 +1105,7 @@ async def _create_prepared_failed_subgraph_replay(
     requested_by_principal_id: UUID,
     initial_tasks: tuple[InitialTaskRun, ...],
     requested_scope: dict[str, object],
+    correlation_id: UUID,
     *,
     idempotency: WorkflowReplayIdempotency | None = None,
 ) -> CreatedWorkflowRun:
@@ -1115,6 +1129,7 @@ async def _create_prepared_failed_subgraph_replay(
         input_snapshot,
         task_values,
         requested_scope,
+        correlation_id,
         idempotency,
     )
     await transaction.commit()
