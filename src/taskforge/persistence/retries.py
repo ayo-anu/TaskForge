@@ -9,7 +9,7 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import exists, func, insert, select, update
+from sqlalchemy import and_, exists, func, insert, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -43,6 +43,7 @@ from taskforge.runs.schema import (
     task_attempt_results,
     task_attempts,
     task_dispatch_outbox,
+    task_result_events,
     task_retry_events,
     task_runs,
     workflow_runs,
@@ -215,6 +216,7 @@ class SQLAlchemyRetryTransitionTransaction:
             failed_attempt_number=prepared.failed_attempt_number,
             retry_attempt_number=attempt.attempt_number,
             next_eligible_at=attempt.next_eligible_at,
+            correlation_id=prepared.correlation_id,
         )
 
     async def fail_retry(
@@ -265,6 +267,7 @@ class SQLAlchemyRetryTransitionTransaction:
             RetryEventType.RETRY_NOT_SCHEDULED,
             failed_attempt_number=prepared.failed_attempt_number,
             decision_reason=reason,
+            correlation_id=prepared.correlation_id,
         )
         try:
             await ensure_dead_letter(
@@ -290,6 +293,7 @@ class SQLAlchemyRetryTransitionTransaction:
         retry_attempt_number: int | None = None,
         next_eligible_at: datetime | None = None,
         decision_reason: RetryNotScheduledReason | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         try:
             await self._required_session().execute(
@@ -298,6 +302,7 @@ class SQLAlchemyRetryTransitionTransaction:
                     task_run_id=task_run_id,
                     event_type=event_type.value,
                     actor_component="retry_transition",
+                    correlation_id=correlation_id,
                     failed_attempt_number=failed_attempt_number,
                     retry_attempt_number=retry_attempt_number,
                     next_eligible_at=next_eligible_at,
@@ -321,11 +326,21 @@ class SQLAlchemyRetryTransitionTransaction:
                     task_attempt_results.c.task_attempt_id.label("result_attempt_id"),
                     task_attempt_results.c.result_kind,
                     task_attempt_results.c.completed_at,
+                    task_result_events.c.id.label("result_event_id"),
+                    task_result_events.c.correlation_id,
                 )
                 .select_from(
                     task_attempts.outerjoin(
                         task_attempt_results,
                         task_attempt_results.c.task_attempt_id == task_attempts.c.id,
+                    ).outerjoin(
+                        task_result_events,
+                        and_(
+                            task_result_events.c.task_attempt_id == task_attempts.c.id,
+                            task_result_events.c.claim_generation
+                            == task_attempt_results.c.claim_generation,
+                            task_result_events.c.event_type == "result_accepted",
+                        ),
                     )
                 )
                 .where(task_attempts.c.task_run_id == task.id)
@@ -338,6 +353,11 @@ class SQLAlchemyRetryTransitionTransaction:
             or latest.result_attempt_id != latest.id
             or latest.result_kind != TaskExecutionResultKind.RETRYABLE_FAILURE.value
             or latest.completed_at is None
+            or latest.result_event_id is None
+            or (
+                latest.correlation_id is not None
+                and not isinstance(latest.correlation_id, str)
+            )
         ):
             raise RetryTransitionPersistenceInvariantViolation
         snapshot = (
@@ -368,6 +388,7 @@ class SQLAlchemyRetryTransitionTransaction:
             latest.completed_at,
             deepcopy(snapshot.workflow_policy),
             deepcopy(snapshot.step_policy),
+            latest.correlation_id,
         )
 
     async def _existing_scheduled(self, task_run_id: UUID) -> ExistingScheduledRetry:

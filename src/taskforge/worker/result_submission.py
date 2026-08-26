@@ -18,6 +18,7 @@ from taskforge.audit.domain import (
 )
 from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import TaskClaimResultAuthority
+from taskforge.correlation import is_valid_correlation_id
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.worker.result_persistence_ports import (
@@ -97,10 +98,7 @@ class TaskResultSubmissionRequest:
     def __post_init__(self) -> None:
         if type(self.claim_generation) is not int or self.claim_generation <= 0:
             raise ValueError("claim generation must be positive")
-        if self.correlation_id is not None and not (
-            1 <= len(self.correlation_id) <= 128
-            and all(32 <= ord(char) <= 126 for char in self.correlation_id)
-        ):
+        if not is_valid_correlation_id(self.correlation_id):
             raise ValueError("result correlation ID is invalid")
 
     def __repr__(self) -> str:

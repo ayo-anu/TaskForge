@@ -418,12 +418,17 @@ def test_nonstandard_json_numeric_constants_are_malformed(constant: bytes) -> No
 
 @pytest.mark.parametrize(
     "value",
-    ("", " padded", "padded ", "line\nbreak", "é", "x" * 129),
+    ("", "line\nbreak", "é", "x" * 129),
 )
 def test_correlation_id_is_bounded_safe_ascii(value: str) -> None:
     with pytest.raises(DispatchEnvelopeValidationError) as caught:
         create_envelope(correlation_id=value)
     assert issue_codes(caught.value) == ("invalid_correlation_id",)
+
+
+@pytest.mark.parametrize("value", (" padded", "padded ", " ", "x" * 128))
+def test_correlation_id_preserves_valid_printable_ascii(value: str) -> None:
+    assert create_envelope(correlation_id=value).correlation_id == value
 
 
 def test_trace_context_is_narrow_and_redacted() -> None:

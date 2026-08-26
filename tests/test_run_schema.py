@@ -230,6 +230,7 @@ def test_execution_events_are_run_ordered_and_task_ownership_constrained() -> No
     assert workflow_run_execution_events.c.occurred_at.server_default is not None
     assert check_texts(workflow_run_execution_events) == {
         "cursor > 0",
+        "event_type ~ '^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)+$'",
         "length(btrim(event_type)) BETWEEN 1 AND 128",
         "jsonb_typeof(payload) = 'object'",
     }
@@ -357,6 +358,20 @@ def test_result_and_retry_actor_component_constraints_match_migration_contract()
     ) == (
         "actor_component IS NOT NULL AND actor_component IN "
         "('retry_transition','retry_dispatch','expired_claim_recovery')"
+    )
+    correlation_contract = (
+        "correlation_id IS NULL OR (length(correlation_id) BETWEEN 1 AND 128 "
+        "AND correlation_id !~ '[^ -~]')"
+    )
+    assert (
+        check_text_by_name(
+            task_result_events, "ck_task_result_events_correlation_valid"
+        )
+        == correlation_contract
+    )
+    assert (
+        check_text_by_name(task_retry_events, "ck_task_retry_events_correlation_valid")
+        == correlation_contract
     )
 
 

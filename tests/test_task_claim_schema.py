@@ -199,6 +199,11 @@ def test_claim_event_metadata_matches_the_immutable_event_migration() -> None:
             "worker_identity_id IS NOT NULL AND worker_session_id IS NOT NULL",
         ),
         (
+            "ck_task_claim_events_correlation_valid",
+            "correlation_id IS NULL OR (length(correlation_id) BETWEEN 1 AND 128 "
+            "AND correlation_id !~ '[^ -~]')",
+        ),
+        (
             "ck_task_claim_events_event_type_valid",
             "event_type IN ('claim_acquired', 'lease_renewed')",
         ),

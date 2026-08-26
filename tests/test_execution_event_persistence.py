@@ -111,7 +111,7 @@ def test_stored_execution_event_requires_cursor_and_server_time_shape() -> None:
         1,
         task_id,
         "task_run.status_changed",
-        {"status": "running"},
+        {"previous_status": "claimed", "status": "running"},
         occurred_at,
     )
     assert event.cursor == 1
@@ -125,15 +125,114 @@ def test_stored_execution_event_requires_cursor_and_server_time_shape() -> None:
                 invalid_cursor,
                 task_id,
                 "task_run.status_changed",
-                {"status": "running"},
+                {"previous_status": "claimed", "status": "running"},
                 occurred_at,
             )
+
+
+def test_execution_event_payload_contract_is_closed_by_event_type() -> None:
+    run_id, task_id = uuid4(), uuid4()
+    valid = (
+        (
+            None,
+            "workflow_run.created",
+            {
+                "workflow_definition_id": str(uuid4()),
+                "workflow_version_id": str(uuid4()),
+                "requested_by_principal_id": str(uuid4()),
+                "creation_kind": "ordinary",
+            },
+        ),
+        (
+            None,
+            "workflow_run.replay_created",
+            {
+                "source_workflow_run_id": str(uuid4()),
+                "replay_mode": "full",
+                "requested_scope": {},
+                "requested_by_principal_id": str(uuid4()),
+                "correlation_id": str(uuid4()),
+            },
+        ),
+        (
+            None,
+            "workflow_run.redrive_created",
+            {
+                "dead_letter_item_id": str(uuid4()),
+                "source_workflow_run_id": str(uuid4()),
+                "source_task_run_id": str(uuid4()),
+                "source_task_attempt_id": str(uuid4()),
+                "requested_by_principal_id": str(uuid4()),
+                "correlation_id": str(uuid4()),
+            },
+        ),
+        (
+            None,
+            "workflow_run.status_changed",
+            {"previous_status": "pending", "status": "running"},
+        ),
+        (
+            task_id,
+            "task_run.status_changed",
+            {"previous_status": "runnable", "status": "dispatched"},
+        ),
+    )
+    for target, event_type, payload in valid:
+        assert (
+            NewWorkflowRunExecutionEvent(
+                uuid4(), run_id, target, event_type, payload
+            ).event_type
+            == event_type
+        )
+
+    invalid_payloads = (
+        (None, "workflow_run.created", {"secret": "value"}),
+        (None, "workflow_run.status_changed", {"status": "running"}),
+        (
+            task_id,
+            "workflow_run.status_changed",
+            {"previous_status": "pending", "status": "running"},
+        ),
+        (
+            None,
+            "task_run.status_changed",
+            {"previous_status": "runnable", "status": "dispatched"},
+        ),
+        (
+            None,
+            "workflow_run.status_changed",
+            {"previous_status": "running", "status": "runnable"},
+        ),
+        (
+            task_id,
+            "task_run.status_changed",
+            {"previous_status": "running", "status": "cancelling"},
+        ),
+    )
+    for target, event_type, payload in invalid_payloads:
+        with pytest.raises(InvalidWorkflowRunExecutionEvent):
+            NewWorkflowRunExecutionEvent(uuid4(), run_id, target, event_type, payload)
+
+
+def test_maximum_valid_failed_subgraph_scope_is_preserved_exactly() -> None:
+    identifiers = [f"step-{index:03d}-" + "x" * 119 for index in range(256)]
+    payload: JSONMapping = {
+        "source_workflow_run_id": str(uuid4()),
+        "replay_mode": "failed_subgraph",
+        "requested_scope": {"failed_step_identifiers": identifiers},
+        "requested_by_principal_id": str(uuid4()),
+        "correlation_id": str(uuid4()),
+    }
+    event = NewWorkflowRunExecutionEvent(
+        uuid4(), uuid4(), None, "workflow_run.replay_created", payload
+    )
+    assert event.payload["requested_scope"] == payload["requested_scope"]
     with pytest.raises(ValueError):
         StoredWorkflowRunExecutionEvent(
-            event_id,
-            run_id,
+            uuid4(),
+            uuid4(),
             1,
-            task_id,
+            uuid4(),
             "task_run.status_changed",
             {"status": "running"},
             datetime.now(),

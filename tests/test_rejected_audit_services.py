@@ -252,11 +252,7 @@ def test_workflow_and_run_rejected_audit_fail_closed() -> None:
     workflow_id = uuid4()
     captured = Recorder()
     workflow_capture = WorkflowService(Any, Any, captured)  # type: ignore[arg-type]
-    for action in (
-        "workflow.create",
-        "workflow.publish",
-        "workflow.availability_change",
-    ):
+    for action in ("workflow.publish", "workflow.availability_change"):
         asyncio.run(
             workflow_capture._audit_rejection(
                 WorkflowNotFound(),
@@ -267,7 +263,6 @@ def test_workflow_and_run_rejected_audit_fail_closed() -> None:
             )
         )
     assert [record.action for record in captured.records] == [
-        "workflow.create",
         "workflow.publish",
         "workflow.availability_change",
     ]
@@ -299,9 +294,9 @@ def test_workflow_and_run_rejected_audit_fail_closed() -> None:
 
     captured = Recorder()
     run_capture = WorkflowRunService(Any, captured)  # type: ignore[arg-type]
-    for action, resource_type in (
-        ("workflow_run.cancel", "workflow_run"),
-        ("workflow_run.create", "workflow"),
+    for action, resource_type, reason in (
+        ("workflow_run.cancel", "workflow_run", "workflow_run_not_visible"),
+        ("workflow_run.create", "workflow", "idempotency_conflict"),
     ):
         asyncio.run(
             run_capture._audit_command_rejection(
@@ -310,7 +305,7 @@ def test_workflow_and_run_rejected_audit_fail_closed() -> None:
                 resource_id=workflow_id,
                 principal_id=principal_id,
                 correlation_id=correlation_id,
-                reasons={WorkflowNotFound: "workflow_run_not_visible"},
+                reasons={WorkflowNotFound: reason},
                 resource_type=resource_type,
             )
         )
@@ -322,20 +317,31 @@ def test_workflow_and_run_rejected_audit_fail_closed() -> None:
 
 def test_worker_rejected_audit_failure_is_fail_closed() -> None:
     captured = Recorder()
-    for action, reason in (
-        ("worker_session.register", "registration_conflict"),
-        ("worker_session.capabilities_replace", "worker_session_inactive"),
-        ("worker_session.heartbeat", "stale_heartbeat"),
+    summary = {"count": 0, "sha256": "0" * 64}
+    for action, reason, session_id, provenance in (
+        (
+            "worker_session.register",
+            "registration_conflict",
+            None,
+            {"capabilities": summary},
+        ),
+        (
+            "worker_session.capabilities_replace",
+            "worker_session_inactive",
+            uuid4(),
+            {"capabilities": summary},
+        ),
+        ("worker_session.heartbeat", "stale_heartbeat", uuid4(), {"sequence": 1}),
     ):
         asyncio.run(
             _worker_rejected(
                 captured,
                 worker(),
-                None,
+                session_id,
                 action,
                 reason,
                 uuid4(),
-                {},
+                provenance,
             )
         )
     assert len(captured.records) == 3

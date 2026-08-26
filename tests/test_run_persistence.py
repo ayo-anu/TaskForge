@@ -712,7 +712,8 @@ def test_creation_transaction_prepares_snapshot_in_locked_transaction() -> None:
 def test_complete_insert_returns_database_timestamps_and_commits() -> None:
     now = datetime.now(UTC)
     workflow_id, version_id = uuid4(), uuid4()
-    run = NewWorkflowRun(uuid4(), uuid4(), WorkflowRunStatus.PENDING)
+    requested_by_principal_id = uuid4()
+    run = NewWorkflowRun(uuid4(), requested_by_principal_id, WorkflowRunStatus.PENDING)
     prepared_session = FakeSession(
         [
             FakeResult([SimpleNamespace(created_at=now, updated_at=now)]),
@@ -726,7 +727,12 @@ def test_complete_insert_returns_database_timestamps_and_commits() -> None:
                         cursor=1,
                         task_run_id=None,
                         event_type="workflow_run.created",
-                        payload={},
+                        payload={
+                            "workflow_definition_id": str(workflow_id),
+                            "workflow_version_id": str(version_id),
+                            "requested_by_principal_id": str(requested_by_principal_id),
+                            "creation_kind": "ordinary",
+                        },
                         occurred_at=now,
                     )
                 ]

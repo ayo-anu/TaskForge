@@ -13,6 +13,7 @@ from taskforge.audit.domain import (
     AuditRecord,
     AuditRejected,
 )
+from taskforge.correlation import is_valid_correlation_id
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.runs.domain import WorkflowRunStatus
@@ -54,10 +55,7 @@ class TaskStartRequest:
     def __post_init__(self) -> None:
         if self.claim_generation <= 0:
             raise ValueError("claim generation must be positive")
-        if self.correlation_id is not None and not (
-            1 <= len(self.correlation_id) <= 128
-            and all(32 <= ord(char) <= 126 for char in self.correlation_id)
-        ):
+        if not is_valid_correlation_id(self.correlation_id):
             raise ValueError("task start correlation ID is invalid")
 
 

@@ -350,6 +350,10 @@ workflow_run_execution_events = Table(
         "length(btrim(event_type)) BETWEEN 1 AND 128",
         name="event_type_valid",
     ),
+    CheckConstraint(
+        "event_type ~ '^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)+$'",
+        name="event_type_namespaced",
+    ),
     CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_object"),
     ForeignKeyConstraint(
         ("workflow_run_id",),
@@ -554,6 +558,11 @@ task_claim_events = Table(
         name="actor_attribution",
     ),
     CheckConstraint(
+        "correlation_id IS NULL OR (length(correlation_id) BETWEEN 1 AND 128 "
+        "AND correlation_id !~ '[^ -~]')",
+        name="correlation_valid",
+    ),
+    CheckConstraint(
         "(event_type = 'claim_acquired' "
         "AND previous_lease_expires_at IS NULL "
         "AND lease_expires_at > occurred_at) OR "
@@ -655,6 +664,11 @@ task_result_events = Table(
         "('expired_claim_recovery','cancellation_recovery')",
         name="actor_component_valid",
     ),
+    CheckConstraint(
+        "correlation_id IS NULL OR (length(correlation_id) BETWEEN 1 AND 128 "
+        "AND correlation_id !~ '[^ -~]')",
+        name="correlation_valid",
+    ),
     CheckConstraint("claim_generation > 0", name="claim_generation_positive"),
     CheckConstraint(
         "event_type IN ('result_accepted', 'result_replayed', "
@@ -729,6 +743,11 @@ task_retry_events = Table(
         "actor_component IS NOT NULL AND actor_component IN "
         "('retry_transition','retry_dispatch','expired_claim_recovery')",
         name="actor_component_valid",
+    ),
+    CheckConstraint(
+        "correlation_id IS NULL OR (length(correlation_id) BETWEEN 1 AND 128 "
+        "AND correlation_id !~ '[^ -~]')",
+        name="correlation_valid",
     ),
     CheckConstraint(
         "(event_type = 'retry_scheduled' AND failed_attempt_number IS NOT NULL "

@@ -13,7 +13,7 @@ from enum import StrEnum
 from uuid import UUID
 
 from taskforge.worker.results import TaskExecutionFailureKind
-from taskforge.workflows.dag_validation import DAGEdge, validate_dag
+from taskforge.workflows.dag_validation import MAX_DAG_STEPS, DAGEdge, validate_dag
 from taskforge.workflows.domain import (
     MAX_TASK_DEADLINE_SECONDS,
     MAX_TASK_EXECUTION_TIMEOUT_SECONDS,
@@ -290,16 +290,8 @@ class NewWorkflowRunExecutionEvent:
     payload: JSONMapping
 
     def __post_init__(self) -> None:
-        if not 1 <= len(self.event_type.strip()) <= 128:
-            raise InvalidWorkflowRunExecutionEvent(
-                "execution event type must be bounded nonblank text"
-            )
-        issues, validated = validate_parameters(self.payload)
-        if issues or validated is None:
-            raise InvalidWorkflowRunExecutionEvent(
-                "execution event payload must be a bounded JSON object"
-            )
-        object.__setattr__(self, "payload", deepcopy(validated))
+        _validate_execution_event(self.task_run_id, self.event_type, self.payload)
+        object.__setattr__(self, "payload", deepcopy(self.payload))
 
     def __repr__(self) -> str:
         return (
@@ -323,14 +315,13 @@ class StoredWorkflowRunExecutionEvent:
     def __post_init__(self) -> None:
         if isinstance(self.cursor, bool) or self.cursor <= 0:
             raise ValueError("execution event cursor must be positive")
-        if not 1 <= len(self.event_type.strip()) <= 128:
-            raise ValueError("persisted execution event type is invalid")
         if self.occurred_at.tzinfo is None:
             raise ValueError("execution event timestamp must be timezone-aware")
-        issues, validated = validate_parameters(self.payload)
-        if issues or validated is None:
-            raise ValueError("persisted execution event payload is invalid")
-        object.__setattr__(self, "payload", deepcopy(validated))
+        try:
+            _validate_execution_event(self.task_run_id, self.event_type, self.payload)
+        except InvalidWorkflowRunExecutionEvent as error:
+            raise ValueError("persisted execution event is invalid") from error
+        object.__setattr__(self, "payload", deepcopy(self.payload))
         object.__setattr__(self, "occurred_at", self.occurred_at.astimezone(UTC))
 
     def __repr__(self) -> str:
@@ -341,6 +332,150 @@ class StoredWorkflowRunExecutionEvent:
             f"event_type={self.event_type!r}, payload=<redacted>, "
             f"occurred_at={self.occurred_at!r})"
         )
+
+
+_EXECUTION_EVENT_TYPES = frozenset(
+    {
+        "workflow_run.created",
+        "workflow_run.replay_created",
+        "workflow_run.redrive_created",
+        "workflow_run.status_changed",
+        "task_run.status_changed",
+    }
+)
+_WORKFLOW_RUN_STATUS_VALUES = frozenset(status.value for status in WorkflowRunStatus)
+_TASK_RUN_STATUS_VALUES = frozenset(status.value for status in TaskRunStatus)
+
+
+def _validate_execution_event(
+    task_run_id: UUID | None, event_type: object, payload: object
+) -> None:
+    if event_type not in _EXECUTION_EVENT_TYPES or not isinstance(payload, dict):
+        raise InvalidWorkflowRunExecutionEvent("execution event contract is invalid")
+    if event_type == "workflow_run.created":
+        _require_event_target(task_run_id, required=False)
+        _require_payload_keys(
+            payload,
+            required={
+                "workflow_definition_id",
+                "workflow_version_id",
+                "requested_by_principal_id",
+                "creation_kind",
+            },
+            optional={"correlation_id"},
+        )
+        for key in (
+            "workflow_definition_id",
+            "workflow_version_id",
+            "requested_by_principal_id",
+        ):
+            _require_uuid_string(payload[key])
+        if payload["creation_kind"] != "ordinary":
+            raise InvalidWorkflowRunExecutionEvent("creation kind is invalid")
+        _require_optional_uuid_string(payload, "correlation_id")
+        return
+    if event_type == "workflow_run.redrive_created":
+        _require_event_target(task_run_id, required=False)
+        keys = {
+            "dead_letter_item_id",
+            "source_workflow_run_id",
+            "source_task_run_id",
+            "source_task_attempt_id",
+            "requested_by_principal_id",
+            "correlation_id",
+        }
+        _require_payload_keys(payload, required=keys)
+        for key in keys:
+            _require_uuid_string(payload[key])
+        return
+    if event_type == "workflow_run.replay_created":
+        _require_event_target(task_run_id, required=False)
+        _require_payload_keys(
+            payload,
+            required={
+                "source_workflow_run_id",
+                "replay_mode",
+                "requested_scope",
+                "requested_by_principal_id",
+                "correlation_id",
+            },
+        )
+        for key in (
+            "source_workflow_run_id",
+            "requested_by_principal_id",
+            "correlation_id",
+        ):
+            _require_uuid_string(payload[key])
+        _require_replay_scope(payload["replay_mode"], payload["requested_scope"])
+        return
+    _require_payload_keys(payload, required={"previous_status", "status"})
+    statuses = (
+        _TASK_RUN_STATUS_VALUES
+        if event_type == "task_run.status_changed"
+        else _WORKFLOW_RUN_STATUS_VALUES
+    )
+    if payload["previous_status"] not in statuses or payload["status"] not in statuses:
+        raise InvalidWorkflowRunExecutionEvent("execution status is invalid")
+    _require_event_target(task_run_id, required=event_type == "task_run.status_changed")
+
+
+def _require_event_target(task_run_id: UUID | None, *, required: bool) -> None:
+    if required is (task_run_id is None):
+        raise InvalidWorkflowRunExecutionEvent("execution event target is invalid")
+
+
+def _require_payload_keys(
+    payload: dict[str, object],
+    *,
+    required: set[str],
+    optional: set[str] | None = None,
+) -> None:
+    if not all(isinstance(key, str) for key in payload) or not (
+        set(payload) == required or set(payload) == required | (optional or set())
+    ):
+        raise InvalidWorkflowRunExecutionEvent(
+            "execution event payload keys are invalid"
+        )
+
+
+def _require_uuid_string(value: object) -> None:
+    try:
+        if not isinstance(value, str) or str(UUID(value)) != value:
+            raise ValueError
+    except ValueError as error:
+        raise InvalidWorkflowRunExecutionEvent(
+            "execution event UUID is invalid"
+        ) from error
+
+
+def _require_optional_uuid_string(payload: dict[str, object], key: str) -> None:
+    if key in payload:
+        _require_uuid_string(payload[key])
+
+
+def _require_replay_scope(mode: object, scope: object) -> None:
+    if mode == "full":
+        if scope != {}:
+            raise InvalidWorkflowRunExecutionEvent("full replay scope is invalid")
+        return
+    if (
+        mode != "failed_subgraph"
+        or not isinstance(scope, dict)
+        or set(scope) != {"failed_step_identifiers"}
+    ):
+        raise InvalidWorkflowRunExecutionEvent("failed-subgraph scope is invalid")
+    identifiers = scope["failed_step_identifiers"]
+    if not isinstance(identifiers, list) or not 1 <= len(identifiers) <= MAX_DAG_STEPS:
+        raise InvalidWorkflowRunExecutionEvent("failed-subgraph scope is invalid")
+    if any(
+        not isinstance(identifier, str)
+        or not 1 <= len(identifier) <= 128
+        or not identifier.strip()
+        for identifier in identifiers
+    ):
+        raise InvalidWorkflowRunExecutionEvent("failed-subgraph identifier is invalid")
+    if identifiers != sorted(set(identifiers)):
+        raise InvalidWorkflowRunExecutionEvent("failed-subgraph scope is not canonical")
 
 
 @dataclass(frozen=True)

@@ -25,6 +25,9 @@ from taskforge.persistence.dead_letters import (
     ensure_dead_letter,
 )
 from taskforge.persistence.retries import SQLAlchemyRetryTransitionRepository
+from taskforge.retries.persistence_ports import (
+    RetryTransitionPersistenceInvariantViolation,
+)
 from taskforge.retries.service import (
     RetryTransitionInvariantError,
     RetryTransitionOutcome,
@@ -73,6 +76,7 @@ class RetryFacts:
     task_run_id: UUID
     failed_attempt_id: UUID
     completed_at: datetime
+    correlation_id: str
 
 
 async def add_retry_pending_task(
@@ -82,6 +86,7 @@ async def add_retry_pending_task(
     step_policy: dict[str, object] | None = None,
     result_kind: str = "retryable_failure",
     failure_kind: str | None = "handler_reported",
+    include_result_event: bool = True,
 ) -> RetryFacts:
     worker = await add_worker(connection)
     principal_id, workflow_id, version_id, run_id = (
@@ -156,6 +161,7 @@ async def add_retry_pending_task(
         worker.session_id,
     )
     output = "'null'::jsonb" if result_kind == "success" else "NULL"
+    result_fingerprint = "a" * 64
     completed_at = await connection.fetchval(
         "INSERT INTO task_attempt_results "
         "(task_attempt_id, claim_generation, dispatch_id, result_kind, "
@@ -165,9 +171,26 @@ async def add_retry_pending_task(
         dispatch_id,
         result_kind,
         failure_kind,
-        "a" * 64,
+        result_fingerprint,
     )
-    return RetryFacts(run_id, task_id, attempt_id, completed_at)
+    correlation_id = f"retry-result-{attempt_id}"
+    if include_result_event:
+        await connection.execute(
+            "INSERT INTO task_result_events "
+            "(id, task_attempt_id, claim_generation, worker_session_id, "
+            "worker_identity_id, correlation_id, dispatch_id, event_type, "
+            "result_kind, result_fingerprint) VALUES "
+            "($1, $2, 1, $3, $4, $5, $6, 'result_accepted', $7, $8)",
+            uuid4(),
+            attempt_id,
+            worker.session_id,
+            worker.authenticated.worker_identity_id,
+            correlation_id,
+            dispatch_id,
+            result_kind,
+            result_fingerprint,
+        )
+    return RetryFacts(run_id, task_id, attempt_id, completed_at, correlation_id)
 
 
 async def scheduled_shape(
@@ -200,6 +223,45 @@ async def exercise_retry_transitions(database_url: URL) -> None:
     sessions = build_session_factory(engine)
     service = RetryTransitionService(SQLAlchemyRetryTransitionRepository(sessions))
     try:
+        corrupt = await add_retry_pending_task(
+            setup,
+            workflow_policy={"retry_policy": retry_policy()},
+            include_result_event=False,
+        )
+        with pytest.raises(RetryTransitionInvariantError) as raised:
+            await service.transition_retry(corrupt.task_run_id)
+        assert isinstance(
+            raised.value.__cause__, RetryTransitionPersistenceInvariantViolation
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT status::text FROM task_runs WHERE id = $1", corrupt.task_run_id
+            )
+            == "retry_pending"
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_attempts WHERE task_run_id = $1",
+                corrupt.task_run_id,
+            )
+            == 1
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_retry_events WHERE task_run_id = $1",
+                corrupt.task_run_id,
+            )
+            == 0
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM workflow_run_execution_events "
+                "WHERE workflow_run_id = $1",
+                corrupt.workflow_run_id,
+            )
+            == 0
+        )
+
         workflow = await add_retry_pending_task(
             setup, workflow_policy={"retry_policy": retry_policy()}
         )
@@ -214,11 +276,19 @@ async def exercise_retry_transitions(database_url: URL) -> None:
         assert tuple(
             await setup.fetchrow(
                 "SELECT event_type, failed_attempt_number, retry_attempt_number, "
-                "next_eligible_at, decision_reason FROM task_retry_events "
+                "next_eligible_at, decision_reason, correlation_id "
+                "FROM task_retry_events "
                 "WHERE task_run_id = $1",
                 workflow.task_run_id,
             )
-        ) == ("retry_scheduled", 1, 2, scheduled.next_eligible_at, None)
+        ) == (
+            "retry_scheduled",
+            1,
+            2,
+            scheduled.next_eligible_at,
+            None,
+            workflow.correlation_id,
+        )
         replayed = await service.transition_retry(workflow.task_run_id)
         assert replayed.outcome is RetryTransitionOutcome.ALREADY_SCHEDULED
         assert replayed.scheduled_attempt_id == scheduled.scheduled_attempt_id

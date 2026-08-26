@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
+from taskforge.correlation import is_valid_correlation_id
 from taskforge.runs.domain import TaskRunStatus
 
 _RESULT_AUTHORITY_PATTERN = re.compile(
@@ -129,10 +130,7 @@ class TaskClaimRenewalRequest:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("expected lease expiry must be timezone-aware")
         object.__setattr__(self, "expected_lease_expires_at", value.astimezone(UTC))
-        if self.correlation_id is not None and not (
-            1 <= len(self.correlation_id) <= 128
-            and all(32 <= ord(char) <= 126 for char in self.correlation_id)
-        ):
+        if not is_valid_correlation_id(self.correlation_id):
             raise ValueError("renewal correlation ID is invalid")
 
 

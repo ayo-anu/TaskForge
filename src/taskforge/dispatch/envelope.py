@@ -9,9 +9,11 @@ from collections.abc import Mapping
 from dataclasses import InitVar, dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
+from typing import cast
 from uuid import UUID
 
 from taskforge.capabilities import is_valid_capability_name
+from taskforge.correlation import is_valid_correlation_id
 from taskforge.workflows.task_types import (
     MAX_COLLECTION_ITEMS,
     MAX_PARAMETER_DEPTH,
@@ -648,13 +650,7 @@ def _validate_correlation_id(
 ) -> str | None:
     if value is None:
         return None
-    if (
-        not isinstance(value, str)
-        or not 1 <= len(value) <= MAX_CORRELATION_ID_LENGTH
-        or not value.isascii()
-        or value != value.strip()
-        or any(ord(character) < 32 or ord(character) > 126 for character in value)
-    ):
+    if not is_valid_correlation_id(value):
         issues.append(
             DispatchEnvelopeIssue(
                 "invalid_correlation_id",
@@ -663,7 +659,7 @@ def _validate_correlation_id(
             )
         )
         return None
-    return value
+    return cast(str, value)
 
 
 def _validate_trace_context(

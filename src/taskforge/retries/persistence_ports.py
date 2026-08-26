@@ -35,6 +35,7 @@ class PreparedRetryTransition:
     completed_at: datetime
     workflow_execution_policy: JSONMapping | None
     step_execution_policy: JSONMapping | None
+    correlation_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.failed_attempt_number <= 0:

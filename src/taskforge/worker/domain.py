@@ -8,6 +8,7 @@ from enum import StrEnum
 from uuid import UUID
 
 from taskforge.capabilities import is_valid_capability_name
+from taskforge.correlation import is_valid_correlation_id
 
 MAX_WORKER_CAPABILITIES = 128
 MAX_HEARTBEAT_SEQUENCE = 9_223_372_036_854_775_807
@@ -85,9 +86,7 @@ class WorkerHeartbeat:
 
 
 def _validate_correlation_id(value: str | None) -> None:
-    if value is not None and not (
-        1 <= len(value) <= 128 and all(32 <= ord(char) <= 126 for char in value)
-    ):
+    if not is_valid_correlation_id(value):
         raise ValueError("worker correlation ID is invalid")
 
 

@@ -109,6 +109,8 @@ def test_heartbeat_history_is_compact_and_session_scoped() -> None:
         "correlation_id",
     }
     assert _check_texts(worker_heartbeats) == {
+        "correlation_id IS NULL OR (length(correlation_id) BETWEEN 1 AND 128 "
+        "AND correlation_id !~ '[^ -~]')",
         "sequence > 0",
         "worker_identity_id IS NOT NULL",
     }

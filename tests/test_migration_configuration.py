@@ -64,6 +64,7 @@ def test_migration_graph_has_one_workflow_head_and_locked_validation_commands() 
         "0023_publish_workflow_run_execution_event_wakeups.py",
         "0024_add_workflow_run_replay_lineage.py",
         "0025_complete_audit_history.py",
+        "0026_standardize_audit_semantics.py",
     ]
     assert "migrations-check:\n\tuv run alembic heads --verbose" in makefile
     assert "migration-test:" in makefile

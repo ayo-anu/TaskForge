@@ -141,4 +141,9 @@ worker_heartbeats = Table(
     ),
     CheckConstraint("sequence > 0", name="sequence_positive"),
     CheckConstraint("worker_identity_id IS NOT NULL", name="actor_attribution"),
+    CheckConstraint(
+        "correlation_id IS NULL OR (length(correlation_id) BETWEEN 1 AND 128 "
+        "AND correlation_id !~ '[^ -~]')",
+        name="correlation_valid",
+    ),
 )

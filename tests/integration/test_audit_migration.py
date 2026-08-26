@@ -14,6 +14,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from taskforge.audit.domain import bounded_string_set
 from taskforge.claims.service import TaskClaimService, TaskClaimServiceUnavailable
 from taskforge.dead_letters.persistence_ports import DeadLetterPersistenceUnavailable
 from taskforge.dead_letters.service import DeadLetterNotFound, DeadLetterService
@@ -33,6 +34,7 @@ from taskforge.worker.start import (
     TaskStartServiceUnavailable,
 )
 from taskforge.worker.start_persistence_ports import TaskStartClaimStale
+from taskforge.workflows.persistence_ports import WorkflowOwnerRecordNotFound
 from taskforge.workflows.service import (
     WorkflowNotFound,
     WorkflowService,
@@ -179,16 +181,19 @@ async def assert_all_rejected_families_fail_closed(database_url: object) -> None
     authenticated = AuthenticatedWorker(uuid4(), uuid4())
     try:
         claim = TaskClaimService(Any, Any, lease_seconds=30, rejected_audit=recorder)  # type: ignore[arg-type]
-        for action in ("task_claim.acquire", "task_claim.renew"):
+        for action, reason_code, provenance in (
+            ("task_claim.acquire", "obsolete_task", {"attempt_number": 1}),
+            ("task_claim.renew", "stale_claim", {"claim_generation": 1}),
+        ):
             with pytest.raises(TaskClaimServiceUnavailable):
                 await claim._audit_rejection(
                     authenticated,
                     uuid4(),
                     action=action,
-                    reason_code="obsolete_task",
+                    reason_code=reason_code,
                     task_attempt_id=resource_id,
                     correlation_id=str(correlation_id),
-                    provenance={},
+                    provenance=provenance,
                 )
 
         class StartRepository:
@@ -216,14 +221,14 @@ async def assert_all_rejected_families_fail_closed(database_url: object) -> None
             )
 
         workflow = WorkflowService(Any, Any, recorder)  # type: ignore[arg-type]
-        for action in (
-            "workflow.create",
-            "workflow.publish",
-            "workflow.availability_change",
+        for action, error in (
+            ("workflow.create", WorkflowOwnerRecordNotFound()),
+            ("workflow.publish", WorkflowNotFound()),
+            ("workflow.availability_change", WorkflowNotFound()),
         ):
             with pytest.raises(WorkflowServiceUnavailable):
                 await workflow._audit_rejection(
-                    WorkflowNotFound(),
+                    error,
                     action=action,
                     workflow_id=resource_id,
                     principal_id=principal_id,
@@ -231,9 +236,9 @@ async def assert_all_rejected_families_fail_closed(database_url: object) -> None
                 )
 
         runs = WorkflowRunService(Any, recorder)  # type: ignore[arg-type]
-        for action, resource_type in (
-            ("workflow_run.cancel", "workflow_run"),
-            ("workflow_run.create", "workflow"),
+        for action, resource_type, reason in (
+            ("workflow_run.cancel", "workflow_run", "workflow_run_not_visible"),
+            ("workflow_run.create", "workflow", "idempotency_conflict"),
         ):
             with pytest.raises(WorkflowRunServiceUnavailable):
                 await runs._audit_command_rejection(
@@ -242,7 +247,7 @@ async def assert_all_rejected_families_fail_closed(database_url: object) -> None
                     resource_id=resource_id,
                     principal_id=principal_id,
                     correlation_id=correlation_id,
-                    reasons={WorkflowNotFound: "workflow_run_not_visible"},
+                    reasons={WorkflowNotFound: reason},
                     resource_type=resource_type,
                 )
 
@@ -261,20 +266,35 @@ async def assert_all_rejected_families_fail_closed(database_url: object) -> None
                     correlation_id=correlation_id,
                 )
 
-        for action, reason in (
-            ("worker_session.register", "registration_conflict"),
-            ("worker_session.capabilities_replace", "worker_session_inactive"),
-            ("worker_session.heartbeat", "stale_heartbeat"),
+        for action, reason, session_id, provenance in (
+            (
+                "worker_session.register",
+                "registration_conflict",
+                None,
+                {"capabilities": bounded_string_set(())},
+            ),
+            (
+                "worker_session.capabilities_replace",
+                "worker_session_inactive",
+                resource_id,
+                {"capabilities": bounded_string_set(())},
+            ),
+            (
+                "worker_session.heartbeat",
+                "stale_heartbeat",
+                resource_id,
+                {"sequence": 1},
+            ),
         ):
             with pytest.raises(WorkerRejectedAuditUnavailable):
                 await _worker_rejected(
                     recorder,
                     authenticated,
-                    None,
+                    session_id,
                     action,
                     reason,
                     correlation_id,
-                    {},
+                    provenance,
                 )
     finally:
         await engine.dispose()

@@ -109,7 +109,12 @@ async def raw_append(
         run_id,
         task_id,
         event_type,
-        json.dumps({"status": "running"}),
+        json.dumps(
+            {
+                "previous_status": "blocked" if task_id is not None else "pending",
+                "status": "running",
+            }
+        ),
     )
     assert row is not None
     return row
@@ -290,7 +295,7 @@ async def verify_session_atomicity(database_url: URL) -> None:
                         run_id,
                         other_task,
                         "task_run.status_changed",
-                        {"status": "runnable"},
+                        {"previous_status": "blocked", "status": "runnable"},
                     ),
                 )
         assert (

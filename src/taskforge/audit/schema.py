@@ -52,6 +52,10 @@ audit_records = Table(
     CheckConstraint(
         "actor_kind IN ('api_principal','worker','system')", name="actor_kind_valid"
     ),
+    CheckConstraint(
+        "action ~ '^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)+$'",
+        name="action_namespaced",
+    ),
     CheckConstraint("outcome IN ('accepted','rejected')", name="outcome_valid"),
     CheckConstraint(
         "action ~ '^[a-z][a-z0-9_.-]{0,127}$' AND "
