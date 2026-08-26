@@ -29,6 +29,7 @@ class AuditOutcome(StrEnum):
 
 
 class AuditAction(StrEnum):
+    AUDIT_EXPORT = "audit.export"
     WORKFLOW_CREATE = "workflow.create"
     WORKFLOW_PUBLISH = "workflow.publish"
     WORKFLOW_AVAILABILITY_CHANGE = "workflow.availability_change"
@@ -39,6 +40,7 @@ class AuditAction(StrEnum):
     WORKFLOW_RUN_CREATE = "workflow_run.create"
     WORKFLOW_RUN_CANCEL = "workflow_run.cancel"
     WORKFLOW_RUN_REPLAY = "workflow_run.replay"
+    WORKFLOW_RUN_HISTORY_EXPORT = "workflow_run.history_export"
     TASK_CLAIM_ACQUIRE = "task_claim.acquire"
     TASK_CLAIM_RENEW = "task_claim.renew"
     TASK_ATTEMPT_START = "task_attempt.start"
@@ -111,6 +113,13 @@ _EMPTY: Mapping[str, _FieldRule] = MappingProxyType({})
 _SUMMARY = _FieldRule("summary")
 _POSITIVE = _FieldRule("positive_int")
 _NONNEGATIVE = _FieldRule("nonnegative_int")
+_EXPORT_PROVENANCE = MappingProxyType(
+    {
+        "export_schema_version": _FieldRule("export_schema_version"),
+        "filter_fingerprint": _FieldRule("sha256"),
+        "high_water_present": _FieldRule("boolean"),
+    }
+)
 _OPTIONAL_COUNTS = MappingProxyType(
     {
         "step_count": _FieldRule("nonnegative_int", required=False),
@@ -146,6 +155,17 @@ _SYSTEM = frozenset({AuditActorKind.SYSTEM})
 
 _AUDIT_CONTRACTS: Mapping[AuditAction, _AuditContract] = MappingProxyType(
     {
+        AuditAction.AUDIT_EXPORT: _AuditContract(
+            _API,
+            "audit_records",
+            MappingProxyType(
+                {
+                    AuditOutcome.ACCEPTED: _OutcomeContract(
+                        _EXPORT_PROVENANCE, target_always_optional=True
+                    )
+                }
+            ),
+        ),
         AuditAction.WORKFLOW_CREATE: _AuditContract(
             _API,
             "workflow",
@@ -333,6 +353,11 @@ _AUDIT_CONTRACTS: Mapping[AuditAction, _AuditContract] = MappingProxyType(
                     )
                 }
             ),
+        ),
+        AuditAction.WORKFLOW_RUN_HISTORY_EXPORT: _AuditContract(
+            _API,
+            "workflow_run",
+            MappingProxyType({AuditOutcome.ACCEPTED: _accepted(_EXPORT_PROVENANCE)}),
         ),
         AuditAction.TASK_CLAIM_ACQUIRE: _AuditContract(
             _WORKER,
@@ -612,6 +637,14 @@ def _validate_semantics(record: AuditRecord, provenance: dict[str, object]) -> N
 
 
 def _valid_field(value: object, shape: str) -> bool:
+    if shape == "boolean":
+        return type(value) is bool
+    if shape == "sha256":
+        return (
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+    if shape == "export_schema_version":
+        return value == "taskforge.history-export.v1"
     if shape == "positive_int":
         return type(value) is int and value > 0
     if shape == "nonnegative_int":

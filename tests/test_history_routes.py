@@ -15,10 +15,12 @@ from pydantic import SecretStr
 from taskforge.api.application import create_app
 from taskforge.api.health import ReadinessCoordinator
 from taskforge.history.domain import (
+    HistoryCursor,
     HistoryItem,
     HistoryPage,
     HistoryRecordType,
 )
+from taskforge.history.export import ExportState
 from taskforge.history.service import HistoryNotFound
 from taskforge.identity.authentication import APIAuthenticator, WorkerAuthenticator
 from taskforge.identity.authorization import AuthorizationService, OwnerFilter, Role
@@ -99,6 +101,46 @@ class HistoryServiceStub:
         )
 
 
+class HistoryExportServiceStub:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.not_found = False
+        self.export_items: tuple[HistoryItem, ...] = ()
+
+    async def initialize(self, *args: object) -> ExportState:
+        self.calls.append(args)
+        if self.not_found:
+            raise HistoryNotFound
+        scope_type, scope_id, owner_filter, _, _, filters = args
+        high_water = None
+        if self.export_items:
+            first = self.export_items[0]
+            high_water = HistoryCursor(
+                str(scope_type),
+                scope_id if isinstance(scope_id, UUID) else None,
+                "",
+                first.occurred_at,
+                first.record_type,
+                first.source_rank,
+                first.source_key,
+            )
+        return ExportState(
+            str(scope_type),
+            scope_id if isinstance(scope_id, UUID) else None,
+            filters,  # type: ignore[arg-type]
+            owner_filter,  # type: ignore[arg-type]
+            "0" * 64,
+            datetime(2026, 8, 26, tzinfo=UTC),
+            high_water,
+            uuid4(),
+        )
+
+    async def items(self, state: ExportState) -> object:
+        del state
+        for item in self.export_items:
+            yield item
+
+
 class Runtime:
     def __init__(
         self,
@@ -112,6 +154,7 @@ class Runtime:
         )
         self.authorization_service = authorization
         self.history_service = history
+        self.history_export_service = HistoryExportServiceStub()
 
     async def close(self) -> None: ...
 
@@ -134,6 +177,7 @@ def _app(role: Role) -> tuple[FastAPI, str, HistoryServiceStub, UUID]:
         AuthorizationService(RoleRepository(role), timeout_seconds=0.05),
         history,
     )
+    history.export_service = runtime.history_export_service  # type: ignore[attr-defined]
     settings = Settings(
         postgres_password=SecretStr("test"), rabbitmq_password=SecretStr("test")
     )
@@ -224,3 +268,113 @@ def test_exactly_six_history_routes_are_registered() -> None:
         "/api/v1/workers/{resource_id}/history",
         "/api/v1/dead-letters/{resource_id}/history",
     }
+
+
+def test_audit_export_is_admin_only_and_streams_frozen_empty_ndjson() -> None:
+    app, credential, _, _ = _app(Role.ADMINISTRATOR)
+    response = _get(
+        app,
+        credential,
+        "/api/v1/audit-records/export?action=workflow.publish&occurred_to=2026-08-27T00:00:00Z",
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+    lines = [__import__("json").loads(line) for line in response.text.splitlines()]
+    assert [line["kind"] for line in lines] == ["manifest", "completion"]
+    assert lines[0]["high_water"] is None
+    assert lines[1] == {
+        "kind": "completion",
+        "schema_version": "taskforge.history-export.v1",
+        "record_count": 0,
+        "records_sha256": (
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ),
+    }
+    runtime = app.state.authentication
+    call = runtime.history_export_service.calls[0]
+    assert call[0] == "audit"
+    assert call[2] == OwnerFilter.all_owners()
+    assert call[5].action.value == "workflow.publish"
+
+
+def test_exactly_two_history_export_routes_are_registered() -> None:
+    from taskforge.api.history import router
+
+    assert {
+        route.path
+        for route in router.routes
+        if getattr(route, "path", "").endswith("/export")
+    } == {
+        "/api/v1/audit-records/export",
+        "/api/v1/workflow-runs/{resource_id}/history/export",
+    }
+
+
+def test_viewer_cannot_export_global_audit() -> None:
+    app, credential, _, _ = _app(Role.VIEWER)
+    response = _get(app, credential, "/api/v1/audit-records/export")
+    assert response.status_code == 403
+    assert app.state.authentication.history_export_service.calls == []
+
+
+def test_run_export_reuses_filters_and_confidential_owner_scope() -> None:
+    app, credential, _, principal_id = _app(Role.VIEWER)
+    run_id = uuid4()
+    response = _get(
+        app,
+        credential,
+        f"/api/v1/workflow-runs/{run_id}/history/export?actor_kind=api_principal&actor_id={principal_id}",
+    )
+    assert response.status_code == 200
+    call = app.state.authentication.history_export_service.calls[0]
+    assert call[0:3] == ("run", run_id, OwnerFilter.only(principal_id))
+    assert call[5].actor_id == principal_id
+    assert call[5].normalized()["actor_kind"] == "api_principal"
+
+    app.state.authentication.history_export_service.not_found = True
+    missing = _get(
+        app,
+        credential,
+        f"/api/v1/workflow-runs/{uuid4()}/history/export",
+    )
+    assert missing.status_code == 404
+
+
+def test_export_record_uses_redacted_schema_and_digest_of_exact_line() -> None:
+    import hashlib
+    import json
+
+    app, credential, history, _ = _app(Role.ADMINISTRATOR)
+    identifier = uuid4()
+    history.export_service.export_items = (  # type: ignore[attr-defined]
+        HistoryItem(
+            HistoryRecordType.AUDIT_RECORD,
+            datetime(2026, 8, 26, 1, 2, 3, 4, tzinfo=UTC),
+            10,
+            str(identifier),
+            "safe-correlation",
+            {
+                "id": identifier,
+                "actor_kind": "api_principal",
+                "api_principal_id": uuid4(),
+                "worker_identity_id": None,
+                "worker_session_id": None,
+                "system_component": None,
+                "action": "workflow.publish",
+                "outcome": "accepted",
+                "reason_code": None,
+                "resource_type": "workflow",
+                "resource_id": uuid4(),
+                "diagnostic_provenance": {},
+            },
+        ),
+    )
+    response = _get(app, credential, "/api/v1/audit-records/export")
+    raw_lines = response.content.splitlines(keepends=True)
+    record = json.loads(raw_lines[1])
+    assert record["occurred_at"] == "2026-08-26T01:02:03.000004Z"
+    assert "input" not in record["data"]
+    completion_record = json.loads(raw_lines[2])
+    assert (
+        completion_record["records_sha256"] == hashlib.sha256(raw_lines[1]).hexdigest()
+    )

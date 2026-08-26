@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from taskforge.claims.service import TaskClaimInspectionService
 from taskforge.dead_letters.service import DeadLetterService
+from taskforge.history.export_service import HistoryExportService
 from taskforge.history.service import HistoryService
 from taskforge.identity.authentication import (
     APIAuthenticator,
@@ -26,7 +27,7 @@ from taskforge.identity.credentials import (
     parse_presented_credential,
 )
 from taskforge.identity.principals import PrincipalProfileService
-from taskforge.persistence.audit import RejectedAuditUnitOfWork
+from taskforge.persistence.audit import AuditUnitOfWork, RejectedAuditUnitOfWork
 from taskforge.persistence.authentication import (
     SQLAlchemyAPICredentialRepository,
     SQLAlchemyWorkerCredentialRepository,
@@ -95,6 +96,7 @@ class AuthenticationRuntime:
         dead_letter_service: DeadLetterService,
         workflow_run_execution_event_repository: WorkflowRunExecutionEventRepository,
         history_service: HistoryService,
+        history_export_service: HistoryExportService,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
@@ -114,6 +116,7 @@ class AuthenticationRuntime:
             workflow_run_execution_event_repository
         )
         self.history_service = history_service
+        self.history_export_service = history_export_service
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -186,6 +189,9 @@ def build_authentication_runtime(
             SQLAlchemyWorkflowRunExecutionEventRepository(sessions)
         ),
         history_service=HistoryService(SQLAlchemyHistoryRepository(sessions)),
+        history_export_service=HistoryExportService(
+            SQLAlchemyHistoryRepository(sessions), AuditUnitOfWork(sessions)
+        ),
     )
 
 

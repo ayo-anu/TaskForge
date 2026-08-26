@@ -16,6 +16,12 @@ class RejectedAuditRecorder(Protocol):
     async def record(self, record: AuditRecord) -> None: ...
 
 
+class AuditRecorder(Protocol):
+    """Service-owned boundary for one independent accepted audit write."""
+
+    async def record(self, record: AuditRecord) -> None: ...
+
+
 async def append_audit_record(session: AsyncSession, record: AuditRecord) -> None:
     await session.execute(
         insert(audit_records).values(
@@ -46,3 +52,12 @@ class RejectedAuditUnitOfWork:
                 await append_audit_record(session, record)
         except SQLAlchemyError as error:
             raise AuditRejected from error
+
+
+class AuditUnitOfWork:
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def record(self, record: AuditRecord) -> None:
+        async with self._sessions.begin() as session:
+            await append_audit_record(session, record)

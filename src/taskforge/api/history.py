@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Annotated, Protocol, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from taskforge.api.authorization import require_permission
@@ -20,6 +23,17 @@ from taskforge.history.domain import (
     decode_cursor,
     encode_cursor,
     filter_fingerprint,
+)
+from taskforge.history.export import (
+    ExportState,
+    canonical_timestamp,
+    completion,
+    manifest,
+    ndjson_line,
+)
+from taskforge.history.export_service import (
+    HistoryExportService,
+    HistoryExportUnavailable,
 )
 from taskforge.history.service import (
     HistoryNotFound,
@@ -173,6 +187,7 @@ class HistoryResponse(BaseModel):
 
 class HistoryRuntimeProtocol(Protocol):
     history_service: HistoryService
+    history_export_service: HistoryExportService
 
 
 router = APIRouter(tags=["history"])
@@ -184,9 +199,7 @@ class HistoryQueryParameters(BaseModel):
     filters: HistoryFilters
 
 
-async def history_query_parameters(
-    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
-    cursor: Annotated[str | None, Query(max_length=2048)] = None,
+async def history_filter_parameters(
     record_type: HistoryRecordType | None = None,
     resource_type: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
     target_resource_id: Annotated[UUID | None, Query(alias="resource_id")] = None,
@@ -199,7 +212,7 @@ async def history_query_parameters(
     reason_code: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     occurred_from: datetime | None = None,
     occurred_to: datetime | None = None,
-) -> HistoryQueryParameters:
+) -> HistoryFilters:
     try:
         filters = HistoryFilters(
             record_type,
@@ -217,6 +230,14 @@ async def history_query_parameters(
         )
     except ValueError as error:
         raise HTTPException(status_code=422) from error
+    return filters
+
+
+async def history_query_parameters(
+    filters: Annotated[HistoryFilters, Depends(history_filter_parameters)],
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
+    cursor: Annotated[str | None, Query(max_length=2048)] = None,
+) -> HistoryQueryParameters:
     return HistoryQueryParameters(limit=limit, cursor=cursor, filters=filters)
 
 
@@ -229,6 +250,17 @@ async def list_audit_records(
     query: Annotated[HistoryQueryParameters, Depends(history_query_parameters)],
 ) -> HistoryResponse | Response:
     return await _list(request, context, "audit", None, query)
+
+
+@router.get("/api/v1/audit-records/export")
+async def export_audit_records(
+    request: Request,
+    context: Annotated[
+        AuthorizationContext, Depends(require_permission(Permission.ADMINISTER))
+    ],
+    filters: Annotated[HistoryFilters, Depends(history_filter_parameters)],
+) -> StreamingResponse:
+    return await _export(request, context, "audit", None, filters)
 
 
 @router.get("/api/v1/workflows/{resource_id}/history", response_model=HistoryResponse)
@@ -256,6 +288,18 @@ async def list_run_history(
 ) -> HistoryResponse | Response:
     """Inspect execution/control-plane history; this is not state reconstruction."""
     return await _list(request, context, "run", resource_id, query)
+
+
+@router.get("/api/v1/workflow-runs/{resource_id}/history/export")
+async def export_run_history(
+    resource_id: UUID,
+    request: Request,
+    context: Annotated[
+        AuthorizationContext, Depends(require_permission(Permission.VIEW))
+    ],
+    filters: Annotated[HistoryFilters, Depends(history_filter_parameters)],
+) -> StreamingResponse:
+    return await _export(request, context, "run", resource_id, filters)
 
 
 @router.get("/api/v1/task-runs/{resource_id}/history", response_model=HistoryResponse)
@@ -373,3 +417,63 @@ def _response(item: HistoryItem) -> HistoryItemResponse:
         correlation_id=item.correlation_id,
         data=cast(HistoryDataResponse, item.data),
     )
+
+
+async def _export(
+    request: Request,
+    context: AuthorizationContext,
+    scope_type: str,
+    scope_id: UUID | None,
+    filters: HistoryFilters,
+) -> StreamingResponse:
+    service = cast(
+        HistoryRuntimeProtocol, request.app.state.authentication
+    ).history_export_service
+    try:
+        state = await service.initialize(
+            scope_type,
+            scope_id,
+            context.owner_filter_for(
+                Permission.ADMINISTER if scope_type == "audit" else Permission.VIEW
+            ),
+            context.principal_id,
+            cast(UUID, request.state.request_id),
+            filters,
+        )
+    except HistoryNotFound as error:
+        raise HTTPException(status_code=404) from error
+    except HistoryExportUnavailable as error:
+        raise HTTPException(status_code=503) from error
+
+    filename_scope = "audit" if scope_id is None else f"workflow-run-{scope_id}"
+    return StreamingResponse(
+        _export_stream(service, state),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="taskforge-{filename_scope}-history.ndjson"'
+            )
+        },
+    )
+
+
+async def _export_stream(
+    service: HistoryExportService, state: ExportState
+) -> AsyncIterator[bytes]:
+    yield ndjson_line(manifest(state))
+    digest = hashlib.sha256()
+    count = 0
+    async for item in service.items(state):
+        response = _response(item).model_dump(mode="json")
+        response["occurred_at"] = canonical_timestamp(item.occurred_at)
+        line = ndjson_line(
+            {
+                "kind": "record",
+                "schema_version": "taskforge.history-export.v1",
+                **response,
+            }
+        )
+        digest.update(line)
+        count += 1
+        yield line
+    yield ndjson_line(completion(count, digest.hexdigest()))

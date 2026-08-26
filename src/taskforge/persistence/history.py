@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.audit.domain import canonical_audit_action, stored_audit_actions
@@ -16,6 +16,7 @@ from taskforge.history.domain import (
     HistoryPage,
     HistoryRecordType,
 )
+from taskforge.history.export import ExportInitialization
 from taskforge.history.service import HistoryNotFound
 from taskforge.identity.authorization import OwnerFilter
 
@@ -87,6 +88,137 @@ class SQLAlchemyHistoryRepository:
             )
         return HistoryPage(items, next_cursor)
 
+    async def initialize_export(
+        self,
+        scope_type: str,
+        scope_id: UUID | None,
+        owner_filter: OwnerFilter,
+        filters: HistoryFilters,
+    ) -> ExportInitialization:
+        async with self._sessions() as session:
+            await _authorize(session, scope_type, scope_id, owner_filter)
+            generated_at = await session.scalar(select(func.statement_timestamp()))
+            rows = (
+                (
+                    await session.execute(
+                        text(_SCOPE_SQL[scope_type] + _filter_sql(filters)),
+                        _query_params(
+                            scope_id,
+                            limit=1,
+                            cursor=None,
+                            filters=filters,
+                        ),
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        if generated_at is None:
+            raise RuntimeError("PostgreSQL did not return export initialization time")
+        high_water = None
+        if rows:
+            item = _item(rows[0])
+            high_water = HistoryCursor(
+                scope_type,
+                scope_id,
+                "",
+                item.occurred_at,
+                item.record_type,
+                item.source_rank,
+                item.source_key,
+            )
+        return ExportInitialization(generated_at, high_water)
+
+    async def list_export_page(
+        self,
+        scope_type: str,
+        scope_id: UUID | None,
+        owner_filter: OwnerFilter,
+        *,
+        limit: int,
+        after: HistoryCursor | None,
+        high_water: HistoryCursor,
+        current_export_audit_id: UUID,
+        filters: HistoryFilters,
+    ) -> tuple[HistoryItem, ...]:
+        async with self._sessions() as session:
+            await _authorize(session, scope_type, scope_id, owner_filter)
+            params = _query_params(
+                scope_id,
+                limit=limit,
+                cursor=after,
+                filters=filters,
+            )
+            params.update(
+                {
+                    "high_water_time": high_water.occurred_at,
+                    "high_water_rank": high_water.source_rank,
+                    "high_water_key": high_water.source_key,
+                    "current_export_audit_id": str(current_export_audit_id),
+                }
+            )
+            rows = (
+                (
+                    await session.execute(
+                        text(_EXPORT_SCOPE_SQL[scope_type] + _filter_sql(filters)),
+                        params,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return tuple(_item(row) for row in rows)
+
+
+async def _authorize(
+    session: AsyncSession,
+    scope_type: str,
+    scope_id: UUID | None,
+    owner_filter: OwnerFilter,
+) -> None:
+    if scope_type == "audit":
+        return
+    exists = await session.scalar(
+        text(_AUTH_SQL[scope_type]),
+        {
+            "id": scope_id,
+            "owner": owner_filter.principal_id,
+            "unrestricted": owner_filter.unrestricted,
+        },
+    )
+    if exists is None:
+        raise HistoryNotFound
+
+
+def _query_params(
+    scope_id: UUID | None,
+    *,
+    limit: int,
+    cursor: HistoryCursor | None,
+    filters: HistoryFilters,
+) -> dict[str, Any]:
+    return {
+        "id": scope_id,
+        "limit": limit,
+        "cursor_time": cursor.occurred_at if cursor else None,
+        "cursor_rank": cursor.source_rank if cursor else None,
+        "cursor_key": cursor.source_key if cursor else None,
+        "record_type": filters.record_type.value if filters.record_type else None,
+        "resource_type": filters.resource_type,
+        "resource_id": filters.resource_id,
+        "actions": list(stored_audit_actions(filters.action))
+        if filters.action
+        else None,
+        "outcome": filters.outcome.value if filters.outcome else None,
+        "actor_kind": filters.actor_kind.value if filters.actor_kind else None,
+        "actor_id": filters.actor_id,
+        "system_component": filters.system_component,
+        "correlation_id": filters.correlation_id,
+        "reason_code": filters.reason_code,
+        "occurred_from": filters.occurred_from,
+        "occurred_to": filters.occurred_to,
+    }
+
 
 def _item(row: Any) -> HistoryItem:
     record_type = HistoryRecordType(row["record_type"])
@@ -115,6 +247,8 @@ _FILTER_COLUMNS = ",NULL::text resource_type,NULL::uuid resource_id,NULL::text a
 _WORKER_FILTER_COLUMNS = ",NULL::text resource_type,NULL::uuid resource_id,NULL::text audit_action,NULL::text audit_outcome,'worker'::text actor_kind,NULL::uuid api_principal_id,{identity} worker_identity_id,NULL::text system_component,NULL::text reason_code"
 _API_FILTER_COLUMNS = ",NULL::text resource_type,NULL::uuid resource_id,NULL::text audit_action,NULL::text audit_outcome,'api_principal'::text actor_kind,{principal} api_principal_id,NULL::uuid worker_identity_id,NULL::text system_component,NULL::text reason_code"
 _BOUNDARY = "AND (CAST(:cursor_time AS timestamptz) IS NULL OR (occurred_at, source_rank, source_key) < (CAST(:cursor_time AS timestamptz), CAST(:cursor_rank AS integer), CAST(:cursor_key AS text)))"
+_HIGH_WATER_BOUNDARY = "AND (occurred_at, source_rank, source_key) <= (CAST(:high_water_time AS timestamptz), CAST(:high_water_rank AS integer), CAST(:high_water_key AS text))"
+_CURRENT_EXPORT_AUDIT_EXCLUSION = "AND (record_type <> 'audit_record' OR source_key <> CAST(:current_export_audit_id AS text))"
 _ORDER = " ORDER BY occurred_at DESC, source_rank DESC, source_key DESC LIMIT :limit"
 _AUDIT_SELECT = "SELECT 'audit_record' record_type,10 source_rank,a.id::text source_key,a.occurred_at,a.correlation_id,jsonb_build_object('id',a.id,'actor_kind',a.actor_kind,'api_principal_id',a.api_principal_id,'worker_identity_id',a.worker_identity_id,'worker_session_id',a.worker_session_id,'system_component',a.system_component,'action',a.action,'outcome',a.outcome,'reason_code',a.reason_code,'resource_type',a.resource_type,'resource_id',a.resource_id,'diagnostic_provenance',a.diagnostic_provenance) data,a.resource_type,a.resource_id,a.action audit_action,a.outcome audit_outcome,a.actor_kind,a.api_principal_id,a.worker_identity_id,a.system_component,a.reason_code FROM audit_records a"
 _EXEC = (
@@ -271,4 +405,13 @@ _SCOPE_SQL = {
             + " WHERE a.resource_type='dead_letter' AND a.resource_id=:id",
         ]
     ),
+}
+
+_EXPORT_SCOPE_SQL = {
+    scope: sql.replace(
+        _BOUNDARY,
+        _BOUNDARY + _HIGH_WATER_BOUNDARY + _CURRENT_EXPORT_AUDIT_EXCLUSION,
+    )
+    for scope, sql in _SCOPE_SQL.items()
+    if scope in {"audit", "run"}
 }

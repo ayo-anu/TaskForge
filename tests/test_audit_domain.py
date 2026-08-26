@@ -71,7 +71,28 @@ def _actor(kind: AuditActorKind) -> AuditActor:
 
 
 _SUMMARY = {"count": 1, "sha256": "0" * 64}
+_EXPORT_PROVENANCE = {
+    "export_schema_version": "taskforge.history-export.v1",
+    "filter_fingerprint": "0" * 64,
+    "high_water_present": True,
+}
 _VALID_CONTRACT_CASES = (
+    (
+        AuditAction.AUDIT_EXPORT,
+        AuditOutcome.ACCEPTED,
+        AuditActorKind.API_PRINCIPAL,
+        "audit_records",
+        _EXPORT_PROVENANCE,
+        None,
+    ),
+    (
+        AuditAction.WORKFLOW_RUN_HISTORY_EXPORT,
+        AuditOutcome.ACCEPTED,
+        AuditActorKind.API_PRINCIPAL,
+        "workflow_run",
+        _EXPORT_PROVENANCE,
+        None,
+    ),
     (
         AuditAction.WORKFLOW_CREATE,
         AuditOutcome.ACCEPTED,
@@ -325,8 +346,11 @@ def test_every_supported_audit_action_outcome_contract(
 ) -> None:
     target = (
         None
-        if action is AuditAction.WORKER_SESSION_REGISTER
-        and outcome is AuditOutcome.REJECTED
+        if action is AuditAction.AUDIT_EXPORT
+        or (
+            action is AuditAction.WORKER_SESSION_REGISTER
+            and outcome is AuditOutcome.REJECTED
+        )
         else uuid4()
     )
     record = AuditRecord(
@@ -348,6 +372,36 @@ def test_contract_covers_every_canonical_action_and_legacy_alias() -> None:
     assert {
         alias: canonical_audit_action(alias) for alias in AUDIT_ACTION_ALIASES
     } == dict(AUDIT_ACTION_ALIASES)
+
+
+def test_export_audit_contract_is_accepted_only_and_redacted() -> None:
+    principal = _actor(AuditActorKind.API_PRINCIPAL)
+    AuditRecord(
+        uuid4(),
+        principal,
+        AuditAction.AUDIT_EXPORT.value,
+        AuditOutcome.ACCEPTED,
+        "audit_records",
+        None,
+        str(uuid4()),
+        _EXPORT_PROVENANCE,
+    )
+    for invalid in (
+        {**_EXPORT_PROVENANCE, "raw_filters": {"reason": "secret"}},
+        {**_EXPORT_PROVENANCE, "filter_fingerprint": "not-a-digest"},
+        {**_EXPORT_PROVENANCE, "export_schema_version": "unversioned"},
+    ):
+        with pytest.raises(ValueError):
+            AuditRecord(
+                uuid4(),
+                principal,
+                AuditAction.AUDIT_EXPORT.value,
+                AuditOutcome.ACCEPTED,
+                "audit_records",
+                None,
+                None,
+                invalid,
+            )
 
 
 def test_semantically_impossible_audit_shapes_are_rejected() -> None:
