@@ -7,7 +7,7 @@ import os
 import pytest
 from pydantic import ValidationError
 
-from taskforge.settings import Settings
+from taskforge.settings import OwnerSettings, Settings
 
 ENVIRONMENT_PREFIX = "TASKFORGE_"
 DEPENDENCY_ENVIRONMENT_VARIABLES = {
@@ -16,6 +16,8 @@ DEPENDENCY_ENVIRONMENT_VARIABLES = {
     "POSTGRES_DB",
     "POSTGRES_USER",
     "POSTGRES_PASSWORD",
+    "POSTGRES_OWNER_USER",
+    "POSTGRES_OWNER_PASSWORD",
     "RABBITMQ_HOST",
     "RABBITMQ_AMQP_PORT",
     "RABBITMQ_DEFAULT_USER",
@@ -145,6 +147,24 @@ def test_settings_accept_compose_compatible_dependency_variables(
     assert settings.rabbitmq_user == "rabbitmq-test-user"
     assert settings.rabbitmq_password.get_secret_value() == "rabbitmq-test-secret"
     assert settings.rabbitmq_vhost == "taskforge_test"
+
+
+def test_runtime_settings_ignore_owner_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POSTGRES_USER", "taskforge_runtime")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "runtime-secret")
+    monkeypatch.setenv("POSTGRES_OWNER_USER", "taskforge_owner")
+    monkeypatch.setenv("POSTGRES_OWNER_PASSWORD", "owner-secret")
+
+    runtime = Settings()
+    owner = OwnerSettings()
+
+    assert runtime.postgres_user == "taskforge_runtime"
+    assert runtime.postgres_password.get_secret_value() == "runtime-secret"
+    assert owner.postgres_user == "taskforge_owner"
+    assert owner.postgres_password.get_secret_value() == "owner-secret"
+    assert "owner-secret" not in repr(runtime)
 
 
 def test_dependency_passwords_are_required(

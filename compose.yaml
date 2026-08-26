@@ -3,12 +3,15 @@ services:
     image: postgres:18.4-bookworm
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-taskforge}
-      POSTGRES_USER: ${POSTGRES_USER:-taskforge}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_USER: ${POSTGRES_OWNER_USER:-taskforge_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD must be set}
+      TASKFORGE_RUNTIME_USER: ${POSTGRES_USER:-taskforge_runtime}
+      TASKFORGE_RUNTIME_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql
+      - ./docker/postgres/init-taskforge-roles.sh:/docker-entrypoint-initdb.d/10-taskforge-roles.sh:ro
     networks:
       - backend
     healthcheck:

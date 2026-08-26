@@ -1,4 +1,4 @@
-.PHONY: install format format-check lint typecheck test coverage migrations-check migration-test claim-test renewal-test retry-test recovery-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test check clean
+.PHONY: install format format-check lint typecheck test coverage privilege-bootstrap migrations-check migration-test claim-test renewal-test retry-test recovery-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test check clean
 
 install:
 	uv sync --locked --dev
@@ -21,13 +21,17 @@ test:
 coverage:
 	uv run pytest --cov=taskforge --cov-report=term-missing
 
+# Run before Alembic 0027 when upgrading an existing initialized Compose volume.
+privilege-bootstrap:
+	docker compose exec postgres sh /docker-entrypoint-initdb.d/10-taskforge-roles.sh
+
 migrations-check:
 	uv run alembic heads --verbose
 
 migration-test:
 	@test "$${TASKFORGE_RUN_MIGRATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_MIGRATION_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_MIGRATION_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_MIGRATION_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_identity_migrations.py tests/integration/test_workflow_definition_migrations.py tests/integration/test_workflow_run_migrations.py tests/integration/test_task_dispatch_migrations.py tests/integration/test_task_claim_migrations.py tests/integration/test_task_claim_event_migrations.py tests/integration/test_retry_persistence_migrations.py tests/integration/test_retry_event_migrations.py tests/integration/test_recovery_migrations.py tests/integration/test_recovery_event_migrations.py tests/integration/test_dead_letter_migrations.py tests/integration/test_workflow_cancellation_migrations.py tests/integration/test_execution_event_migrations.py tests/integration/test_workflow_replay_migrations.py
+	uv run pytest tests/integration/test_identity_migrations.py tests/integration/test_workflow_definition_migrations.py tests/integration/test_workflow_run_migrations.py tests/integration/test_task_dispatch_migrations.py tests/integration/test_task_claim_migrations.py tests/integration/test_task_claim_event_migrations.py tests/integration/test_retry_persistence_migrations.py tests/integration/test_retry_event_migrations.py tests/integration/test_recovery_migrations.py tests/integration/test_recovery_event_migrations.py tests/integration/test_dead_letter_migrations.py tests/integration/test_workflow_cancellation_migrations.py tests/integration/test_execution_event_migrations.py tests/integration/test_workflow_replay_migrations.py tests/integration/test_history_privileges.py
 
 claim-test:
 	@test "$${TASKFORGE_RUN_CLAIM_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_CLAIM_INTEGRATION=1 is required" >&2; exit 2)

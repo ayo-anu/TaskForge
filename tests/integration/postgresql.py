@@ -39,6 +39,7 @@ SAFE_DATABASE_NAME = re.compile(
     r"taskforge_execution_event_mig|taskforge_execution_events|"
     r"taskforge_workflow_replay_mig|taskforge_audit_mig|"
     r"taskforge_audit_semantics)_[0-9a-f]{32}\Z"
+    r"|taskforge_history_privileges_[0-9a-f]{32}\Z"
 )
 
 
@@ -98,6 +99,12 @@ async def create_database(administrative_url: URL, database_name: str) -> None:
     assert_safe_database_name(database_name)
     connection = await asyncpg.connect(asyncpg_dsn(administrative_url))
     try:
+        await connection.execute(
+            "DO $block$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE "
+            "rolname='taskforge_runtime') THEN CREATE ROLE taskforge_runtime "
+            "LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION "
+            "NOBYPASSRLS; END IF; END $block$"
+        )
         await connection.execute(f'CREATE DATABASE "{database_name}"')
     finally:
         await connection.close()

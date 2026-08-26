@@ -144,3 +144,15 @@ class Settings(BaseSettings):
                 "production requires an explicit claim result authority secret"
             )
         return self
+
+
+class OwnerSettings(Settings):
+    """Administrative settings whose database credential is the object owner."""
+
+    postgres_user: str = Field(
+        default="taskforge_owner",
+        validation_alias="POSTGRES_OWNER_USER",
+    )
+    postgres_password: SecretStr = Field(
+        validation_alias="POSTGRES_OWNER_PASSWORD",
+    )

@@ -80,9 +80,11 @@ def test_services_use_private_network_and_named_persistent_volumes(
     for service_name, expected_target in EXPECTED_VOLUME_TARGETS.items():
         service = services[service_name]
         assert set(service["networks"]) == {"backend"}
-        assert len(service["volumes"]) == 1
-        assert service["volumes"][0]["type"] == "volume"
-        assert service["volumes"][0]["target"] == expected_target
+        persistent = [
+            mount for mount in service["volumes"] if mount["type"] == "volume"
+        ]
+        assert len(persistent) == 1
+        assert persistent[0]["target"] == expected_target
 
 
 def test_published_ports_are_bound_to_loopback(
@@ -120,3 +122,22 @@ def test_redis_enables_password_authentication_without_embedding_password(
     assert "$${REDIS_PASSWORD}" in redis_command
     assert 'REDISCLI_AUTH="$${REDIS_PASSWORD}"' in healthcheck_command
     assert "replace-with-local-redis-password" not in redis_command
+
+
+def test_postgres_bootstrap_and_runtime_credentials_are_separate(
+    compose_configuration: dict[str, Any],
+) -> None:
+    postgres = compose_configuration["services"]["postgres"]
+    environment = postgres["environment"]
+
+    assert environment["POSTGRES_USER"] == "taskforge_owner"
+    assert environment["POSTGRES_PASSWORD"] == "replace-with-local-owner-password"
+    assert environment["TASKFORGE_RUNTIME_USER"] == "taskforge_runtime"
+    assert environment["TASKFORGE_RUNTIME_PASSWORD"] == (
+        "replace-with-local-runtime-password"
+    )
+    assert any(
+        mount["target"] == "/docker-entrypoint-initdb.d/10-taskforge-roles.sh"
+        and mount["read_only"] is True
+        for mount in postgres["volumes"]
+    )

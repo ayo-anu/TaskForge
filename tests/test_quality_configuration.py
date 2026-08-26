@@ -24,6 +24,7 @@ REQUIRED_MAKE_TARGETS = {
     "typecheck",
     "test",
     "coverage",
+    "privilege-bootstrap",
     "migrations-check",
     "migration-test",
     "claim-test",

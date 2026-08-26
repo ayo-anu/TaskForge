@@ -65,8 +65,14 @@ def test_migration_graph_has_one_workflow_head_and_locked_validation_commands() 
         "0024_add_workflow_run_replay_lineage.py",
         "0025_complete_audit_history.py",
         "0026_standardize_audit_semantics.py",
+        "0027_enforce_history_privileges.py",
     ]
     assert "migrations-check:\n\tuv run alembic heads --verbose" in makefile
+    assert "privilege-bootstrap:" in makefile
+    assert (
+        "docker compose exec postgres sh "
+        "/docker-entrypoint-initdb.d/10-taskforge-roles.sh" in makefile
+    )
     assert "migration-test:" in makefile
     assert "TASKFORGE_RUN_MIGRATION_INTEGRATION" in makefile
     assert "TASKFORGE_MIGRATION_TEST_DATABASE_URL" in makefile

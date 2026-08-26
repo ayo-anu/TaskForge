@@ -29,7 +29,7 @@ from taskforge.identity.provisioning import (
 )
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.provisioning import SQLAlchemyProvisioningRepository
-from taskforge.settings import Settings
+from taskforge.settings import OwnerSettings, Settings
 
 DURATION_PATTERN = re.compile(r"\A([1-9][0-9]*)([hdw])\Z")
 MUTATING_COMMANDS = frozenset(
@@ -95,7 +95,7 @@ def main(
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
-    settings_factory: Callable[[], Settings] = Settings,
+    settings_factory: Callable[[], Settings] = OwnerSettings,
 ) -> int:
     input_stream = stdin or sys.stdin
     output_stream = stdout or sys.stdout
