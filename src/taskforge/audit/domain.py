@@ -74,6 +74,18 @@ def canonical_audit_action(value: str) -> AuditAction:
     return alias if alias is not None else AuditAction(value)
 
 
+def stored_audit_actions(action: AuditAction) -> frozenset[str]:
+    """Return every historical stored spelling for one canonical action."""
+    return frozenset(
+        {action.value}
+        | {
+            stored
+            for stored, canonical in AUDIT_ACTION_ALIASES.items()
+            if canonical is action
+        }
+    )
+
+
 @dataclass(frozen=True)
 class _FieldRule:
     shape: str

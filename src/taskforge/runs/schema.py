@@ -167,8 +167,10 @@ workflow_run_replays = Table(
 )
 
 Index(
-    "ix_workflow_run_replays_source_workflow_run_id",
+    "ix_workflow_run_replays_source_created_at_run",
     workflow_run_replays.c.source_workflow_run_id,
+    workflow_run_replays.c.created_at.desc(),
+    workflow_run_replays.c.workflow_run_id.desc(),
 )
 
 workflow_run_cancellation_requests = Table(
@@ -374,6 +376,12 @@ workflow_run_execution_events = Table(
         "cursor",
         name="uq_workflow_run_execution_events_run_cursor",
     ),
+)
+Index(
+    "ix_workflow_run_execution_events_run_occurred_at_id",
+    workflow_run_execution_events.c.workflow_run_id,
+    workflow_run_execution_events.c.occurred_at.desc(),
+    workflow_run_execution_events.c.id.desc(),
 )
 
 task_attempts = Table(
@@ -805,6 +813,12 @@ Index(
     postgresql_where=task_result_events.c.event_type == "result_recovered",
 )
 
+Index(
+    "ix_task_claim_events_attempt_occurred_at_id",
+    task_claim_events.c.task_attempt_id,
+    task_claim_events.c.occurred_at.desc(),
+    task_claim_events.c.id.desc(),
+)
 Index(
     "uq_task_claim_events_acquired_generation",
     task_claim_events.c.task_attempt_id,

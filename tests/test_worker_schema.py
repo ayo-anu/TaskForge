@@ -123,7 +123,15 @@ def test_heartbeat_history_is_compact_and_session_scoped() -> None:
             "RESTRICT",
         ),
     }
-    assert worker_heartbeats.indexes == set()
+    assert {
+        (index.name, tuple(column.name for column in index.columns))
+        for index in worker_heartbeats.indexes
+    } == {
+        (
+            "ix_worker_heartbeats_identity_received_session_sequence",
+            ("worker_identity_id", "received_at", "worker_session_id", "sequence"),
+        )
+    }
 
 
 def test_worker_indexes_match_known_lookup_and_scan_patterns() -> None:

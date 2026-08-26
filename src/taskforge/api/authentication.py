@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from taskforge.claims.service import TaskClaimInspectionService
 from taskforge.dead_letters.service import DeadLetterService
+from taskforge.history.service import HistoryService
 from taskforge.identity.authentication import (
     APIAuthenticator,
     AuthenticatedAPIPrincipal,
@@ -37,6 +38,7 @@ from taskforge.persistence.dead_letter_operations import SQLAlchemyDeadLetterRep
 from taskforge.persistence.execution_events import (
     SQLAlchemyWorkflowRunExecutionEventRepository,
 )
+from taskforge.persistence.history import SQLAlchemyHistoryRepository
 from taskforge.persistence.principals import SQLAlchemyPrincipalProfileRepository
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.persistence.workers import (
@@ -92,6 +94,7 @@ class AuthenticationRuntime:
         task_claim_inspection_service: TaskClaimInspectionService,
         dead_letter_service: DeadLetterService,
         workflow_run_execution_event_repository: WorkflowRunExecutionEventRepository,
+        history_service: HistoryService,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
@@ -110,6 +113,7 @@ class AuthenticationRuntime:
         self.workflow_run_execution_event_repository = (
             workflow_run_execution_event_repository
         )
+        self.history_service = history_service
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -181,6 +185,7 @@ def build_authentication_runtime(
         workflow_run_execution_event_repository=(
             SQLAlchemyWorkflowRunExecutionEventRepository(sessions)
         ),
+        history_service=HistoryService(SQLAlchemyHistoryRepository(sessions)),
     )
 
 

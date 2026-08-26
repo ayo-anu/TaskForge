@@ -171,8 +171,8 @@ def test_workflow_replay_records_constrained_immediate_source_lineage() -> None:
         for index in workflow_run_replays.indexes
     } == {
         (
-            "ix_workflow_run_replays_source_workflow_run_id",
-            ("source_workflow_run_id",),
+            "ix_workflow_run_replays_source_created_at_run",
+            ("source_workflow_run_id", "created_at", "workflow_run_id"),
         )
     }
 

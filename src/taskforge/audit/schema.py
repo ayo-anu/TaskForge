@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     String,
     Table,
     text,
@@ -86,4 +87,46 @@ audit_records = Table(
         onupdate="RESTRICT",
         ondelete="RESTRICT",
     ),
+)
+
+Index(
+    "ix_audit_records_occurred_at_id",
+    audit_records.c.occurred_at.desc(),
+    audit_records.c.id.desc(),
+)
+Index(
+    "ix_audit_records_resource_occurred_at_id",
+    audit_records.c.resource_type,
+    audit_records.c.resource_id,
+    audit_records.c.occurred_at.desc(),
+    audit_records.c.id.desc(),
+)
+Index(
+    "ix_audit_records_action_occurred_at_id",
+    audit_records.c.action,
+    audit_records.c.occurred_at.desc(),
+    audit_records.c.id.desc(),
+)
+Index(
+    "ix_audit_records_correlation_occurred_at_id",
+    audit_records.c.correlation_id,
+    audit_records.c.occurred_at.desc(),
+    audit_records.c.id.desc(),
+    postgresql_where=audit_records.c.correlation_id.is_not(None),
+)
+Index(
+    "ix_audit_records_actor_occurred_at_id",
+    audit_records.c.actor_kind,
+    audit_records.c.api_principal_id,
+    audit_records.c.worker_identity_id,
+    audit_records.c.system_component,
+    audit_records.c.occurred_at.desc(),
+    audit_records.c.id.desc(),
+)
+Index(
+    "ix_audit_records_rejected_reason_occurred_at_id",
+    audit_records.c.reason_code,
+    audit_records.c.occurred_at.desc(),
+    audit_records.c.id.desc(),
+    postgresql_where=audit_records.c.outcome == "rejected",
 )

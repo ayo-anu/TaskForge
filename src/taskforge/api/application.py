@@ -27,6 +27,7 @@ from taskforge.api.health import (
     ReadinessCoordinator,
     ReadinessResponse,
 )
+from taskforge.api.history import router as history_router
 from taskforge.api.principals import router as principals_router
 from taskforge.api.runs import router as runs_router
 from taskforge.api.workers import router as workers_router
@@ -88,6 +89,7 @@ def create_app(
     app.include_router(workers_router)
     app.include_router(dead_letters_router)
     app.include_router(execution_stream_router)
+    app.include_router(history_router)
 
     @app.get(
         "/health",

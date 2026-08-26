@@ -225,6 +225,12 @@ def test_claim_event_metadata_matches_the_immutable_event_migration() -> None:
         for index in task_claim_events.indexes
     } == {
         (
+            "ix_task_claim_events_attempt_occurred_at_id",
+            False,
+            ("task_attempt_id", "occurred_at", "id"),
+            "None",
+        ),
+        (
             "uq_task_claim_events_acquired_generation",
             True,
             ("task_attempt_id", "generation"),

@@ -147,3 +147,11 @@ worker_heartbeats = Table(
         name="correlation_valid",
     ),
 )
+Index(
+    "ix_worker_heartbeats_identity_received_session_sequence",
+    worker_heartbeats.c.worker_identity_id,
+    worker_heartbeats.c.received_at.desc(),
+    worker_heartbeats.c.worker_session_id.desc(),
+    worker_heartbeats.c.sequence.desc(),
+    postgresql_where=worker_heartbeats.c.worker_identity_id.is_not(None),
+)

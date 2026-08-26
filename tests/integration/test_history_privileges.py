@@ -106,11 +106,11 @@ def test_history_privilege_upgrade_downgrade_reupgrade() -> None:
             owner_name = asyncio.run(_prepare_cycle(database_url))
             _run_bootstrap(database_url)
             _run_bootstrap(database_url)
-            command.upgrade(configuration, "head")
+            command.upgrade(configuration, "0027_enforce_history_privileges")
             asyncio.run(_assert_0027(database_url, owner_name))
             command.downgrade(configuration, "0026_standardize_audit_semantics")
             asyncio.run(_assert_0026(database_url))
-            command.upgrade(configuration, "head")
+            command.upgrade(configuration, "0027_enforce_history_privileges")
             asyncio.run(_assert_0027(database_url, owner_name))
 
 

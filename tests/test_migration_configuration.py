@@ -66,6 +66,7 @@ def test_migration_graph_has_one_workflow_head_and_locked_validation_commands() 
         "0025_complete_audit_history.py",
         "0026_standardize_audit_semantics.py",
         "0027_enforce_history_privileges.py",
+        "0028_add_authorized_history_queries.py",
     ]
     assert "migrations-check:\n\tuv run alembic heads --verbose" in makefile
     assert "privilege-bootstrap:" in makefile
