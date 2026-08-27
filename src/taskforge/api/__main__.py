@@ -4,6 +4,7 @@ import uvicorn
 
 from taskforge.logging import configure_logging, uvicorn_log_config
 from taskforge.settings import Settings
+from taskforge.tracing import configure_tracing
 
 
 def main() -> int:
@@ -15,15 +16,29 @@ def main() -> int:
         process_role="api",
         level=settings.log_level,
     )
-    uvicorn.run(
-        "taskforge.api.application:create_app",
-        factory=True,
-        host=settings.api_host,
-        port=settings.api_port,
-        log_level=settings.log_level.lower(),
-        log_config=uvicorn_log_config(settings.log_level),
-        access_log=False,
+    tracing = configure_tracing(
+        enabled=settings.tracing_enabled,
+        exporter=settings.tracing_exporter,
+        endpoint=settings.tracing_otlp_endpoint,
+        sample_ratio=settings.tracing_sample_ratio,
+        export_timeout_seconds=settings.tracing_export_timeout_seconds,
+        shutdown_timeout_seconds=settings.tracing_shutdown_timeout_seconds,
+        service_name=settings.application_name,
+        environment=settings.environment,
+        process_role="api",
     )
+    try:
+        uvicorn.run(
+            "taskforge.api.application:create_app",
+            factory=True,
+            host=settings.api_host,
+            port=settings.api_port,
+            log_level=settings.log_level.lower(),
+            log_config=uvicorn_log_config(settings.log_level),
+            access_log=False,
+        )
+    finally:
+        tracing.shutdown()
     return 0
 
 

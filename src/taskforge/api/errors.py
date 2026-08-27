@@ -11,12 +11,21 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from opentelemetry.trace import SpanKind
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
 from taskforge.logging import bind_log_context, log_event
+from taskforge.tracing import (
+    extract_carrier,
+    set_attributes,
+    set_error,
+    set_error_type,
+    span,
+    update_name,
+)
 
 REQUEST_ID_HEADER = "X-Request-ID"
 logger = logging.getLogger(__name__)
@@ -62,24 +71,48 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         request_id = uuid4()
         request.state.request_id = request_id
         started = perf_counter()
+        parent = extract_carrier(_trace_headers(request))
         with bind_log_context(
             **{"request.id": request_id, "correlation.id": request_id}
         ):
-            response = await call_next(request)
-            response.headers[REQUEST_ID_HEADER] = str(request_id)
-            log_event(
-                logger,
-                logging.INFO,
-                "api.request.completed",
-                {
-                    "http.method": request.method,
-                    "http.route": _route_template(request),
-                    "http.status_code": response.status_code,
-                    "duration_ms": round((perf_counter() - started) * 1000, 3),
-                    "outcome": "completed",
-                },
-            )
-            return response
+            with span(
+                "taskforge.api.request",
+                kind=SpanKind.SERVER,
+                parent=parent,
+                attributes={"http.request.method": request.method},
+                enabled=request.scope.get("path") not in {"/health", "/ready"},
+            ) as server_span:
+                try:
+                    response = await call_next(request)
+                except Exception as error:
+                    set_error(server_span, error, "api_unhandled_exception")
+                    raise
+                route = _route_template(request)
+                update_name(server_span, f"{request.method} {route}")
+                set_attributes(
+                    server_span,
+                    {
+                        "http.route": route,
+                        "http.response.status_code": response.status_code,
+                        "taskforge.correlation.id": str(request_id),
+                    },
+                )
+                if response.status_code >= 500:
+                    set_error_type(server_span, "HTTPServerError", "http_5xx")
+                response.headers[REQUEST_ID_HEADER] = str(request_id)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "api.request.completed",
+                    {
+                        "http.method": request.method,
+                        "http.route": route,
+                        "http.status_code": response.status_code,
+                        "duration_ms": round((perf_counter() - started) * 1000, 3),
+                        "outcome": "completed",
+                    },
+                )
+                return response
 
 
 def install_error_handling(app: FastAPI) -> None:
@@ -192,3 +225,26 @@ def _route_template(request: Request) -> str:
     route = request.scope.get("route")
     path = getattr(route, "path", None)
     return path if isinstance(path, str) else "unmatched"
+
+
+def _trace_headers(request: Request) -> dict[str, str]:
+    carrier: dict[str, str] = {}
+    raw_headers = request.scope.get("headers", ())
+    if not isinstance(raw_headers, (tuple, list)):
+        return carrier
+    for item in raw_headers:
+        if not (
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[0], bytes)
+            and isinstance(item[1], bytes)
+        ):
+            continue
+        name = item[0].lower()
+        if name not in {b"traceparent", b"tracestate"}:
+            continue
+        try:
+            carrier[name.decode("ascii")] = item[1].decode("ascii")
+        except UnicodeDecodeError:
+            continue
+    return carrier

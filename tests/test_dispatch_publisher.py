@@ -11,6 +11,10 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
 from taskforge.dispatch.envelope import (
     create_dispatch_envelope,
@@ -24,6 +28,7 @@ from taskforge.dispatch.publisher_ports import (
     StoredDispatch,
     UnpublishedDispatchCursor,
 )
+from taskforge.tracing import inject_trace_context, set_tracer_for_testing, span
 
 
 @dataclass
@@ -113,6 +118,43 @@ def test_empty_pass_is_bounded_and_stateless_across_calls() -> None:
     assert first.reached_end
     assert repository.calls == [(None, 4), (None, 4)]
     assert broker.publications == []
+
+
+def test_publish_uses_fixed_name_and_links_validated_creation_context() -> None:
+    provider = TracerProvider(sampler=ALWAYS_ON)
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    previous = set_tracer_for_testing(provider.get_tracer("publisher-link-test"))
+    try:
+        with span("creation") as creation:
+            assert creation is not None
+            creation_context = creation.get_span_context()
+            propagated = inject_trace_context()
+        assert propagated is not None
+        stored = stored_dispatch(1)
+        stored.payload["trace_context"] = {
+            "traceparent": propagated.traceparent,
+        }
+        repository, broker = FakeRepository((stored,)), FakeBroker()
+        asyncio.run(
+            TaskDispatchPublisher(repository, broker).reconcile_unpublished(
+                page_size=1, pass_limit=1
+            )
+        )
+    finally:
+        set_tracer_for_testing(previous)
+        provider.shutdown()
+
+    publish = next(
+        item
+        for item in exporter.get_finished_spans()
+        if item.name == "taskforge.dispatch.publish"
+    )
+    assert len(publish.links) == 1
+    assert publish.links[0].context.trace_id == creation_context.trace_id
+    assert publish.name == "taskforge.dispatch.publish"
+    assert publish.attributes is not None
+    assert publish.attributes["taskforge.broker.route"] == stored.route
 
 
 def test_pass_uses_keyset_pages_and_reduces_final_query_limit() -> None:

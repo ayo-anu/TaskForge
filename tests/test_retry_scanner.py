@@ -10,6 +10,12 @@ from types import TracebackType
 from uuid import UUID, uuid4
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
+from opentelemetry.trace import StatusCode
 from sqlalchemy.dialects import postgresql
 
 from taskforge.dispatch.envelope import (
@@ -30,6 +36,7 @@ from taskforge.retries.scanner import (
     DueRetryScanner,
     DueRetryScanServiceUnavailable,
 )
+from taskforge.tracing import set_tracer_for_testing
 from taskforge.workflows.task_types import (
     JSONMapping,
     TaskTypeDefinition,
@@ -93,6 +100,7 @@ class FakeTransaction:
         field(default_factory=list)
     )
     exited_with: type[BaseException] | str | None = "not-exited"
+    exit_span_id: int = 0
 
     async def __aenter__(self) -> FakeTransaction:
         return self
@@ -105,6 +113,7 @@ class FakeTransaction:
     ) -> None:
         del exception, traceback
         self.exited_with = exception_type
+        self.exit_span_id = trace.get_current_span().get_span_context().span_id
 
     async def prepare_next_due(self) -> DueRetryPreparation:
         if isinstance(self.preparation, Exception):
@@ -189,11 +198,116 @@ def test_scan_is_bounded_and_preserves_existing_attempt_identity() -> None:
         assert payload["task_payload"] == prepared.task_parameters
         assert payload["references"] == {"object": "stable-reference"}
         assert payload["correlation_id"] == "correlation-1"
-        assert payload["trace_context"] == {
-            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-        }
+        assert "trace_context" not in payload
         assert payload["required_capability"] == "current-workers"
         assert route == "capability.current-workers"
+
+
+def test_retry_is_independent_root_with_predecessor_link_and_new_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    prepared = prepared_due()
+    predecessor_context = prepared.predecessor_payload["trace_context"]
+    assert isinstance(predecessor_context, dict)
+    predecessor_trace_id = str(predecessor_context["traceparent"]).split("-")[1]
+    repository = FakeRepository([prepared])
+    provider = TracerProvider(sampler=ALWAYS_ON)
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    previous = set_tracer_for_testing(provider.get_tracer("retry-test"))
+    caplog.set_level(logging.INFO, logger="taskforge.retries.scanner")
+    try:
+        asyncio.run(
+            DueRetryScanner(repository, registry()).scan_due_retries(batch_size=1)
+        )
+    finally:
+        set_tracer_for_testing(previous)
+        provider.shutdown()
+
+    retry = next(
+        item
+        for item in exporter.get_finished_spans()
+        if item.name == "taskforge.retry.dispatch"
+    )
+    assert retry.parent is None
+    assert repository.transactions[0].exit_span_id == retry.context.span_id
+    assert len(retry.links) == 1
+    assert f"{retry.links[0].context.trace_id:032x}" == predecessor_trace_id
+    payload = repository.transactions[0].persisted[0][3]
+    retry_context = payload["trace_context"]
+    assert isinstance(retry_context, dict)
+    retry_trace_id = str(retry_context["traceparent"]).split("-")[1]
+    assert retry_trace_id == f"{retry.context.trace_id:032x}"
+    assert retry_trace_id != predecessor_trace_id
+    dispatched_log = next(
+        record
+        for record in caplog.records
+        if getattr(record, "_event_name", None) == "scheduler.retry.dispatched"
+    )
+    assert dispatched_log.__dict__.get("_trace_fields") == {}
+
+
+def test_skipped_revalidation_has_no_retry_dispatch_error_span() -> None:
+    repository = FakeRepository([SkippedDueRetryCandidate(uuid4()), None])
+    provider = TracerProvider(sampler=ALWAYS_ON)
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    previous = set_tracer_for_testing(provider.get_tracer("retry-skip-test"))
+    try:
+        asyncio.run(
+            DueRetryScanner(repository, registry()).scan_due_retries(batch_size=2)
+        )
+    finally:
+        set_tracer_for_testing(previous)
+        provider.shutdown()
+
+    assert not any(
+        item.name == "taskforge.retry.dispatch"
+        for item in exporter.get_finished_spans()
+    )
+
+
+def test_retry_persistence_failure_marks_active_dispatch_span_error() -> None:
+    class FailingTransaction(FakeTransaction):
+        async def persist_dispatch(
+            self,
+            prepared: PreparedDueRetryDispatch,
+            outbox_id: UUID,
+            route: str,
+            payload: dict[str, object],
+        ) -> None:
+            del prepared, outbox_id, route, payload
+            raise DueRetryPersistenceUnavailable
+
+    class FailingRepository:
+        transaction = FailingTransaction(prepared_due())
+
+        def due_dispatch_transaction(self) -> FailingTransaction:
+            return self.transaction
+
+    repository = FailingRepository()
+    provider = TracerProvider(sampler=ALWAYS_ON)
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    previous = set_tracer_for_testing(provider.get_tracer("retry-failure-test"))
+    try:
+        with pytest.raises(DueRetryScanServiceUnavailable):
+            asyncio.run(
+                DueRetryScanner(repository, registry()).scan_due_retries(batch_size=1)
+            )
+    finally:
+        set_tracer_for_testing(previous)
+        provider.shutdown()
+
+    retry = next(
+        item
+        for item in exporter.get_finished_spans()
+        if item.name == "taskforge.retry.dispatch"
+    )
+    assert repository.transaction.exit_span_id == retry.context.span_id
+    assert retry.status.status_code is StatusCode.ERROR
+    assert retry.attributes is not None
+    assert retry.attributes["taskforge.error.category"] == "retry_dispatch_failure"
 
 
 def test_scan_counts_locked_revalidation_skip_and_stops_on_no_candidate() -> None:

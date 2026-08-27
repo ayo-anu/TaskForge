@@ -17,6 +17,7 @@ from taskforge.correlation import is_valid_correlation_id
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.runs.domain import WorkflowRunStatus
+from taskforge.tracing import set_attributes, set_error, span
 from taskforge.worker.start_persistence_ports import (
     PersistedTaskStart,
     TaskStartAuthorityRejected,
@@ -83,6 +84,32 @@ class TaskStartService:
         self._rejected_audit = rejected_audit
 
     async def start_task(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        request: TaskStartRequest,
+    ) -> TaskStartReceipt:
+        with span(
+            "taskforge.task.start",
+            attributes={
+                "db.system.name": "postgresql",
+                "taskforge.task_attempt.id": str(request.task_attempt_id),
+            },
+        ) as active_span:
+            try:
+                receipt = await self._start_task(
+                    authenticated_worker, worker_session_id, request
+                )
+            except TaskStartRejected:
+                set_attributes(active_span, {"taskforge.outcome": "rejected"})
+                raise
+            except (TaskStartInvariantError, TaskStartServiceUnavailable) as error:
+                set_error(active_span, error, "task_start_persistence_failure")
+                raise
+            set_attributes(active_span, {"taskforge.outcome": receipt.outcome.value})
+            return receipt
+
+    async def _start_task(
         self,
         authenticated_worker: AuthenticatedWorker,
         worker_session_id: UUID,

@@ -33,6 +33,7 @@ from taskforge.retries.domain import (
     resolve_persisted_retry_policy,
 )
 from taskforge.retries.persistence_ports import NewScheduledRetryAttempt
+from taskforge.tracing import set_attributes, set_error, span
 
 
 class ExpiredClaimRecoveryOutcome(StrEnum):
@@ -73,6 +74,27 @@ class ExpiredClaimRecoveryService:
         self._repository = repository
 
     async def recover_expired_claim(
+        self, candidate: ExpiredClaimCandidate
+    ) -> ExpiredClaimRecoveryReceipt:
+        with span(
+            "taskforge.recovery.expired_claim",
+            attributes={
+                "db.system.name": "postgresql",
+                "taskforge.task_attempt.id": str(candidate.task_attempt_id),
+            },
+        ) as active_span:
+            try:
+                receipt = await self._recover_expired_claim(candidate)
+            except (
+                ExpiredClaimRecoveryInvariantError,
+                ExpiredClaimRecoveryServiceUnavailable,
+            ) as error:
+                set_error(active_span, error, "expired_claim_recovery_failure")
+                raise
+            set_attributes(active_span, {"taskforge.outcome": receipt.outcome.value})
+            return receipt
+
+    async def _recover_expired_claim(
         self, candidate: ExpiredClaimCandidate
     ) -> ExpiredClaimRecoveryReceipt:
         try:
@@ -184,6 +206,32 @@ class StaleWorkerSessionRecoveryService:
         self._repository = repository
 
     async def end_stale_session(
+        self,
+        candidate: StaleWorkerSessionCandidate,
+        *,
+        stale_after_seconds: int,
+    ) -> StaleWorkerSessionRecoveryReceipt:
+        with span(
+            "taskforge.recovery.stale_session",
+            attributes={
+                "db.system.name": "postgresql",
+                "taskforge.worker.session.id": str(candidate.worker_session_id),
+            },
+        ) as active_span:
+            try:
+                receipt = await self._end_stale_session(
+                    candidate, stale_after_seconds=stale_after_seconds
+                )
+            except (
+                StaleWorkerSessionRecoveryInvariantError,
+                StaleWorkerSessionRecoveryServiceUnavailable,
+            ) as error:
+                set_error(active_span, error, "stale_session_recovery_failure")
+                raise
+            set_attributes(active_span, {"taskforge.outcome": receipt.outcome.value})
+            return receipt
+
+    async def _end_stale_session(
         self,
         candidate: StaleWorkerSessionCandidate,
         *,

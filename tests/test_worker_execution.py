@@ -8,6 +8,10 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
 from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import (
@@ -25,6 +29,7 @@ from taskforge.dispatch.envelope import (
 from taskforge.dispatch.transport import DispatchTransportMetadata
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.logging import current_log_context
+from taskforge.tracing import inject_trace_context, set_tracer_for_testing, span
 from taskforge.worker.cancellation import (
     TaskCancellationObservation,
     TaskCancellationObservationOutcome,
@@ -267,6 +272,41 @@ def test_valid_delivery_acks_only_after_result_submission() -> None:
     assert len(result_service.requests) == 1
     assert result_service.requests[0].result.kind is TaskExecutionResultKind.SUCCESS
     assert "result_authority=<redacted>" in repr(result_service.requests[0])
+
+
+def test_validated_delivery_uses_remote_parent_without_duplicate_spans() -> None:
+    provider = TracerProvider(sampler=ALWAYS_ON)
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    previous = set_tracer_for_testing(provider.get_tracer("worker-parent-test"))
+    try:
+        with span("upstream") as upstream:
+            assert upstream is not None
+            upstream_context = upstream.get_span_context()
+            propagated = inject_trace_context()
+        assert propagated is not None
+        _, control, issued, worker, _ = fixture(trace_context=propagated)
+        consumer = WorkerExecutionConsumer(
+            ClaimService(issued),
+            StartService([]),
+            ResultService(),
+            registry(lambda context: asyncio.sleep(0, result=context)),
+            worker,
+            issued.claim.worker_session_id,
+        )
+        asyncio.run(consumer.consume(control))
+    finally:
+        set_tracer_for_testing(previous)
+        provider.shutdown()
+
+    finished = exporter.get_finished_spans()
+    process = next(item for item in finished if item.name == "taskforge.worker.process")
+    assert process.parent is not None
+    assert process.parent.trace_id == upstream_context.trace_id
+    assert process.parent.span_id == upstream_context.span_id
+    assert [item.name for item in finished].count("taskforge.worker.process") == 1
+    assert [item.name for item in finished].count("taskforge.handler.execute") == 1
+    assert [item.name for item in finished].count("taskforge.delivery.ack") == 1
 
 
 def test_complete_delivery_lifecycle_has_isolated_correlated_context(

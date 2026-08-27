@@ -7,6 +7,8 @@ import logging
 from dataclasses import dataclass
 from uuid import uuid4
 
+from opentelemetry.trace import Link, SpanKind
+
 from taskforge.dispatch.envelope import (
     DispatchEnvelopeValidationError,
     deserialize_dispatch_envelope,
@@ -17,13 +19,17 @@ from taskforge.dispatch.publisher_ports import (
     BrokerPublicationRejected,
     BrokerPublicationTimeout,
     BrokerUnavailable,
+    DispatchAcknowledgementPersistenceFailure,
     DispatchBrokerPublisher,
+    DispatchOutboxPersistenceUnavailable,
     DispatchOutboxRepository,
+    DispatchPublicationInvariantConflict,
     PublicationAcknowledgement,
     StoredDispatch,
     UnpublishedDispatchCursor,
 )
 from taskforge.logging import bind_log_context, log_event
+from taskforge.tracing import link_from_trace_context, set_attributes, set_error, span
 
 MAX_PUBLICATION_PAGE_SIZE = 100
 MAX_PUBLICATION_PASS_SIZE = 1_000
@@ -59,9 +65,10 @@ class TaskDispatchPublisher:
         _validate_bounds(page_size, pass_limit)
         operation_id = uuid4()
         with bind_log_context(**{"operation.id": operation_id}):
-            return await self._reconcile_unpublished_bound(
-                page_size=page_size, pass_limit=pass_limit
-            )
+            with span("taskforge.dispatch.publish_pass", root=True):
+                return await self._reconcile_unpublished_bound(
+                    page_size=page_size, pass_limit=pass_limit
+                )
 
     async def _reconcile_unpublished_bound(
         self, *, page_size: int, pass_limit: int
@@ -99,27 +106,59 @@ class TaskDispatchPublisher:
                     after = stored.cursor
                     continue
 
-                publication, identifiers = validated
+                publication, identifiers, predecessor_link = validated
                 with bind_log_context(**identifiers):
-                    try:
-                        await self._broker.publish(publication)
-                    except (
-                        BrokerUnavailable,
-                        BrokerPublicationTimeout,
-                        BrokerPublicationRejected,
-                    ) as error:
-                        log_event(
-                            logger,
-                            logging.ERROR,
-                            "dispatch.publish.failed",
-                            {
-                                "error.category": "broker_publication_failure",
-                                "outcome": "failed",
-                            },
-                            error=error,
+                    links = (predecessor_link,) if predecessor_link is not None else ()
+                    with span(
+                        "taskforge.dispatch.publish",
+                        kind=SpanKind.PRODUCER,
+                        attributes={
+                            "messaging.system": "rabbitmq",
+                            "messaging.destination.name": stored.route,
+                            "messaging.message.id": str(stored.dispatch_id),
+                            "taskforge.broker.route": stored.route,
+                        },
+                        links=links,
+                    ) as publish_span:
+                        try:
+                            await self._broker.publish(publication)
+                        except (
+                            BrokerUnavailable,
+                            BrokerPublicationTimeout,
+                            BrokerPublicationRejected,
+                        ) as error:
+                            set_error(publish_span, error, "broker_publication_failure")
+                            log_event(
+                                logger,
+                                logging.ERROR,
+                                "dispatch.publish.failed",
+                                {
+                                    "error.category": "broker_publication_failure",
+                                    "outcome": "failed",
+                                },
+                                error=error,
+                            )
+                            raise
+                    with span(
+                        "taskforge.dispatch.record_publication",
+                        attributes={"db.system.name": "postgresql"},
+                    ) as record_span:
+                        try:
+                            outcome = (
+                                await self._repository.record_accepted_publication(
+                                    stored
+                                )
+                            )
+                        except (
+                            DispatchAcknowledgementPersistenceFailure,
+                            DispatchOutboxPersistenceUnavailable,
+                            DispatchPublicationInvariantConflict,
+                        ) as error:
+                            set_error(record_span, error, "publication_record_failure")
+                            raise
+                        set_attributes(
+                            record_span, {"taskforge.outcome": outcome.value}
                         )
-                        raise
-                    outcome = await self._repository.record_accepted_publication(stored)
                     if outcome is PublicationAcknowledgement.RECORDED:
                         acknowledged += 1
                     else:
@@ -169,7 +208,7 @@ def _validate_bounds(page_size: int, pass_limit: int) -> None:
 
 def _validated_publication(
     stored: StoredDispatch,
-) -> tuple[BrokerDispatchPublication, dict[str, object]] | None:
+) -> tuple[BrokerDispatchPublication, dict[str, object], Link | None] | None:
     try:
         encoded = json.dumps(
             stored.payload,
@@ -198,6 +237,8 @@ def _validated_publication(
     }
     if envelope.correlation_id is not None:
         identifiers["correlation.id"] = envelope.correlation_id
-    return BrokerDispatchPublication(
-        stored.dispatch_id, stored.route, body
-    ), identifiers
+    return (
+        BrokerDispatchPublication(stored.dispatch_id, stored.route, body),
+        identifiers,
+        link_from_trace_context(envelope.trace_context),
+    )

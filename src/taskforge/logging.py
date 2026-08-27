@@ -223,6 +223,8 @@ def _emit_owned(
     error_type: str | None = None,
 ) -> None:
     try:
+        from taskforge.tracing import current_log_trace_fields
+
         logger.log(
             level,
             event_name,
@@ -231,6 +233,7 @@ def _emit_owned(
                 "_event_name": event_name,
                 "_event_fields": fields,
                 "_safe_error_type": error_type,
+                "_trace_fields": current_log_trace_fields(),
             },
         )
     except Exception:
@@ -281,6 +284,7 @@ class TaskforgeJSONFormatter(logging.Formatter):
     def _owned_record(self, record: logging.LogRecord) -> dict[str, object]:
         data = self._base(record, str(record.__dict__["_event_name"]))
         data.update(_defensive_sanitize(getattr(record, "_event_fields", {})))
+        data.update(_trusted_trace_fields(getattr(record, "_trace_fields", {})))
         error_type = getattr(record, "_safe_error_type", None)
         if error_type is not None:
             data["error.type"] = _bounded_string(error_type)
@@ -365,3 +369,24 @@ def _defensive_sanitize(value: object, *, depth: int = 0) -> dict[str, object]:
 
 def _encode(data: Mapping[str, object]) -> str:
     return json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+def _trusted_trace_fields(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    trace_id, span_id, sampled = (
+        value.get("trace_id"),
+        value.get("span_id"),
+        value.get("trace_sampled"),
+    )
+    if not (
+        isinstance(trace_id, str)
+        and len(trace_id) == 32
+        and all(character in "0123456789abcdef" for character in trace_id)
+        and isinstance(span_id, str)
+        and len(span_id) == 16
+        and all(character in "0123456789abcdef" for character in span_id)
+        and isinstance(sampled, bool)
+    ):
+        return {}
+    return {"trace_id": trace_id, "span_id": span_id, "trace_sampled": sampled}

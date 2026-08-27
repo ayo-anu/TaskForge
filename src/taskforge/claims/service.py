@@ -45,6 +45,7 @@ from taskforge.dispatch.envelope import DispatchEnvelope
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.authorization import OwnerFilter
 from taskforge.persistence.audit import RejectedAuditRecorder
+from taskforge.tracing import set_attributes, set_error, span
 
 _ACQUISITION_REJECTION_REASONS: dict[type[Exception], TaskClaimRejectionReason] = {
     TaskClaimDispatchRejected: TaskClaimRejectionReason.INVALID_DISPATCH,
@@ -92,6 +93,41 @@ class TaskClaimService:
         self._rejected_audit = rejected_audit
 
     async def claim_task(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        dispatch: DispatchEnvelope,
+    ) -> IssuedTaskClaim:
+        with span(
+            "taskforge.claim.acquire",
+            attributes={
+                "db.system.name": "postgresql",
+                "taskforge.task_attempt.id": str(dispatch.task_attempt_id),
+            },
+        ) as active_span:
+            try:
+                result = await self._claim_task(
+                    authenticated_worker, worker_session_id, dispatch
+                )
+            except TaskClaimRejected as error:
+                set_attributes(
+                    active_span,
+                    {
+                        "taskforge.outcome": "rejected",
+                        "taskforge.reason.code": error.reason.value,
+                    },
+                )
+                raise
+            except (
+                TaskClaimServiceInvariantError,
+                TaskClaimServiceUnavailable,
+            ) as error:
+                set_error(active_span, error, "claim_persistence_failure")
+                raise
+            set_attributes(active_span, {"taskforge.outcome": result.outcome.value})
+            return result
+
+    async def _claim_task(
         self,
         authenticated_worker: AuthenticatedWorker,
         worker_session_id: UUID,

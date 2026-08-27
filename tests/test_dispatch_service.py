@@ -8,6 +8,11 @@ from types import TracebackType
 from uuid import UUID, uuid4
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
 from taskforge.dispatch.persistence_ports import (
     NewTaskAttempt,
@@ -24,6 +29,7 @@ from taskforge.dispatch.service import (
     TaskDispatchService,
     TaskDispatchServiceUnavailable,
 )
+from taskforge.tracing import set_tracer_for_testing
 from taskforge.workflows.task_types import (
     JSONMapping,
     TaskTypeDefinition,
@@ -47,6 +53,7 @@ class FakeTransaction:
         default_factory=list
     )
     committed: bool = False
+    observed_span_ids: list[int] = field(default_factory=list)
 
     async def __aenter__(self) -> FakeTransaction:
         return self
@@ -58,6 +65,9 @@ class FakeTransaction:
         traceback: TracebackType | None,
     ) -> None:
         del exception_type, exception, traceback
+        self.observed_span_ids.append(
+            trace.get_current_span().get_span_context().span_id
+        )
 
     async def prepare_dispatch(
         self, workflow_run_id: UUID, task_run_id: UUID
@@ -77,6 +87,9 @@ class FakeTransaction:
         self.persisted.append((attempt, outbox))
 
     async def commit(self) -> None:
+        self.observed_span_ids.append(
+            trace.get_current_span().get_span_context().span_id
+        )
         self.committed = True
 
 
@@ -132,6 +145,34 @@ def test_dispatch_persists_validated_snapshot_and_commits() -> None:
     assert outbox.payload["required_capability"] == "document-workers"
     assert outbox.payload["schema_version"] == 3
     assert outbox.payload["execution_timeout_seconds"] == 45
+
+
+def test_dispatch_span_covers_commit_and_transaction_exit() -> None:
+    prepared = prepared_dispatch()
+    transaction = FakeTransaction(prepared)
+    provider = TracerProvider(sampler=ALWAYS_ON)
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    previous = set_tracer_for_testing(provider.get_tracer("dispatch-boundary-test"))
+    try:
+        asyncio.run(
+            service(transaction).dispatch_task(
+                prepared.workflow_run_id, prepared.task_run_id
+            )
+        )
+    finally:
+        set_tracer_for_testing(previous)
+        provider.shutdown()
+
+    dispatched = next(
+        item
+        for item in exporter.get_finished_spans()
+        if item.name == "taskforge.dispatch.create"
+    )
+    assert transaction.observed_span_ids == [
+        dispatched.context.span_id,
+        dispatched.context.span_id,
+    ]
 
 
 def test_missing_or_nonrunnable_task_is_safely_suppressed() -> None:

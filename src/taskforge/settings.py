@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["development", "test", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+TracingExporter = Literal["none", "otlp_http"]
 DEVELOPMENT_CLAIM_RESULT_AUTHORITY_SECRET = (
     "taskforge-development-claim-result-authority-secret"
 )
@@ -28,6 +29,12 @@ class Settings(BaseSettings):
     application_name: str = "taskforge"
     environment: Environment = "development"
     log_level: LogLevel = "INFO"
+    tracing_enabled: bool = False
+    tracing_exporter: TracingExporter = "none"
+    tracing_otlp_endpoint: str | None = None
+    tracing_sample_ratio: float = Field(default=0.1, ge=0, le=1)
+    tracing_export_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    tracing_shutdown_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
@@ -125,6 +132,18 @@ class Settings(BaseSettings):
             raise ValueError("RabbitMQ topology names cannot use the reserved prefix")
         if names[0] == names[1]:
             raise ValueError("RabbitMQ topology exchange names must be distinct")
+        return self
+
+    @model_validator(mode="after")
+    def validate_tracing_configuration(self) -> Settings:
+        if not self.tracing_enabled and self.tracing_exporter != "none":
+            raise ValueError("a tracing exporter requires tracing to be enabled")
+        if self.tracing_exporter == "otlp_http":
+            endpoint = self.tracing_otlp_endpoint
+            if endpoint is None or not endpoint.startswith(("http://", "https://")):
+                raise ValueError("OTLP/HTTP tracing requires an HTTP(S) endpoint")
+        elif self.tracing_otlp_endpoint is not None:
+            raise ValueError("a tracing endpoint requires the OTLP/HTTP exporter")
         return self
 
     @model_validator(mode="after")

@@ -21,6 +21,7 @@ from taskforge.claims.domain import TaskClaimResultAuthority
 from taskforge.correlation import is_valid_correlation_id
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.persistence.audit import RejectedAuditRecorder
+from taskforge.tracing import set_attributes, set_error, span
 from taskforge.worker.result_persistence_ports import (
     PersistableTaskResult,
     PersistedTaskResultOutcome,
@@ -129,6 +130,39 @@ class TaskResultSubmissionService:
         self._rejected_audit = rejected_audit
 
     async def submit_result(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        request: TaskResultSubmissionRequest,
+    ) -> TaskResultSubmissionReceipt:
+        with span(
+            "taskforge.result.submit",
+            attributes={
+                "db.system.name": "postgresql",
+                "taskforge.task_attempt.id": str(request.task_attempt_id),
+            },
+        ) as active_span:
+            try:
+                receipt = await self._submit_result(
+                    authenticated_worker, worker_session_id, request
+                )
+            except (TaskResultStale, TaskResultConflict, TaskResultInvalidState):
+                set_attributes(active_span, {"taskforge.outcome": "rejected"})
+                raise
+            except (
+                TaskResultAuthorityRejected,
+                TaskResultInvalidOutput,
+                TaskResultNotFound,
+            ):
+                set_attributes(active_span, {"taskforge.outcome": "rejected"})
+                raise
+            except (TaskResultInvariantError, TaskResultServiceUnavailable) as error:
+                set_error(active_span, error, "result_persistence_failure")
+                raise
+            set_attributes(active_span, {"taskforge.outcome": receipt.outcome.value})
+            return receipt
+
+    async def _submit_result(
         self,
         authenticated_worker: AuthenticatedWorker,
         worker_session_id: UUID,

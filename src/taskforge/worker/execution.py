@@ -7,6 +7,9 @@ import logging
 from typing import Protocol
 from uuid import UUID
 
+from opentelemetry.trace import SpanKind
+from opentelemetry.util.types import AttributeValue
+
 from taskforge.claims.domain import (
     IssuedTaskClaim,
     TaskClaimOutcome,
@@ -24,12 +27,22 @@ from taskforge.dispatch.transport import (
 )
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.logging import bind_log_context, log_event
+from taskforge.tracing import (
+    extract_trace_context,
+    set_attributes,
+    set_error,
+    set_error_type,
+    span,
+)
 from taskforge.worker.cancellation import (
     TaskCancellationObservationOutcome,
     TaskCancellationObserver,
     TaskCancellationToken,
 )
-from taskforge.worker.consumer_ports import DispatchDeliveryControl
+from taskforge.worker.consumer_ports import (
+    BrokerConsumerUnavailable,
+    DispatchDeliveryControl,
+)
 from taskforge.worker.handlers import (
     TaskContext,
     TaskDeadline,
@@ -156,7 +169,7 @@ class WorkerExecutionConsumer:
                     "broker.redelivered": control.delivery.redelivered,
                 },
             )
-            await control.reject(requeue=False)
+            await self._reject(control, None, requeue=False)
             return
         envelope = transport.envelope
         fields: dict[str, object] = {
@@ -173,8 +186,40 @@ class WorkerExecutionConsumer:
         if envelope.correlation_id is not None:
             fields["correlation.id"] = envelope.correlation_id
         with bind_log_context(**fields):
-            log_event(logger, logging.INFO, "worker.delivery.validated")
-            await self._consume_validated(control, envelope)
+            parent = extract_trace_context(envelope.trace_context)
+            with span(
+                "taskforge.worker.process",
+                kind=SpanKind.CONSUMER,
+                parent=parent,
+                attributes={
+                    "messaging.system": "rabbitmq",
+                    "messaging.destination.name": envelope.route,
+                    "messaging.message.id": str(envelope.dispatch_id),
+                    "messaging.message.redelivered": control.delivery.redelivered,
+                    "taskforge.broker.route": envelope.route,
+                },
+            ) as process_span:
+                try:
+                    log_event(logger, logging.INFO, "worker.delivery.validated")
+                    await self._consume_validated(control, envelope)
+                except WorkerConsumptionPaused as error:
+                    if isinstance(
+                        error.__cause__,
+                        (
+                            TaskClaimRejected,
+                            TaskStartRejected,
+                            TaskResultAuthorityRejected,
+                            TaskResultConflict,
+                            TaskResultInvalidOutput,
+                            TaskResultInvalidState,
+                            TaskResultNotFound,
+                            TaskResultStale,
+                        ),
+                    ):
+                        set_attributes(process_span, {"taskforge.outcome": "rejected"})
+                    else:
+                        set_error(process_span, error, "worker_consumption_paused")
+                    raise
 
     async def _consume_validated(
         self, control: DispatchDeliveryControl, envelope: DispatchEnvelope
@@ -209,10 +254,10 @@ class WorkerExecutionConsumer:
                 error=error,
             )
             if error.reason is TaskClaimRejectionReason.INVALID_DISPATCH:
-                await control.reject(requeue=False)
+                await self._reject(control, envelope, requeue=False)
                 return
             if error.reason in _ACKNOWLEDGED_REJECTIONS:
-                await control.acknowledge()
+                await self._acknowledge(control, envelope)
                 return
             if error.reason in _PAUSED_REJECTIONS:
                 raise WorkerConsumptionPaused(
@@ -292,7 +337,7 @@ class WorkerExecutionConsumer:
             # The durable claim/session authority is already gone. As with an
             # obsolete or already-authoritative claim delivery, there is no work
             # left for this delivery to perform and no worker result to author.
-            await control.acknowledge()
+            await self._acknowledge(control, envelope)
             log_event(
                 logger,
                 logging.INFO,
@@ -398,7 +443,7 @@ class WorkerExecutionConsumer:
             }
         ):
             raise WorkerConsumptionPaused("task result receipt failed closed")
-        await control.acknowledge()
+        await self._acknowledge(control, envelope)
 
         log_event(
             logger,
@@ -408,6 +453,58 @@ class WorkerExecutionConsumer:
                 "outcome": receipt.outcome.value,
             },
         )
+
+    async def _acknowledge(
+        self, control: DispatchDeliveryControl, envelope: DispatchEnvelope
+    ) -> None:
+        with span(
+            "taskforge.delivery.ack",
+            kind=SpanKind.CLIENT,
+            attributes={
+                "messaging.system": "rabbitmq",
+                "messaging.destination.name": envelope.route,
+                "messaging.message.id": str(envelope.dispatch_id),
+                "taskforge.broker.route": envelope.route,
+                "taskforge.delivery.disposition": "ack",
+            },
+        ) as active_span:
+            try:
+                await control.acknowledge()
+            except BrokerConsumerUnavailable as error:
+                set_error(active_span, error, "broker_acknowledgement_failure")
+                raise
+
+    async def _reject(
+        self,
+        control: DispatchDeliveryControl,
+        envelope: DispatchEnvelope | None,
+        *,
+        requeue: bool,
+    ) -> None:
+        attributes: dict[str, AttributeValue] = {
+            "messaging.system": "rabbitmq",
+            "taskforge.delivery.disposition": (
+                "reject_requeue" if requeue else "reject_drop"
+            ),
+        }
+        if envelope is not None:
+            attributes.update(
+                {
+                    "messaging.destination.name": envelope.route,
+                    "messaging.message.id": str(envelope.dispatch_id),
+                    "taskforge.broker.route": envelope.route,
+                }
+            )
+        with span(
+            "taskforge.delivery.reject",
+            kind=SpanKind.CLIENT,
+            attributes=attributes,
+        ) as active_span:
+            try:
+                await control.reject(requeue=requeue)
+            except BrokerConsumerUnavailable as error:
+                set_error(active_span, error, "broker_rejection_failure")
+                raise
 
     async def _observe_cancellation_once(
         self,
@@ -483,19 +580,24 @@ async def _execute_handler_logged(
     context: TaskContext,
     execution_timeout_seconds: int | None,
 ) -> TaskExecutionResult:
-    log_event(logger, logging.INFO, "worker.handler.started")
-    result = await _execute_handler(handler, context, execution_timeout_seconds)
-    log_event(
-        logger,
-        logging.INFO,
-        "worker.handler.completed",
-        {
-            "outcome": result.kind.value,
-            "reason.code": (
-                result.failure_kind.value
-                if result.failure_kind is not None
-                else "completed"
-            ),
-        },
-    )
-    return result
+    with span("taskforge.handler.execute") as active_span:
+        log_event(logger, logging.INFO, "worker.handler.started")
+        result = await _execute_handler(handler, context, execution_timeout_seconds)
+        reason = (
+            result.failure_kind.value
+            if result.failure_kind is not None
+            else "completed"
+        )
+        set_attributes(
+            active_span,
+            {"taskforge.outcome": result.kind.value, "taskforge.reason.code": reason},
+        )
+        if reason in {"handler_exception", "execution_timeout"}:
+            set_error_type(active_span, "TaskHandlerFailure", reason)
+        log_event(
+            logger,
+            logging.INFO,
+            "worker.handler.completed",
+            {"outcome": result.kind.value, "reason.code": reason},
+        )
+        return result

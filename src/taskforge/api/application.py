@@ -43,10 +43,10 @@ def create_app(
     task_types: TaskTypeRegistry | None = None,
 ) -> FastAPI:
     """Create the API with injectable readiness behavior for focused tests."""
+    resolved_settings = settings or Settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        resolved_settings = settings or Settings()
         resolved_readiness = readiness or build_readiness_coordinator(resolved_settings)
         resolved_task_types = task_types or TaskTypeRegistry(())
         await resolved_readiness.start()

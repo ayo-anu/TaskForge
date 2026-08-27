@@ -7,12 +7,8 @@ import logging
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
-from taskforge.dispatch.envelope import (
-    DispatchEnvelopeValidationError,
-    create_dispatch_envelope,
-    deserialize_dispatch_envelope,
-    dispatch_envelope_to_mapping,
-)
+from opentelemetry.trace import Span
+
 from taskforge.logging import bind_log_context, log_event
 from taskforge.retries.persistence_ports import (
     DueRetryDispatchRepository,
@@ -20,6 +16,13 @@ from taskforge.retries.persistence_ports import (
     DueRetryPersistenceUnavailable,
     PreparedDueRetryDispatch,
     SkippedDueRetryCandidate,
+)
+from taskforge.tracing import (
+    DeferredSpan,
+    add_link,
+    inject_trace_context,
+    link_from_trace_context,
+    set_error,
 )
 from taskforge.workflows.task_types import TaskTypeRegistry
 
@@ -74,38 +77,56 @@ class DueRetryScanner:
         dispatched_attempt_ids: list[UUID] = []
         try:
             for _ in range(batch_size):
+                deferred_span = DeferredSpan()
                 dispatched_attempt_id: UUID | None = None
                 committed_log_fields: dict[str, object] | None = None
                 committed_route: str | None = None
-                async with self._repository.due_dispatch_transaction() as transaction:
-                    prepared = await transaction.prepare_next_due()
-                    if prepared is None:
-                        break
-                    examined += 1
-                    if isinstance(prepared, SkippedDueRetryCandidate):
-                        skipped += 1
-                        continue
+                try:
+                    async with (
+                        self._repository.due_dispatch_transaction() as transaction
+                    ):
+                        prepared = await transaction.prepare_next_due()
+                        if prepared is None:
+                            break
+                        examined += 1
+                        if isinstance(prepared, SkippedDueRetryCandidate):
+                            skipped += 1
+                            continue
 
-                    outbox_id, route, payload, correlation_id = self._prepare_outbox(
-                        prepared
-                    )
-                    identifiers: dict[str, object] = {
-                        "dispatch.id": outbox_id,
-                        "workflow.run.id": prepared.workflow_run_id,
-                        "task.run.id": prepared.task_run_id,
-                        "task.attempt.id": prepared.task_attempt_id,
-                        "task.attempt.number": prepared.attempt_number,
-                        "task.type": prepared.task_type,
-                    }
-                    if correlation_id is not None:
-                        identifiers["correlation.id"] = correlation_id
-                    with bind_log_context(**identifiers):
-                        await transaction.persist_dispatch(
-                            prepared, outbox_id, route, payload
+                        active_span = deferred_span.start(
+                            "taskforge.retry.dispatch",
+                            root=True,
+                            attributes={"db.system.name": "postgresql"},
                         )
-                    committed_log_fields = identifiers
-                    committed_route = route
-                    dispatched_attempt_id = prepared.task_attempt_id
+                        outbox_id, route, payload, correlation_id = (
+                            self._prepare_outbox(prepared, active_span)
+                        )
+                        identifiers: dict[str, object] = {
+                            "dispatch.id": outbox_id,
+                            "workflow.run.id": prepared.workflow_run_id,
+                            "task.run.id": prepared.task_run_id,
+                            "task.attempt.id": prepared.task_attempt_id,
+                            "task.attempt.number": prepared.attempt_number,
+                            "task.type": prepared.task_type,
+                        }
+                        if correlation_id is not None:
+                            identifiers["correlation.id"] = correlation_id
+                        with bind_log_context(**identifiers):
+                            await transaction.persist_dispatch(
+                                prepared, outbox_id, route, payload
+                            )
+                        committed_log_fields = identifiers
+                        committed_route = route
+                        dispatched_attempt_id = prepared.task_attempt_id
+                except (
+                    DueRetryScanInvariantError,
+                    DueRetryPersistenceInvariantViolation,
+                    DueRetryPersistenceUnavailable,
+                ) as error:
+                    set_error(deferred_span.active, error, "retry_dispatch_failure")
+                    raise
+                finally:
+                    deferred_span.end()
                 assert dispatched_attempt_id is not None
                 assert committed_log_fields is not None and committed_route is not None
                 with bind_log_context(**committed_log_fields):
@@ -158,8 +179,15 @@ class DueRetryScanner:
         return result
 
     def _prepare_outbox(
-        self, prepared: PreparedDueRetryDispatch
+        self, prepared: PreparedDueRetryDispatch, active_span: Span | None
     ) -> tuple[UUID, str, dict[str, object], str | None]:
+        from taskforge.dispatch.envelope import (
+            DispatchEnvelopeValidationError,
+            create_dispatch_envelope,
+            deserialize_dispatch_envelope,
+            dispatch_envelope_to_mapping,
+        )
+
         definition = self._task_types.definition(prepared.task_type)
         if definition is None:
             raise DueRetryScanInvariantError
@@ -172,6 +200,7 @@ class DueRetryScanner:
                 sort_keys=True,
             ).encode("utf-8")
             predecessor = deserialize_dispatch_envelope(encoded_predecessor)
+            add_link(active_span, link_from_trace_context(predecessor.trace_context))
             predecessor_mapping = dispatch_envelope_to_mapping(predecessor)
             if (
                 predecessor.dispatch_id != prepared.predecessor_dispatch_id
@@ -201,7 +230,7 @@ class DueRetryScanner:
                 deadline_at=prepared.deadline_at,
                 execution_timeout_seconds=prepared.execution_timeout_seconds,
                 correlation_id=predecessor.correlation_id,
-                trace_context=predecessor.trace_context,
+                trace_context=inject_trace_context(),
             )
         except (DispatchEnvelopeValidationError, TypeError, ValueError) as error:
             raise DueRetryScanInvariantError from error

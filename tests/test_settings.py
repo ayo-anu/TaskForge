@@ -49,6 +49,10 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.application_name == "taskforge"
     assert settings.environment == "development"
     assert settings.log_level == "INFO"
+    assert settings.tracing_enabled is False
+    assert settings.tracing_exporter == "none"
+    assert settings.tracing_otlp_endpoint is None
+    assert settings.tracing_sample_ratio == 0.1
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 8000
     assert settings.readiness_timeout_seconds == 2.0
@@ -87,6 +91,43 @@ def test_settings_accept_prefixed_environment_overrides(
     assert settings.application_name == "taskforge-test"
     assert settings.environment == "test"
     assert settings.log_level == "DEBUG"
+
+
+def test_tracing_enablement_is_independent_from_export_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_TRACING_ENABLED", "true")
+    assert Settings().tracing_exporter == "none"
+
+    monkeypatch.setenv("TASKFORGE_TRACING_EXPORTER", "otlp_http")
+    monkeypatch.setenv(
+        "TASKFORGE_TRACING_OTLP_ENDPOINT", "http://collector:4318/v1/traces"
+    )
+    configured = Settings()
+    assert configured.tracing_enabled
+    assert configured.tracing_exporter == "otlp_http"
+
+
+@pytest.mark.parametrize(
+    ("enabled", "exporter", "endpoint"),
+    (
+        ("false", "otlp_http", "http://collector:4318/v1/traces"),
+        ("true", "otlp_http", None),
+        ("true", "none", "http://collector:4318/v1/traces"),
+    ),
+)
+def test_inconsistent_tracing_configuration_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: str,
+    exporter: str,
+    endpoint: str | None,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_TRACING_ENABLED", enabled)
+    monkeypatch.setenv("TASKFORGE_TRACING_EXPORTER", exporter)
+    if endpoint is not None:
+        monkeypatch.setenv("TASKFORGE_TRACING_OTLP_ENDPOINT", endpoint)
+    with pytest.raises(ValidationError):
+        Settings()
 
 
 @pytest.mark.parametrize(
