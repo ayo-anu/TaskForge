@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Protocol
 from uuid import UUID
 
@@ -22,6 +23,7 @@ from taskforge.dispatch.transport import (
     validate_dispatch_transport,
 )
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.logging import bind_log_context, log_event
 from taskforge.worker.cancellation import (
     TaskCancellationObservationOutcome,
     TaskCancellationObserver,
@@ -32,6 +34,7 @@ from taskforge.worker.handlers import (
     TaskContext,
     TaskDeadline,
     TaskHandler,
+    TaskHandlerDefinition,
     TaskHandlerRegistry,
     create_task_context,
 )
@@ -65,6 +68,9 @@ from taskforge.worker.start import (
 
 class WorkerConsumptionPaused(Exception):
     """Consumption must pause while preserving the current valid delivery."""
+
+
+logger = logging.getLogger(__name__)
 
 
 class TaskClaimAcquirer(Protocol):
@@ -141,14 +147,49 @@ class WorkerExecutionConsumer:
             control.delivery.body, control.delivery.metadata
         )
         if isinstance(transport, MalformedDispatchTransport):
+            log_event(
+                logger,
+                logging.WARNING,
+                "broker.delivery.malformed",
+                {
+                    "reason.code": transport.code,
+                    "broker.redelivered": control.delivery.redelivered,
+                },
+            )
             await control.reject(requeue=False)
             return
         envelope = transport.envelope
+        fields: dict[str, object] = {
+            "dispatch.id": envelope.dispatch_id,
+            "workflow.run.id": envelope.workflow_run_id,
+            "task.run.id": envelope.task_run_id,
+            "task.attempt.id": envelope.task_attempt_id,
+            "task.attempt.number": envelope.attempt_number,
+            "task.type": envelope.task_type,
+            "worker.id": self._authenticated_worker.worker_identity_id,
+            "worker.session.id": self._worker_session_id,
+            "broker.redelivered": control.delivery.redelivered,
+        }
+        if envelope.correlation_id is not None:
+            fields["correlation.id"] = envelope.correlation_id
+        with bind_log_context(**fields):
+            log_event(logger, logging.INFO, "worker.delivery.validated")
+            await self._consume_validated(control, envelope)
+
+    async def _consume_validated(
+        self, control: DispatchDeliveryControl, envelope: DispatchEnvelope
+    ) -> None:
         definition = self._handlers.definition(envelope.task_type)
         if (
             definition is None
             or definition.required_capability != envelope.required_capability
         ):
+            log_event(
+                logger,
+                logging.ERROR,
+                "worker.handler.registration_drift",
+                {"reason.code": "handler_registration_drift"},
+            )
             raise WorkerConsumptionPaused("local handler registration drift")
 
         try:
@@ -156,6 +197,17 @@ class WorkerExecutionConsumer:
                 self._authenticated_worker, self._worker_session_id, envelope
             )
         except TaskClaimRejected as error:
+            log_event(
+                logger,
+                (
+                    logging.INFO
+                    if error.reason in _ACKNOWLEDGED_REJECTIONS
+                    else logging.WARNING
+                ),
+                "worker.claim.rejected",
+                {"reason.code": error.reason.value, "outcome": "rejected"},
+                error=error,
+            )
             if error.reason is TaskClaimRejectionReason.INVALID_DISPATCH:
                 await control.reject(requeue=False)
                 return
@@ -168,9 +220,38 @@ class WorkerExecutionConsumer:
                 ) from error
             raise WorkerConsumptionPaused("unclassified claim rejection") from error
         except (TaskClaimServiceInvariantError, TaskClaimServiceUnavailable) as error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "worker.claim.failed",
+                {"error.category": "claim_service_failure", "outcome": "paused"},
+                error=error,
+            )
             raise WorkerConsumptionPaused("claim persistence failed closed") from error
 
+        with bind_log_context(**{"claim.generation": issued.claim.generation}):
+            log_event(
+                logger,
+                logging.INFO,
+                "worker.claim.issued",
+                {"outcome": issued.outcome.value},
+            )
+            await self._consume_claimed(control, envelope, definition, issued)
+
+    async def _consume_claimed(
+        self,
+        control: DispatchDeliveryControl,
+        envelope: DispatchEnvelope,
+        definition: TaskHandlerDefinition,
+        issued: IssuedTaskClaim,
+    ) -> None:
         if issued.outcome is TaskClaimOutcome.REPLAYED_EXPIRED:
+            log_event(
+                logger,
+                logging.WARNING,
+                "worker.claim.expired",
+                {"reason.code": "replayed_expired", "outcome": "paused"},
+            )
             raise WorkerConsumptionPaused("expired claim requires recovery")
         try:
             start = await self._start_service.start_task(
@@ -188,7 +269,15 @@ class WorkerExecutionConsumer:
             TaskStartInvariantError,
             TaskStartServiceUnavailable,
         ) as error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "worker.start.failed",
+                {"error.category": "task_start_failure", "outcome": "paused"},
+                error=error,
+            )
             raise WorkerConsumptionPaused("task start failed closed") from error
+        log_event(logger, logging.INFO, "worker.task.started")
 
         cancellation_token = TaskCancellationToken()
         initial_observation = TaskCancellationObservationOutcome.ACTIVE
@@ -204,6 +293,12 @@ class WorkerExecutionConsumer:
             # obsolete or already-authoritative claim delivery, there is no work
             # left for this delivery to perform and no worker result to author.
             await control.acknowledge()
+            log_event(
+                logger,
+                logging.INFO,
+                "worker.delivery.acknowledged",
+                {"outcome": "no_longer_authoritative"},
+            )
             return
         context = create_task_context(
             dispatch_id=envelope.dispatch_id,
@@ -237,10 +332,8 @@ class WorkerExecutionConsumer:
             result = (
                 TaskExecutionResult.cancellation()
                 if cancellation_token.is_cancellation_requested
-                else await _execute_handler(
-                    definition.handler,
-                    context,
-                    envelope.execution_timeout_seconds,
+                else await _execute_handler_logged(
+                    definition.handler, context, envelope.execution_timeout_seconds
                 )
             )
         finally:
@@ -266,6 +359,17 @@ class WorkerExecutionConsumer:
                     envelope.correlation_id,
                 ),
             )
+        except TaskResultStale as error:
+            log_event(
+                logger,
+                logging.INFO,
+                "worker.result.stale",
+                {"reason.code": "stale_result", "outcome": "paused"},
+                error=error,
+            )
+            raise WorkerConsumptionPaused(
+                "task result persistence failed closed"
+            ) from error
         except (
             TaskResultAuthorityRejected,
             TaskResultConflict,
@@ -274,8 +378,14 @@ class WorkerExecutionConsumer:
             TaskResultInvariantError,
             TaskResultNotFound,
             TaskResultServiceUnavailable,
-            TaskResultStale,
         ) as error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "worker.result.failed",
+                {"error.category": "result_submission_failure", "outcome": "paused"},
+                error=error,
+            )
             raise WorkerConsumptionPaused(
                 "task result persistence failed closed"
             ) from error
@@ -289,6 +399,15 @@ class WorkerExecutionConsumer:
         ):
             raise WorkerConsumptionPaused("task result receipt failed closed")
         await control.acknowledge()
+
+        log_event(
+            logger,
+            logging.INFO,
+            "worker.delivery.completed",
+            {
+                "outcome": receipt.outcome.value,
+            },
+        )
 
     async def _observe_cancellation_once(
         self,
@@ -357,3 +476,26 @@ async def _execute_handler(
     if isinstance(raw_result, TaskCancellation):
         return TaskExecutionResult.cancellation()
     return TaskExecutionResult.success(raw_result)
+
+
+async def _execute_handler_logged(
+    handler: TaskHandler,
+    context: TaskContext,
+    execution_timeout_seconds: int | None,
+) -> TaskExecutionResult:
+    log_event(logger, logging.INFO, "worker.handler.started")
+    result = await _execute_handler(handler, context, execution_timeout_seconds)
+    log_event(
+        logger,
+        logging.INFO,
+        "worker.handler.completed",
+        {
+            "outcome": result.kind.value,
+            "reason.code": (
+                result.failure_kind.value
+                if result.failure_kind is not None
+                else "completed"
+            ),
+        },
+    )
+    return result

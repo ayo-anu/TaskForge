@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 import asyncpg
 from fastapi import WebSocket, WebSocketDisconnect, status
 
+from taskforge.logging import bind_log_context, log_event
 from taskforge.runs.domain import StoredWorkflowRunExecutionEvent
 from taskforge.runs.persistence_ports import (
     WorkflowRunExecutionEventInvariantViolation,
@@ -325,14 +326,20 @@ class ExecutionStreamRuntime:
                 self._listener_ready = True
                 self._first_attempt_complete.set()
                 delay = INITIAL_RECONNECT_DELAY_SECONDS
-                logger.info("execution event listener connected")
+                log_event(logger, logging.INFO, "execution_stream.listener.connected")
                 for run_id in tuple(self._groups):
                     self._mark_dirty(run_id)
                 await terminated.wait()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.warning("execution event listener unavailable", exc_info=True)
+            except Exception as error:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "execution_stream.listener.unavailable",
+                    {"error.category": "dependency_unavailable"},
+                    error=error,
+                )
             finally:
                 self._listener_ready = False
                 self._first_attempt_complete.set()
@@ -378,7 +385,12 @@ class ExecutionStreamRuntime:
                 return
             run_id = UUID(value["workflow_run_id"])
         except (TypeError, ValueError, json.JSONDecodeError):
-            logger.warning("invalid execution event wake-up payload")
+            log_event(
+                logger,
+                logging.WARNING,
+                "execution_stream.wakeup.invalid",
+                {"reason.code": "invalid_payload"},
+            )
             return
         if run_id in self._groups:
             self._mark_dirty(run_id)
@@ -395,6 +407,10 @@ class ExecutionStreamRuntime:
             )
 
     async def _reconcile_group(self, group: _RunGroup) -> None:
+        with bind_log_context(**{"workflow.run.id": group.workflow_run_id}):
+            await self._reconcile_group_bound(group)
+
+    async def _reconcile_group_bound(self, group: _RunGroup) -> None:
         retry_delay = INITIAL_RECONNECT_DELAY_SECONDS
         while not self._stopping:
             relevant = tuple(
@@ -432,7 +448,12 @@ class ExecutionStreamRuntime:
                     read_cursor = page[-1].cursor
                 retry_delay = INITIAL_RECONNECT_DELAY_SECONDS
             except WorkflowRunExecutionEventPersistenceUnavailable:
-                logger.warning("execution event reconciliation unavailable")
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "execution_stream.reconciliation.unavailable",
+                    {"error.category": "dependency_unavailable"},
+                )
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(
                     retry_delay * 2,
@@ -440,7 +461,12 @@ class ExecutionStreamRuntime:
                 )
                 continue
             except (WorkflowRunExecutionEventInvariantViolation, TypeError, ValueError):
-                logger.error("execution event reconciliation invariant failure")
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "execution_stream.reconciliation.invariant_failed",
+                    {"error.category": "invariant_violation"},
+                )
                 for subscription in tuple(group.subscriptions.values()):
                     self._signal_termination(subscription, SERVICE_FAILURE)
                 return

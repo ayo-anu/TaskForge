@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from time import perf_counter
 from typing import Literal, cast
 from uuid import UUID, uuid4
 
@@ -14,6 +15,8 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
+
+from taskforge.logging import bind_log_context, log_event
 
 REQUEST_ID_HEADER = "X-Request-ID"
 logger = logging.getLogger(__name__)
@@ -58,9 +61,25 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         request_id = uuid4()
         request.state.request_id = request_id
-        response = await call_next(request)
-        response.headers[REQUEST_ID_HEADER] = str(request_id)
-        return response
+        started = perf_counter()
+        with bind_log_context(
+            **{"request.id": request_id, "correlation.id": request_id}
+        ):
+            response = await call_next(request)
+            response.headers[REQUEST_ID_HEADER] = str(request_id)
+            log_event(
+                logger,
+                logging.INFO,
+                "api.request.completed",
+                {
+                    "http.method": request.method,
+                    "http.route": _route_template(request),
+                    "http.status_code": response.status_code,
+                    "duration_ms": round((perf_counter() - started) * 1000, 3),
+                    "outcome": "completed",
+                },
+            )
+            return response
 
 
 def install_error_handling(app: FastAPI) -> None:
@@ -110,11 +129,15 @@ async def unexpected_exception_handler(
     request: Request,
     exception: Exception,
 ) -> JSONResponse:
-    logger.error(
-        "Unhandled API exception type=%s request_id=%s",
-        type(exception).__name__,
-        request.state.request_id,
-    )
+    request_id = cast(UUID, request.state.request_id)
+    with bind_log_context(**{"request.id": request_id, "correlation.id": request_id}):
+        log_event(
+            logger,
+            logging.ERROR,
+            "api.exception.unhandled",
+            {"error.category": "unexpected"},
+            error=exception,
+        )
     code, message = ERROR_CONTRACTS[500]
     return error_response(
         request,
@@ -163,3 +186,9 @@ def _request_validation_detail(error: Mapping[str, object]) -> ErrorDetail:
     location = raw_location if isinstance(raw_location, tuple) else ()
     path = [part for part in location if isinstance(part, (str, int))]
     return ErrorDetail(code=code, path=path, message=message)
+
+
+def _route_template(request: Request) -> str:
+    route = request.scope.get("route")
+    path = getattr(route, "path", None)
+    return path if isinstance(path, str) else "unmatched"

@@ -2,18 +2,27 @@
 
 import uvicorn
 
+from taskforge.logging import configure_logging, uvicorn_log_config
 from taskforge.settings import Settings
 
 
 def main() -> int:
     """Run the API using only typed runtime configuration."""
     settings = Settings()
+    configure_logging(
+        service_name=settings.application_name,
+        environment=settings.environment,
+        process_role="api",
+        level=settings.log_level,
+    )
     uvicorn.run(
         "taskforge.api.application:create_app",
         factory=True,
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
+        log_config=uvicorn_log_config(settings.log_level),
+        access_log=False,
     )
     return 0
 

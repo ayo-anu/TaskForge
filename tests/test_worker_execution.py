@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -23,6 +24,7 @@ from taskforge.dispatch.envelope import (
 )
 from taskforge.dispatch.transport import DispatchTransportMetadata
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.logging import current_log_context
 from taskforge.worker.cancellation import (
     TaskCancellationObservation,
     TaskCancellationObservationOutcome,
@@ -267,6 +269,49 @@ def test_valid_delivery_acks_only_after_result_submission() -> None:
     assert "result_authority=<redacted>" in repr(result_service.requests[0])
 
 
+def test_complete_delivery_lifecycle_has_isolated_correlated_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    first_correlation, second_correlation = str(uuid4()), str(uuid4())
+    observed: list[dict[str, object]] = []
+    caplog.set_level(logging.INFO, logger="taskforge.worker.execution")
+
+    async def handler(_context: TaskContext) -> None:
+        observed.append(dict(current_log_context()))
+
+    for correlation_id in (first_correlation, second_correlation):
+        envelope, control, issued, worker, _ = fixture(correlation_id=correlation_id)
+        asyncio.run(
+            WorkerExecutionConsumer(
+                ClaimService(issued),
+                StartService([]),
+                ResultService(),
+                registry(handler),
+                worker,
+                issued.claim.worker_session_id,
+            ).consume(control)
+        )
+        assert control.actions == ["ack"]
+        completed = [
+            record
+            for record in caplog.records
+            if getattr(record, "_event_name", None) == "worker.delivery.completed"
+            and record.__dict__["_event_fields"].get("dispatch.id")
+            == str(envelope.dispatch_id)
+        ]
+        assert len(completed) == 1
+        fields = completed[0].__dict__["_event_fields"]
+        assert fields["correlation.id"] == correlation_id
+        assert fields["claim.generation"] == issued.claim.generation
+        assert fields["worker.id"] == str(worker.worker_identity_id)
+
+    assert [item["correlation.id"] for item in observed] == [
+        first_correlation,
+        second_correlation,
+    ]
+    assert current_log_context() == {}
+
+
 @pytest.mark.parametrize(
     "outcome",
     (
@@ -319,6 +364,33 @@ def test_result_rejections_and_uncertainty_preserve_delivery(error: Exception) -
     with pytest.raises(WorkerConsumptionPaused, match="persistence failed closed"):
         asyncio.run(consumer.consume(control))
 
+    assert control.actions == []
+
+
+def test_stale_result_is_an_expected_info_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _, control, issued, worker, _ = fixture(correlation_id=str(uuid4()))
+    caplog.set_level(logging.INFO, logger="taskforge.worker.execution")
+    consumer = WorkerExecutionConsumer(
+        ClaimService(issued),
+        StartService([]),
+        ResultService(error=TaskResultStale()),
+        registry(lambda context: asyncio.sleep(0, result=context)),
+        worker,
+        issued.claim.worker_session_id,
+    )
+
+    with pytest.raises(WorkerConsumptionPaused, match="persistence failed closed"):
+        asyncio.run(consumer.consume(control))
+
+    event = next(
+        record
+        for record in caplog.records
+        if getattr(record, "_event_name", None) == "worker.result.stale"
+    )
+    assert event.levelno == logging.INFO
+    assert event.__dict__["_event_fields"]["reason.code"] == "stale_result"
     assert control.actions == []
 
 

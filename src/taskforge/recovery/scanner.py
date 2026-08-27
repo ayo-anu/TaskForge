@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+from uuid import uuid4
+
+from taskforge.logging import bind_log_context, log_event
 from taskforge.recovery.domain import (
     MAX_RECOVERY_SCAN_BATCH_SIZE,
     ExpiredClaimCandidatePage,
@@ -24,6 +28,9 @@ class RecoveryScanServiceUnavailable(Exception):
     """Recovery candidate persistence is operationally unavailable."""
 
 
+logger = logging.getLogger(__name__)
+
+
 class RecoveryCandidateScanner:
     def __init__(
         self,
@@ -40,14 +47,36 @@ class RecoveryCandidateScanner:
         self, *, limit: int, cursor: ExpiredClaimScanCursor | None = None
     ) -> ExpiredClaimCandidatePage:
         _validate_limit(limit)
-        try:
-            return await self._repository.scan_expired_claims(
-                limit=limit, cursor=cursor
-            )
-        except RecoveryScanPersistenceInvariantViolation as error:
-            raise RecoveryScanInvariantError from error
-        except RecoveryScanPersistenceUnavailable as error:
-            raise RecoveryScanServiceUnavailable from error
+        with bind_log_context(**{"operation.id": uuid4()}):
+            try:
+                page = await self._repository.scan_expired_claims(
+                    limit=limit, cursor=cursor
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "scheduler.expired_claim_scan.completed",
+                    {"examined": len(page.items)},
+                )
+                return page
+            except RecoveryScanPersistenceInvariantViolation as error:
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "scheduler.expired_claim_scan.failed",
+                    {"error.category": "persistence_invariant", "outcome": "failed"},
+                    error=error,
+                )
+                raise RecoveryScanInvariantError from error
+            except RecoveryScanPersistenceUnavailable as error:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "scheduler.expired_claim_scan.failed",
+                    {"error.category": "persistence_unavailable", "outcome": "failed"},
+                    error=error,
+                )
+                raise RecoveryScanServiceUnavailable from error
 
     async def scan_stale_worker_sessions(
         self,
@@ -61,16 +90,38 @@ class RecoveryCandidateScanner:
             and cursor.stale_after_seconds != self._worker_stale_after_seconds
         ):
             raise ValueError("stale-session cursor threshold does not match scanner")
-        try:
-            return await self._repository.scan_stale_worker_sessions(
-                stale_after_seconds=self._worker_stale_after_seconds,
-                limit=limit,
-                cursor=cursor,
-            )
-        except RecoveryScanPersistenceInvariantViolation as error:
-            raise RecoveryScanInvariantError from error
-        except RecoveryScanPersistenceUnavailable as error:
-            raise RecoveryScanServiceUnavailable from error
+        with bind_log_context(**{"operation.id": uuid4()}):
+            try:
+                page = await self._repository.scan_stale_worker_sessions(
+                    stale_after_seconds=self._worker_stale_after_seconds,
+                    limit=limit,
+                    cursor=cursor,
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "scheduler.stale_worker_scan.completed",
+                    {"examined": len(page.items)},
+                )
+                return page
+            except RecoveryScanPersistenceInvariantViolation as error:
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "scheduler.stale_worker_scan.failed",
+                    {"error.category": "persistence_invariant", "outcome": "failed"},
+                    error=error,
+                )
+                raise RecoveryScanInvariantError from error
+            except RecoveryScanPersistenceUnavailable as error:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "scheduler.stale_worker_scan.failed",
+                    {"error.category": "persistence_unavailable", "outcome": "failed"},
+                    error=error,
+                )
+                raise RecoveryScanServiceUnavailable from error
 
 
 def _validate_limit(limit: int) -> None:

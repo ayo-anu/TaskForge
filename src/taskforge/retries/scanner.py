@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
@@ -12,6 +13,7 @@ from taskforge.dispatch.envelope import (
     deserialize_dispatch_envelope,
     dispatch_envelope_to_mapping,
 )
+from taskforge.logging import bind_log_context, log_event
 from taskforge.retries.persistence_ports import (
     DueRetryDispatchRepository,
     DueRetryPersistenceInvariantViolation,
@@ -22,6 +24,7 @@ from taskforge.retries.persistence_ports import (
 from taskforge.workflows.task_types import TaskTypeRegistry
 
 MAX_DUE_RETRY_BATCH_SIZE = 100
+logger = logging.getLogger(__name__)
 
 
 class DueRetryScanInvariantError(Exception):
@@ -63,11 +66,17 @@ class DueRetryScanner:
         ):
             raise ValueError("due retry batch size is outside the supported bounds")
 
+        with bind_log_context(**{"operation.id": uuid4()}):
+            return await self._scan_due_retries_bound(batch_size=batch_size)
+
+    async def _scan_due_retries_bound(self, *, batch_size: int) -> DueRetryScanResult:
         examined = skipped = 0
         dispatched_attempt_ids: list[UUID] = []
         try:
             for _ in range(batch_size):
                 dispatched_attempt_id: UUID | None = None
+                committed_log_fields: dict[str, object] | None = None
+                committed_route: str | None = None
                 async with self._repository.due_dispatch_transaction() as transaction:
                     prepared = await transaction.prepare_next_due()
                     if prepared is None:
@@ -77,23 +86,80 @@ class DueRetryScanner:
                         skipped += 1
                         continue
 
-                    outbox_id, route, payload = self._prepare_outbox(prepared)
-                    await transaction.persist_dispatch(
-                        prepared, outbox_id, route, payload
+                    outbox_id, route, payload, correlation_id = self._prepare_outbox(
+                        prepared
                     )
+                    identifiers: dict[str, object] = {
+                        "dispatch.id": outbox_id,
+                        "workflow.run.id": prepared.workflow_run_id,
+                        "task.run.id": prepared.task_run_id,
+                        "task.attempt.id": prepared.task_attempt_id,
+                        "task.attempt.number": prepared.attempt_number,
+                        "task.type": prepared.task_type,
+                    }
+                    if correlation_id is not None:
+                        identifiers["correlation.id"] = correlation_id
+                    with bind_log_context(**identifiers):
+                        await transaction.persist_dispatch(
+                            prepared, outbox_id, route, payload
+                        )
+                    committed_log_fields = identifiers
+                    committed_route = route
                     dispatched_attempt_id = prepared.task_attempt_id
                 assert dispatched_attempt_id is not None
+                assert committed_log_fields is not None and committed_route is not None
+                with bind_log_context(**committed_log_fields):
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "scheduler.retry.dispatched",
+                        {"broker.route": committed_route, "outcome": "dispatched"},
+                    )
                 dispatched_attempt_ids.append(dispatched_attempt_id)
+        except DueRetryScanInvariantError as error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "scheduler.retry_scan.failed",
+                {"error.category": "scanner_invariant", "outcome": "failed"},
+                error=error,
+            )
+            raise
         except DueRetryPersistenceInvariantViolation as error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "scheduler.retry_scan.failed",
+                {"error.category": "persistence_invariant", "outcome": "failed"},
+                error=error,
+            )
             raise DueRetryScanInvariantError from error
         except DueRetryPersistenceUnavailable as error:
+            log_event(
+                logger,
+                logging.WARNING,
+                "scheduler.retry_scan.failed",
+                {"error.category": "persistence_unavailable", "outcome": "failed"},
+                error=error,
+            )
             raise DueRetryScanServiceUnavailable from error
 
-        return DueRetryScanResult(examined, tuple(dispatched_attempt_ids), skipped)
+        result = DueRetryScanResult(examined, tuple(dispatched_attempt_ids), skipped)
+        log_event(
+            logger,
+            logging.INFO,
+            "scheduler.retry_scan.completed",
+            {
+                "examined": result.examined,
+                "dispatched": result.dispatched,
+                "skipped": result.skipped,
+            },
+        )
+        return result
 
     def _prepare_outbox(
         self, prepared: PreparedDueRetryDispatch
-    ) -> tuple[UUID, str, dict[str, object]]:
+    ) -> tuple[UUID, str, dict[str, object], str | None]:
         definition = self._task_types.definition(prepared.task_type)
         if definition is None:
             raise DueRetryScanInvariantError
@@ -139,4 +205,9 @@ class DueRetryScanner:
             )
         except (DispatchEnvelopeValidationError, TypeError, ValueError) as error:
             raise DueRetryScanInvariantError from error
-        return dispatch_id, envelope.route, dispatch_envelope_to_mapping(envelope)
+        return (
+            dispatch_id,
+            envelope.route,
+            dispatch_envelope_to_mapping(envelope),
+            envelope.correlation_id,
+        )

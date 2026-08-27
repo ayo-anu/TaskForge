@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import TracebackType
@@ -208,6 +209,23 @@ def test_scan_counts_locked_revalidation_skip_and_stops_on_no_candidate() -> Non
     assert result.dispatched_attempt_ids == ()
 
 
+def test_retry_success_event_preserves_correlation_after_transaction_exit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repository = FakeRepository([prepared_due()])
+    caplog.set_level(logging.INFO, logger="taskforge.retries.scanner")
+
+    asyncio.run(DueRetryScanner(repository, registry()).scan_due_retries(batch_size=1))
+
+    event = next(
+        record
+        for record in caplog.records
+        if getattr(record, "_event_name", None) == "scheduler.retry.dispatched"
+    )
+    assert repository.transactions[0].exited_with is None
+    assert event.__dict__["_event_fields"]["correlation.id"] == "correlation-1"
+
+
 def test_invalid_predecessor_envelope_fails_closed_and_rolls_back() -> None:
     prepared = prepared_due()
     prepared.predecessor_payload["task_attempt_id"] = str(uuid4())
@@ -248,3 +266,24 @@ def test_persistence_errors_are_stably_translated(
         asyncio.run(
             DueRetryScanner(repository, registry()).scan_due_retries(batch_size=1)
         )
+
+
+def test_persistence_failure_has_scheduler_owned_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="taskforge.retries.scanner")
+
+    with pytest.raises(DueRetryScanServiceUnavailable):
+        asyncio.run(
+            DueRetryScanner(
+                FakeRepository([DueRetryPersistenceUnavailable()]), registry()
+            ).scan_due_retries(batch_size=1)
+        )
+
+    event = next(
+        record
+        for record in caplog.records
+        if getattr(record, "_event_name", None) == "scheduler.retry_scan.failed"
+    )
+    assert "operation.id" in event.__dict__["_event_fields"]
+    assert event.__dict__["_safe_error_type"] == "DueRetryPersistenceUnavailable"

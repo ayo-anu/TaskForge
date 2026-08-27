@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from taskforge.api.__main__ import main as api_main
+from taskforge.logging import uvicorn_log_config
 from taskforge.worker.__main__ import main as worker_main
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,8 @@ def test_api_entry_point_uses_typed_runtime_settings(
         "host": "127.0.0.2",
         "port": 8765,
         "log_level": "warning",
+        "log_config": uvicorn_log_config("WARNING"),
+        "access_log": False,
     }
 
 

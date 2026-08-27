@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -68,6 +69,7 @@ class FakeBroker:
 def stored_dispatch(
     sequence: int,
     *,
+    correlation_id: str | None = None,
     mutate: Callable[[dict[str, object]], None] | None = None,
 ) -> StoredDispatch:
     dispatch_id, attempt_id = uuid4(), uuid4()
@@ -81,6 +83,7 @@ def stored_dispatch(
         required_capability="document-workers",
         task_payload={"sequence": sequence},
         references={},
+        correlation_id=correlation_id,
     )
     payload = dispatch_envelope_to_mapping(envelope)
     if mutate is not None:
@@ -195,10 +198,17 @@ def test_publication_uses_exact_durable_route_identity_and_snapshot() -> None:
     assert str(record.dispatch_id).encode() in publication.body
 
 
-def test_broker_failure_stops_pass_before_acknowledgement() -> None:
-    first, second = stored_dispatch(1), stored_dispatch(2)
+def test_broker_failure_logs_safe_owned_event_before_propagation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    correlation_id = str(uuid4())
+    first, second = (
+        stored_dispatch(1, correlation_id=correlation_id),
+        stored_dispatch(2),
+    )
     repository = FakeRepository((first, second))
     broker = FakeBroker(failure_for=first.dispatch_id)
+    caplog.set_level(logging.INFO, logger="taskforge.dispatch.publisher")
 
     with pytest.raises(BrokerPublicationTimeout):
         asyncio.run(
@@ -209,6 +219,16 @@ def test_broker_failure_stops_pass_before_acknowledgement() -> None:
 
     assert [item.dispatch_id for item in broker.publications] == [first.dispatch_id]
     assert repository.acknowledged == []
+    event = next(
+        record
+        for record in caplog.records
+        if getattr(record, "_event_name", None) == "dispatch.publish.failed"
+    )
+    fields = event.__dict__["_event_fields"]
+    assert fields["dispatch.id"] == str(first.dispatch_id)
+    assert fields["correlation.id"] == correlation_id
+    assert event.__dict__["_safe_error_type"] == "BrokerPublicationTimeout"
+    assert "body" not in fields
 
 
 def test_concurrent_acknowledgement_outcome_is_counted() -> None:
@@ -223,6 +243,37 @@ def test_concurrent_acknowledgement_outcome_is_counted() -> None:
 
     assert result.acknowledged == 0
     assert result.already_acknowledged == 1
+
+
+def test_publication_reconstructs_isolated_identifier_contexts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    first_correlation, second_correlation = str(uuid4()), str(uuid4())
+    first = stored_dispatch(1, correlation_id=first_correlation)
+    second = stored_dispatch(2, correlation_id=second_correlation)
+    caplog.set_level(logging.INFO, logger="taskforge.dispatch.publisher")
+
+    asyncio.run(
+        TaskDispatchPublisher(
+            FakeRepository((first, second)), FakeBroker()
+        ).reconcile_unpublished(page_size=2, pass_limit=2)
+    )
+
+    events = [
+        record
+        for record in caplog.records
+        if getattr(record, "_event_name", None) == "dispatch.publish.succeeded"
+    ]
+    assert [record.__dict__["_event_fields"]["dispatch.id"] for record in events] == [
+        str(first.dispatch_id),
+        str(second.dispatch_id),
+    ]
+    assert [
+        record.__dict__["_event_fields"]["correlation.id"] for record in events
+    ] == [
+        first_correlation,
+        second_correlation,
+    ]
 
 
 @pytest.mark.parametrize(

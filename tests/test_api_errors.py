@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from uuid import UUID
 
 import httpx2
+import pytest
 from fastapi import FastAPI, HTTPException
+from starlette.requests import Request
+from starlette.responses import Response
 
-from taskforge.api.errors import REQUEST_ID_HEADER, install_error_handling
+from taskforge.api.errors import (
+    REQUEST_ID_HEADER,
+    RequestIDMiddleware,
+    install_error_handling,
+)
 
 
 def make_app() -> FastAPI:
@@ -111,10 +119,42 @@ def test_validation_failures_use_the_common_envelope() -> None:
     assert "not-an-integer" not in response.text
 
 
-def test_unexpected_failures_use_a_safe_internal_error_contract() -> None:
+def test_unexpected_failures_have_one_owning_error_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="taskforge.api.errors")
     response = request(make_app(), "/unexpected", raise_app_exceptions=False)
 
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
     assert response.headers[REQUEST_ID_HEADER] == response.json()["error"]["request_id"]
     assert "secret" not in response.text
+    errors = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        and getattr(record, "_event_name", None) == "api.exception.unhandled"
+    ]
+    assert len(errors) == 1
+    fields = errors[0].__dict__["_event_fields"]
+    response_request_id = response.headers[REQUEST_ID_HEADER]
+    assert fields["request.id"] == response_request_id
+    assert fields["correlation.id"] == response_request_id
+
+
+def test_request_cancellation_is_not_logged_as_application_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    middleware = RequestIDMiddleware(FastAPI())
+    request_value = Request({"type": "http", "method": "GET", "path": "/cancel"})
+
+    async def cancel(_request: Request) -> Response:
+        raise asyncio.CancelledError
+
+    async def invoke() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await middleware.dispatch(request_value, cancel)
+
+    caplog.set_level(logging.INFO, logger="taskforge.api.errors")
+    asyncio.run(invoke())
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
