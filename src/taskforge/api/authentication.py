@@ -118,6 +118,11 @@ class AuthenticationRuntime:
         self.history_service = history_service
         self.history_export_service = history_export_service
 
+    @property
+    def engine(self) -> AsyncEngine:
+        """Expose the lifespan-owned engine for API readiness composition."""
+        return self._engine
+
     async def close(self) -> None:
         await self._engine.dispose()
 

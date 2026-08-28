@@ -166,7 +166,7 @@ async def verify_protected_route(database_url: URL) -> None:
 
     app = create_app(
         settings=settings,
-        readiness=ReadinessCoordinator((AlwaysReady(),), timeout_seconds=1),
+        readiness=ReadinessCoordinator(AlwaysReady(), timeout_seconds=1),
     )
     tokens = {
         "viewer": credential_value(

@@ -214,7 +214,7 @@ def make_app(
             postgres_password=SecretStr("postgres-test-secret"),
             rabbitmq_password=SecretStr("rabbitmq-test-secret"),
         ),
-        readiness=ReadinessCoordinator((AlwaysReady(),), timeout_seconds=0.05),
+        readiness=ReadinessCoordinator(AlwaysReady(), timeout_seconds=0.05),
         authentication=runtime,
     )
     app.state.authentication = runtime

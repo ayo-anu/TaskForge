@@ -265,7 +265,7 @@ def make_app(
         postgres_password=SecretStr("test"), rabbitmq_password=SecretStr("test")
     )
     app = create_app(
-        settings, ReadinessCoordinator((AlwaysReady(),), timeout_seconds=0.05), runtime
+        settings, ReadinessCoordinator(AlwaysReady(), timeout_seconds=0.05), runtime
     )
     return app, runtime, service, validator
 

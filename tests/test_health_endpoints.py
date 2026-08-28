@@ -1,4 +1,4 @@
-"""Focused tests for the unversioned operational health endpoints."""
+"""Focused tests for API-owned operational health and readiness."""
 
 from __future__ import annotations
 
@@ -9,14 +9,13 @@ import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
 
+import taskforge.api.health as health_module
 from taskforge.api.application import create_app
 from taskforge.api.health import ReadinessCoordinator
 from taskforge.settings import Settings
 
 
-class FakeReadinessAdapter:
-    """Controllable dependency adapter that never uses external services."""
-
+class FakePostgreSQLProbe:
     def __init__(
         self,
         *,
@@ -27,12 +26,7 @@ class FakeReadinessAdapter:
         self.result = result
         self.error = error
         self.delay_seconds = delay_seconds
-        self.start_count = 0
         self.check_count = 0
-        self.close_count = 0
-
-    async def start(self) -> None:
-        self.start_count += 1
 
     async def is_ready(self) -> bool:
         self.check_count += 1
@@ -42,34 +36,16 @@ class FakeReadinessAdapter:
             raise self.error
         return self.result
 
+
+class FakeAuthentication:
+    api_authenticator = object()
+    worker_authenticator = object()
+
+    def __init__(self) -> None:
+        self.closed = False
+
     async def close(self) -> None:
-        self.close_count += 1
-
-
-class ProbeBarrier:
-    """Prove probes overlap without relying on elapsed wall-clock timing."""
-
-    def __init__(self, participant_count: int) -> None:
-        self._participant_count = participant_count
-        self._arrived = 0
-        self._all_arrived = asyncio.Event()
-
-    async def arrive(self) -> None:
-        self._arrived += 1
-        if self._arrived == self._participant_count:
-            self._all_arrived.set()
-        await self._all_arrived.wait()
-
-
-class CoordinatedAdapter(FakeReadinessAdapter):
-    def __init__(self, barrier: ProbeBarrier) -> None:
-        super().__init__()
-        self._barrier = barrier
-
-    async def is_ready(self) -> bool:
-        self.check_count += 1
-        await self._barrier.arrive()
-        return True
+        self.closed = True
 
 
 def make_settings() -> Settings:
@@ -80,14 +56,19 @@ def make_settings() -> Settings:
 
 
 def make_app(
-    *adapters: FakeReadinessAdapter,
+    probe: FakePostgreSQLProbe,
+    *,
+    listener_available: bool | None = None,
     timeout_seconds: float = 0.05,
 ) -> FastAPI:
-    readiness = ReadinessCoordinator(
-        adapters=adapters,
-        timeout_seconds=timeout_seconds,
+    readiness = ReadinessCoordinator(probe, timeout_seconds=timeout_seconds)
+    if listener_available is not None:
+        readiness.observe_execution_stream(listener_available)
+    return create_app(
+        settings=make_settings(),
+        readiness=readiness,
+        authentication=FakeAuthentication(),  # type: ignore[arg-type]
     )
-    return create_app(settings=make_settings(), readiness=readiness)
 
 
 def request(app: FastAPI, path: str) -> httpx2.Response:
@@ -95,101 +76,265 @@ def request(app: FastAPI, path: str) -> httpx2.Response:
         transport = httpx2.ASGITransport(app=app)
         async with app.router.lifespan_context(app):
             async with httpx2.AsyncClient(
-                transport=transport,
-                base_url="http://testserver",
+                transport=transport, base_url="http://testserver"
             ) as client:
                 return await client.get(path)
 
     return asyncio.run(send())
 
 
-def test_liveness_is_independent_of_dependencies() -> None:
-    first = FakeReadinessAdapter(result=False)
-    second = FakeReadinessAdapter(error=RuntimeError("broker-secret-detail"))
+def test_liveness_is_no_io_after_startup_and_unchanged() -> None:
+    probe = FakePostgreSQLProbe(result=False)
+    app = make_app(probe)
 
-    response = request(make_app(first, second), "/health")
+    async def exercise() -> tuple[httpx2.Response, int, int]:
+        transport = httpx2.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            before = probe.check_count
+            async with httpx2.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                response = await client.get("/health")
+            return response, before, probe.check_count
 
+    response, before, after = asyncio.run(exercise())
     assert response.status_code == 200
     assert response.json() == {"alive": True}
-    assert first.check_count == 0
-    assert second.check_count == 0
-    assert first.start_count == first.close_count == 1
-    assert second.start_count == second.close_count == 1
+    assert before == after == 1
 
 
-def test_readiness_succeeds_when_all_required_dependencies_are_ready() -> None:
+def test_ready_is_ready_when_postgresql_and_listener_are_available() -> None:
     response = request(
-        make_app(FakeReadinessAdapter(), FakeReadinessAdapter()),
-        "/ready",
+        make_app(FakePostgreSQLProbe(), listener_available=True), "/ready"
     )
-
     assert response.status_code == 200
-    assert response.json() == {"ready": True}
+    assert response.json() == {"ready": True, "status": "ready"}
 
 
-@pytest.mark.parametrize("failed_adapter_index", (0, 1))
-def test_each_required_dependency_can_make_readiness_fail(
-    failed_adapter_index: int,
-) -> None:
-    adapters = [FakeReadinessAdapter(), FakeReadinessAdapter()]
-    adapters[failed_adapter_index].result = False
-
-    response = request(make_app(*adapters), "/ready")
-
-    assert response.status_code == 503
-    assert response.json() == {"ready": False}
+def test_listener_unknown_or_unavailable_is_degraded() -> None:
+    for listener in (None, False):
+        response = request(
+            make_app(FakePostgreSQLProbe(), listener_available=listener), "/ready"
+        )
+        assert response.status_code == 200
+        assert response.json() == {"ready": True, "status": "degraded"}
 
 
-def test_dependency_errors_are_normalized_without_detail_leakage() -> None:
-    secret_detail = "postgresql://user:secret@internal-host:5432/taskforge"
-    failing = FakeReadinessAdapter(error=RuntimeError(secret_detail))
-
-    response = request(make_app(failing, FakeReadinessAdapter()), "/ready")
-
-    assert response.status_code == 503
-    assert response.json() == {"ready": False}
-    assert secret_detail not in response.text
-    assert "postgres" not in response.text.lower()
-    assert "rabbit" not in response.text.lower()
-
-
-def test_dependency_timeout_makes_readiness_fail() -> None:
-    slow = FakeReadinessAdapter(delay_seconds=0.1)
-
+def test_postgresql_unavailable_is_not_ready() -> None:
     response = request(
-        make_app(slow, FakeReadinessAdapter(), timeout_seconds=0.01),
+        make_app(FakePostgreSQLProbe(result=False), listener_available=True), "/ready"
+    )
+    assert response.status_code == 503
+    assert response.json() == {"ready": False, "status": "not_ready"}
+
+
+def test_every_ready_request_performs_a_live_probe_and_recovers() -> None:
+    probe = FakePostgreSQLProbe(result=False)
+    app = make_app(probe, listener_available=True)
+
+    async def exercise() -> tuple[httpx2.Response, httpx2.Response]:
+        transport = httpx2.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx2.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                first = await client.get("/ready")
+                probe.result = True
+                second = await client.get("/ready")
+                return first, second
+
+    first, second = asyncio.run(exercise())
+    assert first.status_code == 503
+    assert second.status_code == 200
+    assert second.json() == {"ready": True, "status": "ready"}
+    assert probe.check_count == 3
+
+
+def test_dependency_errors_and_timeouts_are_safe() -> None:
+    secret = "postgresql://user:sentinel-secret@internal-host/taskforge"
+    error_response = request(
+        make_app(FakePostgreSQLProbe(error=RuntimeError(secret))), "/ready"
+    )
+    timeout_response = request(
+        make_app(FakePostgreSQLProbe(delay_seconds=0.1), timeout_seconds=0.01),
         "/ready",
     )
+    for response in (error_response, timeout_response):
+        assert response.status_code == 503
+        assert response.json() == {"ready": False, "status": "not_ready"}
+        assert secret not in response.text
+        assert "postgres" not in response.text.lower()
 
-    assert response.status_code == 503
-    assert response.json() == {"ready": False}
 
+def test_readiness_is_withdrawn_before_authentication_close() -> None:
+    probe = FakePostgreSQLProbe()
+    readiness = ReadinessCoordinator(probe, timeout_seconds=0.05)
 
-def test_required_dependency_checks_run_concurrently() -> None:
-    barrier = ProbeBarrier(participant_count=2)
+    class InspectingAuthentication(FakeAuthentication):
+        async def close(self) -> None:
+            assert (await readiness.snapshot()).status == "not_ready"
+            await super().close()
 
-    response = request(
-        make_app(
-            CoordinatedAdapter(barrier),
-            CoordinatedAdapter(barrier),
-            timeout_seconds=0.1,
-        ),
-        "/ready",
+    authentication = InspectingAuthentication()
+    app = create_app(
+        settings=make_settings(),
+        readiness=readiness,
+        authentication=authentication,  # type: ignore[arg-type]
     )
 
-    assert response.status_code == 200
-    assert response.json() == {"ready": True}
+    async def exercise() -> None:
+        async with app.router.lifespan_context(app):
+            pass
+
+    asyncio.run(exercise())
+    assert authentication.closed is True
 
 
-def test_operational_endpoints_are_intentionally_unversioned() -> None:
-    schema = request(
-        make_app(FakeReadinessAdapter(), FakeReadinessAdapter()),
-        "/openapi.json",
-    ).json()
-
+def test_operational_endpoints_are_unversioned() -> None:
+    schema = request(make_app(FakePostgreSQLProbe()), "/openapi.json").json()
     assert "/health" in schema["paths"]
     assert "/ready" in schema["paths"]
     assert "/api/v1/health" not in schema["paths"]
     assert "/api/v1/ready" not in schema["paths"]
-    assert "Unversioned operational" in schema["paths"]["/health"]["get"]["summary"]
-    assert "Unversioned operational" in schema["paths"]["/ready"]["get"]["summary"]
+
+
+def test_transition_telemetry_is_bounded_deduplicated_and_initially_meaningful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs: list[tuple[str, dict[str, object]]] = []
+    metrics: list[tuple[str, dict[str, str | bool] | None]] = []
+
+    def capture_log(
+        _logger: object,
+        _level: int,
+        event: str,
+        fields: dict[str, object],
+    ) -> None:
+        logs.append((event, fields))
+
+    def capture_metric(
+        name: str,
+        _value: int = 1,
+        attributes: dict[str, str | bool] | None = None,
+    ) -> None:
+        metrics.append((name, attributes))
+
+    monkeypatch.setattr(health_module, "log_event", capture_log)
+    monkeypatch.setattr(health_module, "add_metric", capture_metric)
+    readiness = ReadinessCoordinator(FakePostgreSQLProbe(), timeout_seconds=0.05)
+    readiness.observe_execution_stream(True)
+
+    async def exercise() -> None:
+        await readiness.start()
+        await readiness.snapshot()
+        await readiness.snapshot()
+
+    asyncio.run(exercise())
+    readiness.observe_execution_stream(True)
+
+    readiness_statuses = [
+        fields["readiness.status"]
+        for event, fields in logs
+        if event == "process.readiness.changed"
+    ]
+    assert readiness_statuses == ["ready"]
+    assert (
+        sum(name == "taskforge.process.readiness.transitions" for name, _ in metrics)
+        == 1
+    )
+    assert all(
+        set(fields) <= {"dependency.name", "dependency.state", "reason.code"}
+        if event == "dependency.state.changed"
+        else set(fields) <= {"readiness.status", "reason.code"}
+        for event, fields in logs
+    )
+
+
+def test_telemetry_failures_do_not_change_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("telemetry sentinel secret")
+
+    monkeypatch.setattr(health_module, "log_event", fail)
+    monkeypatch.setattr(health_module, "add_metric", fail)
+    readiness = ReadinessCoordinator(FakePostgreSQLProbe(), timeout_seconds=0.05)
+    readiness.observe_execution_stream(True)
+
+    assert asyncio.run(readiness.start()).status == "ready"
+    assert asyncio.run(readiness.snapshot()).status == "ready"
+
+
+def test_listener_loss_signals_degradation_but_shutdown_teardown_is_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs: list[tuple[str, dict[str, object]]] = []
+    metrics: list[tuple[str, dict[str, str | bool] | None]] = []
+
+    def capture_log(
+        _logger: object,
+        _level: int,
+        event: str,
+        fields: dict[str, object],
+    ) -> None:
+        logs.append((event, fields))
+
+    def capture_metric(
+        name: str,
+        _value: int = 1,
+        attributes: dict[str, str | bool] | None = None,
+    ) -> None:
+        metrics.append((name, attributes))
+
+    monkeypatch.setattr(health_module, "log_event", capture_log)
+    monkeypatch.setattr(health_module, "add_metric", capture_metric)
+    readiness = ReadinessCoordinator(FakePostgreSQLProbe(), timeout_seconds=0.05)
+    readiness.observe_execution_stream(True)
+    assert asyncio.run(readiness.start()).status == "ready"
+
+    logs.clear()
+    metrics.clear()
+    readiness.observe_execution_stream(False)
+    assert asyncio.run(readiness.snapshot()).status == "degraded"
+    assert logs == [
+        (
+            "dependency.state.changed",
+            {
+                "dependency.name": "execution_stream",
+                "dependency.state": "unavailable",
+                "reason.code": "connection_lost",
+            },
+        ),
+        ("process.readiness.changed", {"readiness.status": "degraded"}),
+    ]
+    assert metrics == [
+        (
+            "taskforge.dependency.state.transitions",
+            {
+                "taskforge.dependency": "execution_stream",
+                "taskforge.dependency.state": "unavailable",
+            },
+        ),
+        (
+            "taskforge.process.readiness.transitions",
+            {"taskforge.readiness.status": "degraded"},
+        ),
+    ]
+
+    readiness.observe_execution_stream(True)
+    logs.clear()
+    metrics.clear()
+    readiness.withdraw()
+    readiness.observe_execution_stream(False)
+    assert logs == [
+        (
+            "process.readiness.changed",
+            {"readiness.status": "not_ready", "reason.code": "stopping"},
+        )
+    ]
+    assert metrics == [
+        (
+            "taskforge.process.readiness.transitions",
+            {"taskforge.readiness.status": "not_ready"},
+        )
+    ]

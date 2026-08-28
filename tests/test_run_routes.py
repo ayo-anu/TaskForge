@@ -460,7 +460,7 @@ def make_app(roles: frozenset[str]) -> tuple[Any, Runtime, RunServiceStub]:
     )
     app = create_app(
         settings,
-        ReadinessCoordinator((AlwaysReady(),), timeout_seconds=0.05),
+        ReadinessCoordinator(AlwaysReady(), timeout_seconds=0.05),
         runtime,
     )
     return app, runtime, runtime.workflow_run_service

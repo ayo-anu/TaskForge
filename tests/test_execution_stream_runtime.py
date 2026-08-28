@@ -500,6 +500,38 @@ def test_initial_listener_failure_rejects_until_reconnect_is_usable() -> None:
     asyncio.run(exercise())
 
 
+def test_listener_availability_callback_is_transition_only_and_failure_isolated() -> (
+    None
+):
+    async def exercise() -> None:
+        listener = Listener()
+        states: list[bool] = []
+
+        def observe(available: bool) -> None:
+            states.append(available)
+            if available:
+                raise RuntimeError("telemetry sentinel secret")
+
+        async def connect() -> Listener:
+            return listener
+
+        runtime = ExecutionStreamRuntime(
+            settings(),
+            Repository({}),
+            serialized,
+            listener_factory=connect,
+            availability_changed=observe,
+        )
+        await runtime.start()
+        assert runtime.listener_ready is True
+        runtime._set_listener_ready(True)
+        await runtime.close()
+        runtime._set_listener_ready(False)
+        assert states == [True, False]
+
+    asyncio.run(exercise())
+
+
 def test_same_run_clients_share_coalesced_duplicate_wakeup_reconciliation() -> None:
     async def exercise() -> None:
         run_id = uuid4()

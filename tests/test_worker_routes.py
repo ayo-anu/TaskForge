@@ -221,7 +221,7 @@ def make_app() -> tuple[Any, str, str, RegistrationServiceStub, AuthenticatedWor
             postgres_password=SecretStr("postgres-test-secret"),
             rabbitmq_password=SecretStr("rabbitmq-test-secret"),
         ),
-        readiness=ReadinessCoordinator((AlwaysReady(),), timeout_seconds=0.05),
+        readiness=ReadinessCoordinator(AlwaysReady(), timeout_seconds=0.05),
         authentication=runtime,
     )
     app.state.test_heartbeat_service = runtime.worker_heartbeat_service

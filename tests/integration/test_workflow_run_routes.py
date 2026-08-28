@@ -106,7 +106,7 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
     )
     app = create_app(
         settings,
-        ReadinessCoordinator((AlwaysReady(),), timeout_seconds=1),
+        ReadinessCoordinator(AlwaysReady(), timeout_seconds=1),
         task_types=registry,
     )
     owner_headers = {

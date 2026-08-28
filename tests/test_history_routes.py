@@ -183,7 +183,7 @@ def _app(role: Role) -> tuple[FastAPI, str, HistoryServiceStub, UUID]:
     )
     app = create_app(
         settings=settings,
-        readiness=ReadinessCoordinator((AlwaysReady(),), timeout_seconds=0.05),
+        readiness=ReadinessCoordinator(AlwaysReady(), timeout_seconds=0.05),
         authentication=runtime,
     )
     encoded = base64.urlsafe_b64encode(secret).rstrip(b"=").decode()

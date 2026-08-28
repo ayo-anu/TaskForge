@@ -110,6 +110,8 @@ def test_instrument_names_types_and_units_are_exact() -> None:
         "taskforge.websocket.disconnections": ("Counter", "{connection}"),
         "taskforge.websocket.backpressure": ("Counter", "{event}"),
         "taskforge.websocket.resume.outcomes": ("Counter", "{connection}"),
+        "taskforge.dependency.state.transitions": ("Counter", "{transition}"),
+        "taskforge.process.readiness.transitions": ("Counter", "{transition}"),
     }
     assert set(task_metrics._instruments) == set(expected)
     for name, (kind, unit) in expected.items():
@@ -190,6 +192,49 @@ def test_globally_valid_attribute_is_dropped_for_the_wrong_instrument(
 
     point = _points(metric_reader, "taskforge.dispatch.created")[0]
     assert dict(point.attributes) == {}
+
+
+def test_health_transition_attributes_are_strictly_bounded_per_instrument(
+    metric_reader: InMemoryMetricReader,
+) -> None:
+    secret = "sentinel-secret-postgresql.example"
+    add(
+        "taskforge.dependency.state.transitions",
+        attributes={
+            "taskforge.dependency": "postgresql",
+            "taskforge.dependency.state": "unavailable",
+            "taskforge.readiness.status": "degraded",
+            "error.type": secret,
+        },
+    )
+    add(
+        "taskforge.process.readiness.transitions",
+        attributes={
+            "taskforge.readiness.status": "ready",
+            "taskforge.dependency": "execution_stream",
+        },
+    )
+    add(
+        "taskforge.dependency.state.transitions",
+        attributes={
+            "taskforge.dependency": secret,
+            "taskforge.dependency.state": "unknown",
+        },
+    )
+
+    dependency_points = _points(metric_reader, "taskforge.dependency.state.transitions")
+    assert {tuple(sorted(point.attributes.items())) for point in dependency_points} == {
+        (
+            ("taskforge.dependency", "postgresql"),
+            ("taskforge.dependency.state", "unavailable"),
+        ),
+        (),
+    }
+    readiness_point = _points(metric_reader, "taskforge.process.readiness.transitions")[
+        0
+    ]
+    assert dict(readiness_point.attributes) == {"taskforge.readiness.status": "ready"}
+    assert secret not in repr(_metrics(metric_reader))
 
 
 def test_pending_outbox_schema_allows_only_boolean_saturation() -> None:

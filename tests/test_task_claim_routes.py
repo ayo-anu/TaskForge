@@ -166,7 +166,7 @@ def make_app(
     return (
         create_app(
             settings=settings,
-            readiness=ReadinessCoordinator((AlwaysReady(),), timeout_seconds=0.05),
+            readiness=ReadinessCoordinator(AlwaysReady(), timeout_seconds=0.05),
             authentication=runtime,
         ),
         api_value,

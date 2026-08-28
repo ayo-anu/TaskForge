@@ -136,14 +136,17 @@ class ExecutionStreamRuntime:
         serializer: Callable[[StoredWorkflowRunExecutionEvent], dict[str, Any]],
         *,
         listener_factory: ListenerFactory | None = None,
+        availability_changed: Callable[[bool], None] | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
         self._serializer = serializer
         self._listener_factory = listener_factory or self._connect_listener
+        self._availability_changed = availability_changed
         self._groups: dict[UUID, _RunGroup] = {}
         self._active_connections = 0
         self._listener_ready = False
+        self._listener_observed = False
         self._stopping = False
         self._listener_task: asyncio.Task[None] | None = None
         self._listener_connection: ListenerConnection | None = None
@@ -277,7 +280,7 @@ class ExecutionStreamRuntime:
         if self._stopping:
             return
         self._stopping = True
-        self._listener_ready = False
+        self._set_listener_ready(False)
         subscriptions = [
             subscription
             for group in self._groups.values()
@@ -334,25 +337,18 @@ class ExecutionStreamRuntime:
                     lambda _connection, signal=terminated: signal.set()
                 )
                 self._listener_connection = connection
-                self._listener_ready = True
+                self._set_listener_ready(True)
                 self._first_attempt_complete.set()
                 delay = INITIAL_RECONNECT_DELAY_SECONDS
-                log_event(logger, logging.INFO, "execution_stream.listener.connected")
                 for run_id in tuple(self._groups):
                     self._mark_dirty(run_id)
                 await terminated.wait()
             except asyncio.CancelledError:
                 raise
-            except Exception as error:
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "execution_stream.listener.unavailable",
-                    {"error.category": "dependency_unavailable"},
-                    error=error,
-                )
+            except Exception:
+                pass
             finally:
-                self._listener_ready = False
+                self._set_listener_ready(False)
                 self._first_attempt_complete.set()
                 if connection is not None:
                     try:
@@ -367,6 +363,18 @@ class ExecutionStreamRuntime:
                     delay * 2,
                     self._settings.execution_stream_listener_reconnect_max_seconds,
                 )
+
+    def _set_listener_ready(self, ready: bool) -> None:
+        if self._listener_observed and self._listener_ready is ready:
+            return
+        self._listener_observed = True
+        self._listener_ready = ready
+        if self._availability_changed is None:
+            return
+        try:
+            self._availability_changed(ready)
+        except Exception:
+            pass
 
     async def _connect_listener(self) -> ListenerConnection:
         return cast(

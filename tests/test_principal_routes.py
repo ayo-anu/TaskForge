@@ -155,7 +155,7 @@ def make_app(
     )
     app = create_app(
         settings=settings,
-        readiness=ReadinessCoordinator((AlwaysReady(),), timeout_seconds=0.05),
+        readiness=ReadinessCoordinator(AlwaysReady(), timeout_seconds=0.05),
         authentication=runtime,
     )
     return app, api_value, worker_value, profile_repository

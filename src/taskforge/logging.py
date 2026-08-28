@@ -63,6 +63,9 @@ _APPROVED_FIELDS: Final = CANONICAL_IDENTIFIER_FIELDS | frozenset(
         "skipped",
         "reached_end",
         "pass_limit_reached",
+        "dependency.name",
+        "dependency.state",
+        "readiness.status",
     }
 )
 _SENSITIVE_FRAGMENTS: Final = (

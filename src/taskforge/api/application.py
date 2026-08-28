@@ -49,31 +49,36 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        resolved_readiness = readiness or build_readiness_coordinator(resolved_settings)
         resolved_task_types = task_types or TaskTypeRegistry(())
-        await resolved_readiness.start()
-        try:
-            resolved_authentication = authentication or build_authentication_runtime(
-                resolved_settings,
-                resolved_task_types,
+        resolved_authentication = authentication or build_authentication_runtime(
+            resolved_settings,
+            resolved_task_types,
+        )
+        if readiness is not None:
+            resolved_readiness = readiness
+        elif isinstance(resolved_authentication, AuthenticationRuntime):
+            resolved_readiness = build_readiness_coordinator(
+                resolved_settings, resolved_authentication.engine
             )
-        except BaseException:
-            await resolved_readiness.close()
-            raise
+        else:
+            raise TypeError("injected authentication requires injected readiness")
         app.state.readiness = resolved_readiness
         app.state.authentication = resolved_authentication
         resolved_execution_stream: ExecutionStreamRuntime | None = None
-        if isinstance(resolved_authentication, AuthenticationRuntime):
-            resolved_execution_stream = ExecutionStreamRuntime(
-                resolved_settings,
-                resolved_authentication.workflow_run_execution_event_repository,
-                serialize_execution_event,
-            )
-            await resolved_execution_stream.start()
-            app.state.execution_stream = resolved_execution_stream
         try:
+            if isinstance(resolved_authentication, AuthenticationRuntime):
+                resolved_execution_stream = ExecutionStreamRuntime(
+                    resolved_settings,
+                    resolved_authentication.workflow_run_execution_event_repository,
+                    serialize_execution_event,
+                    availability_changed=resolved_readiness.observe_execution_stream,
+                )
+                await resolved_execution_stream.start()
+                app.state.execution_stream = resolved_execution_stream
+            await resolved_readiness.start()
             yield
         finally:
+            resolved_readiness.withdraw()
             if resolved_execution_stream is not None:
                 await resolved_execution_stream.close()
             await asyncio.gather(
@@ -113,9 +118,10 @@ def create_app(
     async def ready(request: Request) -> ReadinessResponse | JSONResponse:
         """Report whether every currently required API dependency is usable."""
         coordinator = cast(ReadinessCoordinator, request.app.state.readiness)
-        if await coordinator.is_ready():
-            return ReadinessResponse(ready=True)
-        response = ReadinessResponse(ready=False)
+        snapshot = await coordinator.snapshot()
+        response = ReadinessResponse(ready=snapshot.ready, status=snapshot.status)
+        if snapshot.ready:
+            return response
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content=response.model_dump(),

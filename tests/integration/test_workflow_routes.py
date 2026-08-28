@@ -104,7 +104,7 @@ async def verify_workflow_routes(database_url: URL) -> None:
     )
     app = create_app(
         settings,
-        ReadinessCoordinator((AlwaysReady(),), timeout_seconds=1),
+        ReadinessCoordinator(AlwaysReady(), timeout_seconds=1),
         task_types=registry,
     )
     owner_token = credential_value(owner_credential_id, owner_secret)

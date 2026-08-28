@@ -305,6 +305,12 @@ _INSTRUMENT_ATTRIBUTE_KEYS: Final[dict[str, frozenset[str]]] = {
     "taskforge.websocket.connection.duration": frozenset({"taskforge.disconnect.kind"}),
     "taskforge.websocket.disconnections": frozenset({"taskforge.disconnect.kind"}),
     "taskforge.websocket.resume.outcomes": frozenset({"taskforge.outcome"}),
+    "taskforge.dependency.state.transitions": frozenset(
+        {"taskforge.dependency", "taskforge.dependency.state"}
+    ),
+    "taskforge.process.readiness.transitions": frozenset(
+        {"taskforge.readiness.status"}
+    ),
 }
 
 _ATTRIBUTE_VALUES_BY_INSTRUMENT_KEY: Final[dict[tuple[str, str], frozenset[str]]] = {}
@@ -518,6 +524,25 @@ _allow(
     "cursor_ahead",
     "snapshot_required",
 )
+_allow(
+    "taskforge.dependency.state.transitions",
+    "taskforge.dependency",
+    "postgresql",
+    "execution_stream",
+)
+_allow(
+    "taskforge.dependency.state.transitions",
+    "taskforge.dependency.state",
+    "available",
+    "unavailable",
+)
+_allow(
+    "taskforge.process.readiness.transitions",
+    "taskforge.readiness.status",
+    "ready",
+    "degraded",
+    "not_ready",
+)
 
 
 def _counter(name: str, unit: str) -> metrics.Counter:
@@ -555,6 +580,8 @@ def _build_instruments() -> dict[str, object]:
         "taskforge.websocket.disconnections": "{connection}",
         "taskforge.websocket.backpressure": "{event}",
         "taskforge.websocket.resume.outcomes": "{connection}",
+        "taskforge.dependency.state.transitions": "{transition}",
+        "taskforge.process.readiness.transitions": "{transition}",
     }
     histograms = {
         "taskforge.api.request.duration": "s",
