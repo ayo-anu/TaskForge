@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from opentelemetry.trace import Span
 
 from taskforge.logging import bind_log_context, log_event
+from taskforge.metrics import add as add_metric
+from taskforge.metrics import record as record_metric
 from taskforge.retries.persistence_ports import (
     DueRetryDispatchRepository,
     DueRetryPersistenceInvariantViolation,
@@ -78,6 +81,7 @@ class DueRetryScanner:
         try:
             for _ in range(batch_size):
                 deferred_span = DeferredSpan()
+                prepared_due: PreparedDueRetryDispatch | None = None
                 dispatched_attempt_id: UUID | None = None
                 committed_log_fields: dict[str, object] | None = None
                 committed_route: str | None = None
@@ -91,7 +95,13 @@ class DueRetryScanner:
                         examined += 1
                         if isinstance(prepared, SkippedDueRetryCandidate):
                             skipped += 1
+                            add_metric(
+                                "taskforge.retry.dispatches",
+                                attributes={"taskforge.outcome": "skipped"},
+                            )
                             continue
+
+                        prepared_due = prepared
 
                         active_span = deferred_span.start(
                             "taskforge.retry.dispatch",
@@ -136,8 +146,21 @@ class DueRetryScanner:
                         "scheduler.retry.dispatched",
                         {"broker.route": committed_route, "outcome": "dispatched"},
                     )
+                add_metric(
+                    "taskforge.retry.dispatches",
+                    attributes={"taskforge.outcome": "dispatched"},
+                )
+                assert prepared_due is not None
+                record_metric(
+                    "taskforge.retry.due.age",
+                    (datetime.now(UTC) - prepared_due.next_eligible_at).total_seconds(),
+                )
                 dispatched_attempt_ids.append(dispatched_attempt_id)
         except DueRetryScanInvariantError as error:
+            add_metric(
+                "taskforge.retry.dispatches",
+                attributes={"taskforge.outcome": "invariant_failure"},
+            )
             log_event(
                 logger,
                 logging.ERROR,
@@ -147,6 +170,10 @@ class DueRetryScanner:
             )
             raise
         except DueRetryPersistenceInvariantViolation as error:
+            add_metric(
+                "taskforge.retry.dispatches",
+                attributes={"taskforge.outcome": "invariant_failure"},
+            )
             log_event(
                 logger,
                 logging.ERROR,
@@ -156,6 +183,10 @@ class DueRetryScanner:
             )
             raise DueRetryScanInvariantError from error
         except DueRetryPersistenceUnavailable as error:
+            add_metric(
+                "taskforge.retry.dispatches",
+                attributes={"taskforge.outcome": "persistence_failure"},
+            )
             log_event(
                 logger,
                 logging.WARNING,

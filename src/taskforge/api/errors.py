@@ -18,6 +18,17 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import Response
 
 from taskforge.logging import bind_log_context, log_event
+from taskforge.metrics import (
+    add as add_metric,
+)
+from taskforge.metrics import (
+    normalize_http_method,
+    normalize_http_route,
+    status_class,
+)
+from taskforge.metrics import (
+    record as record_metric,
+)
 from taskforge.tracing import (
     extract_carrier,
     set_attributes,
@@ -86,6 +97,12 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
                     response = await call_next(request)
                 except Exception as error:
                     set_error(server_span, error, "api_unhandled_exception")
+                    _record_request_metrics(
+                        request,
+                        started,
+                        status_code=None,
+                        outcome="unhandled_exception",
+                    )
                     raise
                 route = _route_template(request)
                 update_name(server_span, f"{request.method} {route}")
@@ -111,6 +128,12 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
                         "duration_ms": round((perf_counter() - started) * 1000, 3),
                         "outcome": "completed",
                     },
+                )
+                _record_request_metrics(
+                    request,
+                    started,
+                    status_code=response.status_code,
+                    outcome="completed",
                 )
                 return response
 
@@ -224,7 +247,28 @@ def _request_validation_detail(error: Mapping[str, object]) -> ErrorDetail:
 def _route_template(request: Request) -> str:
     route = request.scope.get("route")
     path = getattr(route, "path", None)
-    return path if isinstance(path, str) else "unmatched"
+    return normalize_http_route(path)
+
+
+def _record_request_metrics(
+    request: Request,
+    started: float,
+    *,
+    status_code: int | None,
+    outcome: Literal["completed", "unhandled_exception"],
+) -> None:
+    if request.scope.get("path") in {"/health", "/ready"}:
+        return
+    attributes = {
+        "http.request.method": normalize_http_method(request.method),
+        "http.route": _route_template(request),
+        "http.response.status_class": status_class(status_code),
+        "taskforge.outcome": outcome,
+    }
+    add_metric("taskforge.api.requests", attributes=attributes)
+    record_metric(
+        "taskforge.api.request.duration", perf_counter() - started, attributes
+    )
 
 
 def _trace_headers(request: Request) -> dict[str, str]:

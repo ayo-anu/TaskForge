@@ -6,6 +6,7 @@ import logging
 from uuid import uuid4
 
 from taskforge.logging import bind_log_context, log_event
+from taskforge.metrics import add as add_metric
 from taskforge.recovery.domain import (
     MAX_RECOVERY_SCAN_BATCH_SIZE,
     ExpiredClaimCandidatePage,
@@ -52,6 +53,18 @@ class RecoveryCandidateScanner:
                 page = await self._repository.scan_expired_claims(
                     limit=limit, cursor=cursor
                 )
+                add_metric(
+                    "taskforge.recovery.scan.candidates",
+                    len(page.items),
+                    {"taskforge.scan.kind": "expired_claim"},
+                )
+                add_metric(
+                    "taskforge.recovery.scan.operations",
+                    attributes={
+                        "taskforge.scan.kind": "expired_claim",
+                        "taskforge.outcome": "completed",
+                    },
+                )
                 log_event(
                     logger,
                     logging.INFO,
@@ -60,6 +73,13 @@ class RecoveryCandidateScanner:
                 )
                 return page
             except RecoveryScanPersistenceInvariantViolation as error:
+                add_metric(
+                    "taskforge.recovery.scan.operations",
+                    attributes={
+                        "taskforge.scan.kind": "expired_claim",
+                        "taskforge.outcome": "invariant_failure",
+                    },
+                )
                 log_event(
                     logger,
                     logging.ERROR,
@@ -69,6 +89,13 @@ class RecoveryCandidateScanner:
                 )
                 raise RecoveryScanInvariantError from error
             except RecoveryScanPersistenceUnavailable as error:
+                add_metric(
+                    "taskforge.recovery.scan.operations",
+                    attributes={
+                        "taskforge.scan.kind": "expired_claim",
+                        "taskforge.outcome": "persistence_failure",
+                    },
+                )
                 log_event(
                     logger,
                     logging.WARNING,
@@ -97,6 +124,18 @@ class RecoveryCandidateScanner:
                     limit=limit,
                     cursor=cursor,
                 )
+                add_metric(
+                    "taskforge.recovery.scan.candidates",
+                    len(page.items),
+                    {"taskforge.scan.kind": "stale_worker_session"},
+                )
+                add_metric(
+                    "taskforge.recovery.scan.operations",
+                    attributes={
+                        "taskforge.scan.kind": "stale_worker_session",
+                        "taskforge.outcome": "completed",
+                    },
+                )
                 log_event(
                     logger,
                     logging.INFO,
@@ -105,6 +144,13 @@ class RecoveryCandidateScanner:
                 )
                 return page
             except RecoveryScanPersistenceInvariantViolation as error:
+                add_metric(
+                    "taskforge.recovery.scan.operations",
+                    attributes={
+                        "taskforge.scan.kind": "stale_worker_session",
+                        "taskforge.outcome": "invariant_failure",
+                    },
+                )
                 log_event(
                     logger,
                     logging.ERROR,
@@ -114,6 +160,13 @@ class RecoveryCandidateScanner:
                 )
                 raise RecoveryScanInvariantError from error
             except RecoveryScanPersistenceUnavailable as error:
+                add_metric(
+                    "taskforge.recovery.scan.operations",
+                    attributes={
+                        "taskforge.scan.kind": "stale_worker_session",
+                        "taskforge.outcome": "persistence_failure",
+                    },
+                )
                 log_event(
                     logger,
                     logging.WARNING,

@@ -20,6 +20,7 @@ from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import TaskClaimResultAuthority
 from taskforge.correlation import is_valid_correlation_id
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.metrics import add as add_metric
 from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.tracing import set_attributes, set_error, span
 from taskforge.worker.result_persistence_ports import (
@@ -116,6 +117,7 @@ class TaskResultSubmissionRequest:
 class TaskResultSubmissionReceipt:
     outcome: TaskResultSubmissionOutcome
     task_attempt_id: UUID
+    dead_letter_created: bool = False
 
 
 class TaskResultSubmissionService:
@@ -146,19 +148,64 @@ class TaskResultSubmissionService:
                 receipt = await self._submit_result(
                     authenticated_worker, worker_session_id, request
                 )
-            except (TaskResultStale, TaskResultConflict, TaskResultInvalidState):
+            except TaskResultStale:
+                add_metric(
+                    "taskforge.task.result_submissions",
+                    attributes={"taskforge.outcome": "stale"},
+                )
+                set_attributes(active_span, {"taskforge.outcome": "rejected"})
+                raise
+            except TaskResultConflict:
+                add_metric(
+                    "taskforge.task.result_submissions",
+                    attributes={"taskforge.outcome": "conflict"},
+                )
                 set_attributes(active_span, {"taskforge.outcome": "rejected"})
                 raise
             except (
                 TaskResultAuthorityRejected,
                 TaskResultInvalidOutput,
+                TaskResultInvalidState,
                 TaskResultNotFound,
             ):
+                add_metric(
+                    "taskforge.task.result_submissions",
+                    attributes={"taskforge.outcome": "rejected"},
+                )
                 set_attributes(active_span, {"taskforge.outcome": "rejected"})
                 raise
             except (TaskResultInvariantError, TaskResultServiceUnavailable) as error:
+                add_metric(
+                    "taskforge.task.result_submissions",
+                    attributes={
+                        "taskforge.outcome": (
+                            "invariant_failure"
+                            if isinstance(error, TaskResultInvariantError)
+                            else "persistence_failure"
+                        )
+                    },
+                )
                 set_error(active_span, error, "result_persistence_failure")
                 raise
+            metric_attributes = {"taskforge.outcome": receipt.outcome.value}
+            if receipt.outcome is TaskResultSubmissionOutcome.ACCEPTED:
+                metric_attributes["taskforge.result.kind"] = request.result.kind.value
+                if request.result.failure_kind is not None:
+                    metric_attributes["taskforge.failure.kind"] = (
+                        request.result.failure_kind.value
+                    )
+            add_metric(
+                "taskforge.task.result_submissions",
+                attributes=metric_attributes,
+            )
+            if (
+                receipt.outcome is TaskResultSubmissionOutcome.ACCEPTED
+                and receipt.dead_letter_created
+            ):
+                add_metric(
+                    "taskforge.dead_letters.created",
+                    attributes={"taskforge.reason": "permanent_failure"},
+                )
             set_attributes(active_span, {"taskforge.outcome": receipt.outcome.value})
             return receipt
 
@@ -220,6 +267,7 @@ class TaskResultSubmissionService:
         return TaskResultSubmissionReceipt(
             TaskResultSubmissionOutcome(persisted.outcome.value),
             persisted.task_attempt_id,
+            persisted.dead_letter_created,
         )
 
     async def _audit_rejection(

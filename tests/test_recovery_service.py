@@ -134,10 +134,11 @@ class FakeRecoveryTransaction:
         self,
         transition: PreparedExpiredClaimRecovery,
         reason: RetryNotScheduledReason,
-    ) -> None:
+    ) -> bool:
         if self.failure is not None:
             raise self.failure
         self.exhausted.append((transition, reason))
+        return True
 
 
 @dataclass(frozen=True)

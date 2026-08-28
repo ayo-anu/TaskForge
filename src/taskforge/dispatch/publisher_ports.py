@@ -71,6 +71,16 @@ class StoredDispatch:
         )
 
 
+@dataclass(frozen=True)
+class OutboxBacklogObservation:
+    """A bounded unpublished count plus an exact indexed oldest timestamp."""
+
+    pending: int
+    saturated: bool
+    oldest_created_at: datetime | None
+    observed_at: datetime
+
+
 @dataclass(frozen=True, repr=False)
 class BrokerDispatchPublication:
     dispatch_id: UUID
@@ -101,6 +111,10 @@ class DispatchOutboxRepository(Protocol):
     async def record_accepted_publication(
         self, expected: StoredDispatch
     ) -> PublicationAcknowledgement: ...
+
+    async def observe_unpublished_backlog(
+        self, *, limit: int
+    ) -> OutboxBacklogObservation: ...
 
 
 class DispatchBrokerPublisher(Protocol):

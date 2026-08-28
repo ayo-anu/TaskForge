@@ -3,6 +3,7 @@
 import uvicorn
 
 from taskforge.logging import configure_logging, uvicorn_log_config
+from taskforge.metrics import configure_metrics
 from taskforge.settings import Settings
 from taskforge.tracing import configure_tracing
 
@@ -27,6 +28,18 @@ def main() -> int:
         environment=settings.environment,
         process_role="api",
     )
+    metric_runtime = configure_metrics(
+        enabled=settings.metrics_enabled,
+        exporter=settings.metrics_exporter,
+        endpoint=settings.metrics_otlp_endpoint,
+        export_interval_seconds=settings.metrics_export_interval_seconds,
+        export_timeout_seconds=settings.metrics_export_timeout_seconds,
+        shutdown_timeout_seconds=settings.metrics_shutdown_timeout_seconds,
+        outbox_staleness_seconds=settings.metrics_outbox_staleness_seconds,
+        service_name=settings.application_name,
+        environment=settings.environment,
+        process_role="api",
+    )
     try:
         uvicorn.run(
             "taskforge.api.application:create_app",
@@ -38,6 +51,7 @@ def main() -> int:
             access_log=False,
         )
     finally:
+        metric_runtime.shutdown()
         tracing.shutdown()
     return 0
 

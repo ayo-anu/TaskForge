@@ -53,6 +53,11 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.tracing_exporter == "none"
     assert settings.tracing_otlp_endpoint is None
     assert settings.tracing_sample_ratio == 0.1
+    assert settings.metrics_enabled is False
+    assert settings.metrics_exporter == "none"
+    assert settings.metrics_otlp_endpoint is None
+    assert settings.metrics_export_interval_seconds == 60.0
+    assert settings.metrics_outbox_staleness_seconds == 120.0
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 8000
     assert settings.readiness_timeout_seconds == 2.0
@@ -106,6 +111,43 @@ def test_tracing_enablement_is_independent_from_export_selection(
     configured = Settings()
     assert configured.tracing_enabled
     assert configured.tracing_exporter == "otlp_http"
+
+
+def test_metrics_enablement_is_independent_from_export_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_METRICS_ENABLED", "true")
+    assert Settings().metrics_exporter == "none"
+
+    monkeypatch.setenv("TASKFORGE_METRICS_EXPORTER", "otlp_http")
+    monkeypatch.setenv(
+        "TASKFORGE_METRICS_OTLP_ENDPOINT", "http://collector:4318/v1/metrics"
+    )
+    configured = Settings()
+    assert configured.metrics_enabled
+    assert configured.metrics_exporter == "otlp_http"
+
+
+@pytest.mark.parametrize(
+    ("enabled", "exporter", "endpoint"),
+    (
+        ("false", "otlp_http", "http://collector:4318/v1/metrics"),
+        ("true", "otlp_http", None),
+        ("true", "none", "http://collector:4318/v1/metrics"),
+    ),
+)
+def test_inconsistent_metrics_configuration_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: str,
+    exporter: str,
+    endpoint: str | None,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_METRICS_ENABLED", enabled)
+    monkeypatch.setenv("TASKFORGE_METRICS_EXPORTER", exporter)
+    if endpoint is not None:
+        monkeypatch.setenv("TASKFORGE_METRICS_OTLP_ENDPOINT", endpoint)
+    with pytest.raises(ValidationError):
+        Settings()
 
 
 @pytest.mark.parametrize(

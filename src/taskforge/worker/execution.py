@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from time import perf_counter
 from typing import Protocol
 from uuid import UUID
 
@@ -27,6 +28,8 @@ from taskforge.dispatch.transport import (
 )
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.logging import bind_log_context, log_event
+from taskforge.metrics import add as add_metric
+from taskforge.metrics import record as record_metric
 from taskforge.tracing import (
     extract_trace_context,
     set_attributes,
@@ -580,6 +583,7 @@ async def _execute_handler_logged(
     context: TaskContext,
     execution_timeout_seconds: int | None,
 ) -> TaskExecutionResult:
+    started = perf_counter()
     with span("taskforge.handler.execute") as active_span:
         log_event(logger, logging.INFO, "worker.handler.started")
         result = await _execute_handler(handler, context, execution_timeout_seconds)
@@ -599,5 +603,14 @@ async def _execute_handler_logged(
             logging.INFO,
             "worker.handler.completed",
             {"outcome": result.kind.value, "reason.code": reason},
+        )
+        attributes = {"taskforge.result.kind": result.kind.value}
+        if result.failure_kind is not None:
+            attributes["taskforge.failure.kind"] = result.failure_kind.value
+        add_metric("taskforge.handler.executions", attributes=attributes)
+        record_metric(
+            "taskforge.handler.duration",
+            perf_counter() - started,
+            attributes,
         )
         return result

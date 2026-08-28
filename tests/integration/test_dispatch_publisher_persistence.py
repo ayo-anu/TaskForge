@@ -68,6 +68,11 @@ async def verify_publisher_persistence(database_url: URL) -> None:
             (item.cursor for item in ordered),
             key=lambda cursor: (cursor.created_at, cursor.dispatch_id),
         )
+        capped = await repository.observe_unpublished_backlog(limit=2)
+        assert capped.pending == 2
+        assert capped.saturated is True
+        assert capped.oldest_created_at == ordered[0].created_at
+        assert capped.observed_at.tzinfo is not None
 
         concurrent = await asyncio.gather(
             repository.record_accepted_publication(ordered[0]),
@@ -84,6 +89,11 @@ async def verify_publisher_persistence(database_url: URL) -> None:
                 )
             )
         assert published_at is not None and published_at.tzinfo is not None
+
+        exact = await repository.observe_unpublished_backlog(limit=10)
+        assert exact.pending == 3
+        assert exact.saturated is False
+        assert exact.oldest_created_at == ordered[1].created_at
 
         restarted = SQLAlchemyDispatchOutboxRepository(sessions)
         remaining = await restarted.list_unpublished_page(after=None, limit=10)

@@ -35,6 +35,7 @@ from taskforge.identity.credentials import (
     PresentedCredential,
     parse_presented_credential,
 )
+from taskforge.metrics import add as add_metric
 from taskforge.runs.domain import (
     StoredWorkflowRunExecutionEvent,
     WorkflowRunExecutionEventResumeState,
@@ -145,6 +146,7 @@ async def workflow_run_execution_stream(
         WorkflowRunNotFound,
         _InvalidRunIdentifier,
     ):
+        _record_connection_attempt("policy_rejected")
         await websocket.close(
             code=status.WS_1008_POLICY_VIOLATION,
             reason=POLICY_REJECTION_REASON,
@@ -156,6 +158,7 @@ async def workflow_run_execution_stream(
         WorkflowRunInspectionInvariantError,
         WorkflowRunServiceUnavailable,
     ):
+        _record_connection_attempt("service_unavailable")
         await websocket.close(
             code=status.WS_1011_INTERNAL_ERROR,
             reason=SERVICE_REJECTION_REASON,
@@ -165,6 +168,7 @@ async def workflow_run_execution_stream(
     try:
         requested_cursor = _parse_cursor(cursor)
     except _InvalidCursorSyntax:
+        _record_resume_rejection("invalid_cursor")
         await websocket.accept()
         await _send_then_close(
             websocket,
@@ -181,6 +185,7 @@ async def workflow_run_execution_stream(
         )
         last_delivered_cursor = _resume_position(resume_state)
     except _CursorAhead:
+        _record_resume_rejection("cursor_ahead")
         await websocket.accept()
         await _send_then_close(
             websocket,
@@ -189,6 +194,7 @@ async def workflow_run_execution_stream(
         )
         return
     except _CursorExpired as error:
+        _record_resume_rejection("snapshot_required")
         await websocket.accept()
         await _send_then_close(
             websocket,
@@ -204,6 +210,7 @@ async def workflow_run_execution_stream(
         WorkflowRunExecutionEventInvariantViolation,
         WorkflowRunExecutionEventPersistenceUnavailable,
     ):
+        _record_connection_attempt("service_unavailable")
         await websocket.close(
             code=status.WS_1011_INTERNAL_ERROR,
             reason=SERVICE_REJECTION_REASON,
@@ -219,6 +226,7 @@ async def workflow_run_execution_stream(
             expiry_deadline is not None
             and expiry_deadline <= asyncio.get_running_loop().time()
         ):
+            _record_connection_attempt("policy_rejected")
             await websocket.close(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason=POLICY_REJECTION_REASON,
@@ -232,12 +240,14 @@ async def workflow_run_execution_stream(
                 expiry_deadline,
             )
         except ExecutionStreamUnavailable:
+            _record_connection_attempt("service_unavailable")
             await websocket.close(
                 code=status.WS_1011_INTERNAL_ERROR,
                 reason=SERVICE_REJECTION_REASON,
             )
             return
         except ExecutionStreamCapacityExceeded:
+            _record_connection_attempt("capacity_rejected")
             await websocket.close(
                 code=status.WS_1013_TRY_AGAIN_LATER,
                 reason="stream capacity unavailable",
@@ -247,12 +257,17 @@ async def workflow_run_execution_stream(
             await websocket.accept()
         except (RuntimeError, WebSocketDisconnect):
             await live_runtime.abort_subscription(subscription)
+            _record_connection_attempt("service_unavailable")
             return
+        _record_resume_success(requested_cursor)
+        _record_connection_attempt("accepted")
         await live_runtime.serve(subscription)
         return
 
     # Injectable focused route tests may omit the process-level live runtime.
     await websocket.accept()
+    _record_resume_success(requested_cursor)
+    _record_connection_attempt("accepted")
     if requested_cursor is not None:
         try:
             await _replay_events(websocket, runtime, run_id, last_delivered_cursor)
@@ -290,6 +305,32 @@ def _parse_cursor(value: str | None) -> int | None:
     if parsed > MAX_POSTGRESQL_BIGINT:
         raise _InvalidCursorSyntax
     return parsed
+
+
+def _record_connection_attempt(outcome: str) -> None:
+    add_metric(
+        "taskforge.websocket.connection.attempts",
+        attributes={"taskforge.outcome": outcome},
+    )
+
+
+def _record_resume_rejection(outcome: str) -> None:
+    _record_connection_attempt("resume_rejected")
+    add_metric(
+        "taskforge.websocket.resume.outcomes",
+        attributes={"taskforge.outcome": outcome},
+    )
+
+
+def _record_resume_success(requested_cursor: int | None) -> None:
+    add_metric(
+        "taskforge.websocket.resume.outcomes",
+        attributes={
+            "taskforge.outcome": (
+                "not_requested" if requested_cursor is None else "resumed"
+            )
+        },
+    )
 
 
 def _resume_position(state: WorkflowRunExecutionEventResumeState) -> int:

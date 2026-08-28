@@ -14,6 +14,7 @@ from taskforge.audit.domain import (
     bounded_string_set,
 )
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.metrics import add as add_metric
 from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.worker.domain import (
     InspectedWorkerHeartbeatPage,
@@ -243,6 +244,59 @@ class WorkerHeartbeatService:
         self._rejected_audit = rejected_audit
 
     async def heartbeat(
+        self,
+        authenticated_worker: AuthenticatedWorker,
+        worker_session_id: UUID,
+        *,
+        sequence: int,
+        accepting_work: bool,
+        correlation_id: UUID | None = None,
+    ) -> WorkerHealthProjection:
+        try:
+            projection = await self._heartbeat(
+                authenticated_worker,
+                worker_session_id,
+                sequence=sequence,
+                accepting_work=accepting_work,
+                correlation_id=correlation_id,
+            )
+        except (
+            WorkerHeartbeatRejected,
+            WorkerSessionUnavailable,
+            WorkerSessionInactive,
+            StaleWorkerHeartbeat,
+            WorkerHeartbeatGap,
+            ConflictingWorkerHeartbeatReplay,
+        ) as error:
+            reason = {
+                WorkerHeartbeatRejected: "worker_authority_rejected",
+                WorkerSessionUnavailable: "worker_session_unavailable",
+                WorkerSessionInactive: "worker_session_inactive",
+                StaleWorkerHeartbeat: "stale_heartbeat",
+                WorkerHeartbeatGap: "heartbeat_sequence_gap",
+                ConflictingWorkerHeartbeatReplay: "heartbeat_replay_conflict",
+            }[type(error)]
+            add_metric(
+                "taskforge.worker.heartbeats",
+                attributes={
+                    "taskforge.outcome": "rejected",
+                    "taskforge.rejection.reason": reason,
+                },
+            )
+            raise
+        except WorkerHeartbeatServiceUnavailable:
+            add_metric(
+                "taskforge.worker.heartbeats",
+                attributes={"taskforge.outcome": "persistence_failure"},
+            )
+            raise
+        add_metric(
+            "taskforge.worker.heartbeats",
+            attributes={"taskforge.outcome": "accepted"},
+        )
+        return projection
+
+    async def _heartbeat(
         self,
         authenticated_worker: AuthenticatedWorker,
         worker_session_id: UUID,

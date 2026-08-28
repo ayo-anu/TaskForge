@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from enum import StrEnum
 
+from taskforge.metrics import add as add_metric
 from taskforge.worker.consumer_ports import (
     DispatchConsumer,
     DispatchDeliveryControl,
@@ -163,10 +164,12 @@ class WorkerDispatchRuntime:
             ):
                 raise WorkerDispatchRuntimeInvariantError
             self._in_flight += 1
+            add_metric("taskforge.worker.running.deliveries", 1)
         try:
             await self._handler(control)
         finally:
             async with self._drained:
                 self._in_flight -= 1
+                add_metric("taskforge.worker.running.deliveries", -1)
                 if self._in_flight == 0:
                     self._drained.notify_all()

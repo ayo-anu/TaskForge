@@ -28,6 +28,7 @@ from starlette.types import Receive, Scope, Send
 
 from taskforge.api.errors import RequestIDMiddleware
 from taskforge.logging import TaskforgeJSONFormatter, log_event
+from taskforge.metrics import register_http_routes
 from taskforge.tracing import (
     DeferredSpan,
     configure_tracing,
@@ -217,6 +218,7 @@ def test_api_server_span_uses_w3c_parent_without_duplicate_asgi_spans(
     spans: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
     _, exporter = spans
+    register_http_routes({"/items/{item_id}"})
     with span("upstream") as upstream:
         assert upstream is not None
         upstream_context = upstream.get_span_context()

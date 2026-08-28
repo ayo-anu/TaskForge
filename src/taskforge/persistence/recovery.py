@@ -35,6 +35,7 @@ from taskforge.audit.domain import AuditActor, AuditActorKind, AuditOutcome, Aud
 from taskforge.dead_letters.domain import DeadLetterReason
 from taskforge.persistence.audit import append_audit_record
 from taskforge.persistence.dead_letters import (
+    DeadLetterInsertOutcome,
     DeadLetterPersistenceInvariantViolation,
     ensure_dead_letter,
 )
@@ -623,7 +624,7 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
         self,
         prepared: PreparedExpiredClaimRecovery,
         reason: RetryNotScheduledReason,
-    ) -> None:
+    ) -> bool:
         await self._persist_orphan_outcome(prepared)
         session = self._required_session()
         try:
@@ -665,7 +666,7 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
                     decision_reason=reason.value,
                 )
             )
-            await ensure_dead_letter(
+            dead_letter_outcome = await ensure_dead_letter(
                 session,
                 item_id=uuid4(),
                 task_run_id=prepared.task_run_id,
@@ -678,6 +679,7 @@ class SQLAlchemyExpiredClaimRecoveryTransaction:
             raise ExpiredClaimRecoveryPersistenceInvariantViolation from error
         except DBAPIError as error:
             raise ExpiredClaimRecoveryPersistenceUnavailable from error
+        return dead_letter_outcome is DeadLetterInsertOutcome.CREATED
 
     async def settle_cancellation(
         self,

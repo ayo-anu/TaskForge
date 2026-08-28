@@ -344,6 +344,7 @@ async def exercise_retry_transitions(database_url: URL) -> None:
         no_policy = await add_retry_pending_task(setup)
         no_policy_result = await service.transition_retry(no_policy.task_run_id)
         assert no_policy_result.outcome is RetryTransitionOutcome.FAILED_NO_POLICY
+        assert no_policy_result.dead_letter_created is True
         assert (
             await setup.fetchval(
                 "SELECT status::text FROM task_runs WHERE id = $1",
@@ -374,6 +375,7 @@ async def exercise_retry_transitions(database_url: URL) -> None:
         )
         exhausted_result = await service.transition_retry(exhausted.task_run_id)
         assert exhausted_result.outcome is RetryTransitionOutcome.FAILED_EXHAUSTED
+        assert exhausted_result.dead_letter_created is True
         assert (
             await service.transition_retry(exhausted.task_run_id)
         ).outcome is RetryTransitionOutcome.NOT_ELIGIBLE

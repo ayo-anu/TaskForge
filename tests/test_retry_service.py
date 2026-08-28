@@ -104,10 +104,11 @@ class FakeTransaction:
         self,
         transition: PreparedRetryTransition,
         reason: RetryNotScheduledReason,
-    ) -> None:
+    ) -> bool:
         if self.failure is not None:
             raise self.failure
         self.failed.append((transition, reason))
+        return True
 
 
 @dataclass(frozen=True)
@@ -170,6 +171,7 @@ def test_no_policy_fails_without_creating_attempt() -> None:
     receipt = run(transaction)
 
     assert receipt.outcome is RetryTransitionOutcome.FAILED_NO_POLICY
+    assert receipt.dead_letter_created is True
     assert transaction.failed == [(transition, RetryNotScheduledReason.NO_POLICY)]
     assert transaction.scheduled == []
 
@@ -183,6 +185,7 @@ def test_exhausted_policy_fails_without_creating_attempt() -> None:
     receipt = run(transaction)
 
     assert receipt.outcome is RetryTransitionOutcome.FAILED_EXHAUSTED
+    assert receipt.dead_letter_created is True
     assert transaction.failed == [(transition, RetryNotScheduledReason.EXHAUSTED)]
     assert transaction.scheduled == []
 

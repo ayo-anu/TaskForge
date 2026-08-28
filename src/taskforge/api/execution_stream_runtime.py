@@ -8,6 +8,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from time import monotonic
 from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
 
@@ -15,6 +16,8 @@ import asyncpg
 from fastapi import WebSocket, WebSocketDisconnect, status
 
 from taskforge.logging import bind_log_context, log_event
+from taskforge.metrics import add as add_metric
+from taskforge.metrics import record as record_metric
 from taskforge.runs.domain import StoredWorkflowRunExecutionEvent
 from taskforge.runs.persistence_ports import (
     WorkflowRunExecutionEventInvariantViolation,
@@ -109,6 +112,7 @@ class ExecutionStreamSubscription:
     expiry_deadline: float | None
     observed_generation: int
     termination: asyncio.Future[TerminationDirective]
+    opened_at_monotonic: float
     state: SubscriptionState = SubscriptionState.CATCHING_UP
     supervisor_task: asyncio.Task[None] | None = None
     cleanup_complete: bool = False
@@ -184,15 +188,17 @@ class ExecutionStreamRuntime:
             expiry_deadline=expiry_deadline,
             observed_generation=group.generation,
             termination=loop.create_future(),
+            opened_at_monotonic=monotonic(),
         )
         group.subscriptions[subscription.id] = subscription
         self._active_connections += 1
+        add_metric("taskforge.websocket.connections.active", 1)
         return subscription
 
     async def abort_subscription(
         self, subscription: ExecutionStreamSubscription
     ) -> None:
-        self._finalize_subscription(subscription)
+        self._finalize_subscription(subscription, "handshake_abort")
 
     async def serve(self, subscription: ExecutionStreamSubscription) -> None:
         """Supervise catch-up, sending, receiving, expiry, and final cleanup."""
@@ -253,7 +259,12 @@ class ExecutionStreamRuntime:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._discard_queue(subscription)
-            self._finalize_subscription(subscription)
+            disconnect_kind = (
+                "client"
+                if client_disconnected or directive is None
+                else directive.kind.value
+            )
+            self._finalize_subscription(subscription, disconnect_kind)
             if directive is not None and not client_disconnected:
                 try:
                     await subscription.websocket.close(
@@ -564,8 +575,12 @@ class ExecutionStreamRuntime:
         subscription.state = SubscriptionState.TERMINATING
         if not subscription.termination.done():
             subscription.termination.set_result(directive)
+            if directive.kind is TerminationKind.SLOW_CONSUMER:
+                add_metric("taskforge.websocket.backpressure")
 
-    def _finalize_subscription(self, subscription: ExecutionStreamSubscription) -> None:
+    def _finalize_subscription(
+        self, subscription: ExecutionStreamSubscription, disconnect_kind: str
+    ) -> None:
         if subscription.cleanup_complete:
             return
         subscription.cleanup_complete = True
@@ -578,6 +593,14 @@ class ExecutionStreamRuntime:
                     group.reconcile_task.cancel()
                 self._groups.pop(subscription.workflow_run_id, None)
         self._active_connections -= 1
+        add_metric("taskforge.websocket.connections.active", -1)
+        attributes = {"taskforge.disconnect.kind": disconnect_kind}
+        add_metric("taskforge.websocket.disconnections", attributes=attributes)
+        record_metric(
+            "taskforge.websocket.connection.duration",
+            monotonic() - subscription.opened_at_monotonic,
+            attributes,
+        )
 
     @staticmethod
     def _discard_queue(subscription: ExecutionStreamSubscription) -> None:

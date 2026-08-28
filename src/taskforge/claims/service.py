@@ -44,6 +44,7 @@ from taskforge.claims.persistence_ports import (
 from taskforge.dispatch.envelope import DispatchEnvelope
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.authorization import OwnerFilter
+from taskforge.metrics import add as add_metric
 from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.tracing import set_attributes, set_error, span
 
@@ -110,6 +111,13 @@ class TaskClaimService:
                     authenticated_worker, worker_session_id, dispatch
                 )
             except TaskClaimRejected as error:
+                add_metric(
+                    "taskforge.worker.claims",
+                    attributes={
+                        "taskforge.outcome": "rejected",
+                        "taskforge.rejection.reason": error.reason.value,
+                    },
+                )
                 set_attributes(
                     active_span,
                     {
@@ -122,8 +130,16 @@ class TaskClaimService:
                 TaskClaimServiceInvariantError,
                 TaskClaimServiceUnavailable,
             ) as error:
+                add_metric(
+                    "taskforge.worker.claims",
+                    attributes={"taskforge.outcome": "infrastructure_failure"},
+                )
                 set_error(active_span, error, "claim_persistence_failure")
                 raise
+            add_metric(
+                "taskforge.worker.claims",
+                attributes={"taskforge.outcome": result.outcome.value},
+            )
             set_attributes(active_span, {"taskforge.outcome": result.outcome.value})
             return result
 

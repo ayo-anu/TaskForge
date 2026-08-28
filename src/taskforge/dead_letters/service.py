@@ -32,6 +32,7 @@ from taskforge.dead_letters.persistence_ports import (
     DeadLetterTransitionConflict,
 )
 from taskforge.identity.authorization import OwnerFilter
+from taskforge.metrics import add as add_metric
 from taskforge.persistence.audit import RejectedAuditRecorder
 
 
@@ -102,14 +103,30 @@ class DeadLetterService:
         reason: str | None,
         correlation_id: UUID,
     ) -> DeadLetterDetail:
-        return await self._transition(
-            item_id,
-            owner_filter,
-            operator_principal_id=operator_principal_id,
-            target_status=DeadLetterStatus.ACKNOWLEDGED,
-            reason=reason,
-            correlation_id=correlation_id,
+        try:
+            result = await self._transition(
+                item_id,
+                owner_filter,
+                operator_principal_id=operator_principal_id,
+                target_status=DeadLetterStatus.ACKNOWLEDGED,
+                reason=reason,
+                correlation_id=correlation_id,
+            )
+        except (
+            DeadLetterNotFound,
+            DeadLetterTransitionConflict,
+            DeadLetterPersistenceUnavailable,
+        ) as error:
+            self._record_operation_failure("acknowledge", error)
+            raise
+        add_metric(
+            "taskforge.dead_letters.operations",
+            attributes={
+                "taskforge.operation": "acknowledge",
+                "taskforge.outcome": "completed",
+            },
         )
+        return result
 
     async def resolve(
         self,
@@ -120,14 +137,30 @@ class DeadLetterService:
         reason: str,
         correlation_id: UUID,
     ) -> DeadLetterDetail:
-        return await self._transition(
-            item_id,
-            owner_filter,
-            operator_principal_id=operator_principal_id,
-            target_status=DeadLetterStatus.RESOLVED,
-            reason=reason,
-            correlation_id=correlation_id,
+        try:
+            result = await self._transition(
+                item_id,
+                owner_filter,
+                operator_principal_id=operator_principal_id,
+                target_status=DeadLetterStatus.RESOLVED,
+                reason=reason,
+                correlation_id=correlation_id,
+            )
+        except (
+            DeadLetterNotFound,
+            DeadLetterTransitionConflict,
+            DeadLetterPersistenceUnavailable,
+        ) as error:
+            self._record_operation_failure("resolve", error)
+            raise
+        add_metric(
+            "taskforge.dead_letters.operations",
+            attributes={
+                "taskforge.operation": "resolve",
+                "taskforge.outcome": "completed",
+            },
         )
+        return result
 
     async def redrive(
         self,
@@ -168,6 +201,7 @@ class DeadLetterService:
                 action="dead_letter.redrive",
                 correlation_id=correlation_id,
             )
+            self._record_operation_failure("redrive", error)
             raise
         if result is None:
             await self._audit_rejection(
@@ -177,8 +211,37 @@ class DeadLetterService:
                 action="dead_letter.redrive",
                 correlation_id=correlation_id,
             )
+            self._record_operation_failure("redrive", DeadLetterNotFound())
             raise DeadLetterNotFound
+        add_metric(
+            "taskforge.dead_letters.operations",
+            attributes={
+                "taskforge.operation": "redrive",
+                "taskforge.outcome": "completed",
+            },
+        )
         return result
+
+    @staticmethod
+    def _record_operation_failure(operation: str, error: Exception) -> None:
+        outcome = {
+            DeadLetterNotFound: "not_found",
+            DeadLetterRedriveNotEligible: "not_eligible",
+            DeadLetterRedriveLimitExceeded: "limit_exceeded",
+            DeadLetterTransitionConflict: "conflict",
+            DeadLetterRedriveIdempotencyConflict: "conflict",
+            InvalidDeadLetterRedriveIdempotencyKey: "conflict",
+            DeadLetterPersistenceUnavailable: "persistence_failure",
+        }.get(type(error))
+        if outcome is None:
+            return
+        add_metric(
+            "taskforge.dead_letters.operations",
+            attributes={
+                "taskforge.operation": operation,
+                "taskforge.outcome": outcome,
+            },
+        )
 
     async def _transition(
         self,

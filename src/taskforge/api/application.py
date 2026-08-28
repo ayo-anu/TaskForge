@@ -9,6 +9,7 @@ from typing import cast
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
 from taskforge.api.authentication import (
     AuthenticationRuntime,
@@ -32,6 +33,7 @@ from taskforge.api.principals import router as principals_router
 from taskforge.api.runs import router as runs_router
 from taskforge.api.workers import router as workers_router
 from taskforge.api.workflows import router as workflows_router
+from taskforge.metrics import register_http_routes
 from taskforge.settings import Settings
 from taskforge.workflows.task_types import TaskTypeRegistry
 
@@ -118,5 +120,9 @@ def create_app(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content=response.model_dump(),
         )
+
+    register_http_routes(
+        route.path for route in app.routes if isinstance(route, APIRoute)
+    )
 
     return app

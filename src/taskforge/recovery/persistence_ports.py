@@ -89,7 +89,7 @@ class ExpiredClaimRecoveryTransaction(Protocol):
         self,
         prepared: PreparedExpiredClaimRecovery,
         reason: RetryNotScheduledReason,
-    ) -> None: ...
+    ) -> bool: ...
 
     async def settle_cancellation(
         self,

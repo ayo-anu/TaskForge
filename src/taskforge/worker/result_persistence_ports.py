@@ -64,6 +64,7 @@ class PersistableTaskResult:
 class PersistedTaskResult:
     outcome: PersistedTaskResultOutcome
     task_attempt_id: UUID
+    dead_letter_created: bool = False
 
 
 class TaskResultRepository(Protocol):

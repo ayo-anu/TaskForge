@@ -5,8 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from time import perf_counter
 from uuid import UUID, uuid4
 
+from taskforge.metrics import add as add_metric
+from taskforge.metrics import record as record_metric
 from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
     PreparedCancellationSettlement,
@@ -67,6 +70,7 @@ class ExpiredClaimRecoveryReceipt:
     scheduled_attempt_id: UUID | None = None
     scheduled_attempt_number: int | None = None
     next_eligible_at: datetime | None = None
+    dead_letter_created: bool = False
 
 
 class ExpiredClaimRecoveryService:
@@ -76,6 +80,7 @@ class ExpiredClaimRecoveryService:
     async def recover_expired_claim(
         self, candidate: ExpiredClaimCandidate
     ) -> ExpiredClaimRecoveryReceipt:
+        started = perf_counter()
         with span(
             "taskforge.recovery.expired_claim",
             attributes={
@@ -89,8 +94,36 @@ class ExpiredClaimRecoveryService:
                 ExpiredClaimRecoveryInvariantError,
                 ExpiredClaimRecoveryServiceUnavailable,
             ) as error:
+                outcome = (
+                    "invariant_failure"
+                    if isinstance(error, ExpiredClaimRecoveryInvariantError)
+                    else "persistence_failure"
+                )
+                attributes = {
+                    "taskforge.recovery.kind": "expired_claim",
+                    "taskforge.outcome": outcome,
+                }
+                add_metric("taskforge.recovery.operations", attributes=attributes)
+                record_metric(
+                    "taskforge.recovery.duration",
+                    perf_counter() - started,
+                    attributes,
+                )
                 set_error(active_span, error, "expired_claim_recovery_failure")
                 raise
+            attributes = {
+                "taskforge.recovery.kind": "expired_claim",
+                "taskforge.outcome": receipt.outcome.value,
+            }
+            add_metric("taskforge.recovery.operations", attributes=attributes)
+            record_metric(
+                "taskforge.recovery.duration", perf_counter() - started, attributes
+            )
+            if receipt.dead_letter_created:
+                add_metric(
+                    "taskforge.dead_letters.created",
+                    attributes={"taskforge.reason": "retry_exhausted"},
+                )
             set_attributes(active_span, {"taskforge.outcome": receipt.outcome.value})
             return receipt
 
@@ -166,7 +199,7 @@ class ExpiredClaimRecoveryService:
             if decision.kind is RetryDecisionKind.NO_POLICY
             else RetryNotScheduledReason.EXHAUSTED
         )
-        await transaction.exhaust(prepared, reason)
+        dead_letter_created = (await transaction.exhaust(prepared, reason)) is True
         outcome = (
             ExpiredClaimRecoveryOutcome.FAILED_NO_POLICY
             if decision.kind is RetryDecisionKind.NO_POLICY
@@ -177,6 +210,7 @@ class ExpiredClaimRecoveryService:
             prepared.task_attempt_id,
             prepared.task_run_id,
             prepared.recovered_at,
+            dead_letter_created=dead_letter_created,
         )
 
 
@@ -211,6 +245,7 @@ class StaleWorkerSessionRecoveryService:
         *,
         stale_after_seconds: int,
     ) -> StaleWorkerSessionRecoveryReceipt:
+        started = perf_counter()
         with span(
             "taskforge.recovery.stale_session",
             attributes={
@@ -226,8 +261,31 @@ class StaleWorkerSessionRecoveryService:
                 StaleWorkerSessionRecoveryInvariantError,
                 StaleWorkerSessionRecoveryServiceUnavailable,
             ) as error:
+                outcome = (
+                    "invariant_failure"
+                    if isinstance(error, StaleWorkerSessionRecoveryInvariantError)
+                    else "persistence_failure"
+                )
+                attributes = {
+                    "taskforge.recovery.kind": "stale_worker_session",
+                    "taskforge.outcome": outcome,
+                }
+                add_metric("taskforge.recovery.operations", attributes=attributes)
+                record_metric(
+                    "taskforge.recovery.duration",
+                    perf_counter() - started,
+                    attributes,
+                )
                 set_error(active_span, error, "stale_session_recovery_failure")
                 raise
+            attributes = {
+                "taskforge.recovery.kind": "stale_worker_session",
+                "taskforge.outcome": receipt.outcome.value,
+            }
+            add_metric("taskforge.recovery.operations", attributes=attributes)
+            record_metric(
+                "taskforge.recovery.duration", perf_counter() - started, attributes
+            )
             set_attributes(active_span, {"taskforge.outcome": receipt.outcome.value})
             return receipt
 

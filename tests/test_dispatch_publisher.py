@@ -24,6 +24,7 @@ from taskforge.dispatch.publisher import TaskDispatchPublisher
 from taskforge.dispatch.publisher_ports import (
     BrokerDispatchPublication,
     BrokerPublicationTimeout,
+    OutboxBacklogObservation,
     PublicationAcknowledgement,
     StoredDispatch,
     UnpublishedDispatchCursor,
@@ -58,6 +59,17 @@ class FakeRepository:
     ) -> PublicationAcknowledgement:
         self.acknowledged.append(expected.dispatch_id)
         return self.acknowledgement
+
+    async def observe_unpublished_backlog(
+        self, *, limit: int
+    ) -> OutboxBacklogObservation:
+        pending = min(len(self.records), limit)
+        return OutboxBacklogObservation(
+            pending,
+            len(self.records) > limit,
+            self.records[0].created_at if self.records else None,
+            datetime.now(UTC),
+        )
 
 
 @dataclass
@@ -118,6 +130,50 @@ def test_empty_pass_is_bounded_and_stateless_across_calls() -> None:
     assert first.reached_end
     assert repository.calls == [(None, 4), (None, 4)]
     assert broker.publications == []
+
+
+def test_publication_metrics_have_one_physical_and_one_recording_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str] | None]] = []
+
+    def capture(
+        name: str,
+        value: int = 1,
+        attributes: dict[str, str] | None = None,
+    ) -> None:
+        assert value == 1
+        calls.append((name, attributes))
+
+    monkeypatch.setattr("taskforge.dispatch.publisher.add_metric", capture)
+    valid = stored_dispatch(1)
+    invalid = stored_dispatch(2, mutate=remove_schema_version)
+    result = asyncio.run(
+        TaskDispatchPublisher(
+            FakeRepository((valid, invalid)), FakeBroker()
+        ).reconcile_unpublished(page_size=2, pass_limit=2)
+    )
+
+    assert result.acknowledged == result.durable_invalid == 1
+    assert (
+        calls.count(
+            (
+                "taskforge.dispatch.publications",
+                {"taskforge.outcome": "accepted"},
+            )
+        )
+        == 1
+    )
+    assert (
+        calls.count(
+            (
+                "taskforge.dispatch.publication_records",
+                {"taskforge.outcome": "recorded"},
+            )
+        )
+        == 1
+    )
+    assert calls.count(("taskforge.dispatch.outbox.invalid", None)) == 1
 
 
 def test_publish_uses_fixed_name_and_links_validated_creation_context() -> None:

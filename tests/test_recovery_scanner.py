@@ -156,6 +156,71 @@ def test_persistence_errors_are_translated(
         asyncio.run(scanner.scan_stale_worker_sessions(limit=1))
 
 
+def test_scan_metrics_separate_candidate_counts_and_operation_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int, dict[str, str] | None]] = []
+
+    def capture(
+        name: str,
+        value: int = 1,
+        attributes: dict[str, str] | None = None,
+    ) -> None:
+        calls.append((name, value, attributes))
+
+    monkeypatch.setattr("taskforge.recovery.scanner.add_metric", capture)
+    page = ExpiredClaimCandidatePage((expired_candidate(),), NOW, None)
+    scanner = RecoveryCandidateScanner(
+        FakeRecoveryRepository(page, repository().stale_result),
+        worker_stale_after_seconds=30,
+    )
+    asyncio.run(scanner.scan_expired_claims(limit=1))
+    assert calls == [
+        (
+            "taskforge.recovery.scan.candidates",
+            1,
+            {"taskforge.scan.kind": "expired_claim"},
+        ),
+        (
+            "taskforge.recovery.scan.operations",
+            1,
+            {
+                "taskforge.scan.kind": "expired_claim",
+                "taskforge.outcome": "completed",
+            },
+        ),
+    ]
+
+    for failure, outcome, expected in (
+        (
+            RecoveryScanPersistenceInvariantViolation(),
+            "invariant_failure",
+            RecoveryScanInvariantError,
+        ),
+        (
+            RecoveryScanPersistenceUnavailable(),
+            "persistence_failure",
+            RecoveryScanServiceUnavailable,
+        ),
+    ):
+        calls.clear()
+        scanner = RecoveryCandidateScanner(
+            FakeRecoveryRepository(failure, failure), worker_stale_after_seconds=30
+        )
+        with pytest.raises(expected):
+            asyncio.run(scanner.scan_expired_claims(limit=1))
+        assert calls == [
+            (
+                "taskforge.recovery.scan.operations",
+                1,
+                {
+                    "taskforge.scan.kind": "expired_claim",
+                    "taskforge.outcome": outcome,
+                },
+            )
+        ]
+
+
 def test_queries_are_bounded_ordered_database_timed_and_lock_free() -> None:
     claim_sql = str(
         _expired_claim_statement(7, None).compile(

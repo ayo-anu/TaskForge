@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 Environment = Literal["development", "test", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 TracingExporter = Literal["none", "otlp_http"]
+MetricsExporter = Literal["none", "otlp_http"]
 DEVELOPMENT_CLAIM_RESULT_AUTHORITY_SECRET = (
     "taskforge-development-claim-result-authority-secret"
 )
@@ -35,6 +36,13 @@ class Settings(BaseSettings):
     tracing_sample_ratio: float = Field(default=0.1, ge=0, le=1)
     tracing_export_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     tracing_shutdown_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    metrics_enabled: bool = False
+    metrics_exporter: MetricsExporter = "none"
+    metrics_otlp_endpoint: str | None = None
+    metrics_export_interval_seconds: float = Field(default=60.0, ge=5, le=300)
+    metrics_export_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    metrics_shutdown_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    metrics_outbox_staleness_seconds: float = Field(default=120.0, ge=10, le=600)
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
@@ -144,6 +152,18 @@ class Settings(BaseSettings):
                 raise ValueError("OTLP/HTTP tracing requires an HTTP(S) endpoint")
         elif self.tracing_otlp_endpoint is not None:
             raise ValueError("a tracing endpoint requires the OTLP/HTTP exporter")
+        return self
+
+    @model_validator(mode="after")
+    def validate_metrics_configuration(self) -> Settings:
+        if not self.metrics_enabled and self.metrics_exporter != "none":
+            raise ValueError("a metrics exporter requires metrics to be enabled")
+        if self.metrics_exporter == "otlp_http":
+            endpoint = self.metrics_otlp_endpoint
+            if endpoint is None or not endpoint.startswith(("http://", "https://")):
+                raise ValueError("OTLP/HTTP metrics requires an HTTP(S) endpoint")
+        elif self.metrics_otlp_endpoint is not None:
+            raise ValueError("a metrics endpoint requires the OTLP/HTTP exporter")
         return self
 
     @model_validator(mode="after")

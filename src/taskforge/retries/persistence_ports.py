@@ -107,7 +107,7 @@ class RetryTransitionTransaction(Protocol):
         self,
         prepared: PreparedRetryTransition,
         reason: RetryNotScheduledReason,
-    ) -> None: ...
+    ) -> bool: ...
 
 
 class RetryTransitionTransactionContext(Protocol):

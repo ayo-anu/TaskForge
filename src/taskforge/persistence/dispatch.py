@@ -24,6 +24,7 @@ from taskforge.dispatch.publisher_ports import (
     DispatchAcknowledgementPersistenceFailure,
     DispatchOutboxPersistenceUnavailable,
     DispatchPublicationInvariantConflict,
+    OutboxBacklogObservation,
     PublicationAcknowledgement,
     StoredDispatch,
     UnpublishedDispatchCursor,
@@ -111,6 +112,39 @@ class SQLAlchemyDispatchOutboxRepository:
                 return PublicationAcknowledgement.ALREADY_RECORDED
         except DBAPIError as error:
             raise DispatchOutboxPersistenceUnavailable from error
+
+    async def observe_unpublished_backlog(
+        self, *, limit: int
+    ) -> OutboxBacklogObservation:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("outbox observation limit must be positive")
+        bounded = (
+            select(task_dispatch_outbox.c.created_at)
+            .where(task_dispatch_outbox.c.published_at.is_(None))
+            .order_by(
+                task_dispatch_outbox.c.created_at,
+                task_dispatch_outbox.c.id,
+            )
+            .limit(limit + 1)
+            .subquery()
+        )
+        statement = select(
+            func.count().label("pending"),
+            func.min(bounded.c.created_at).label("oldest_created_at"),
+            func.statement_timestamp().label("observed_at"),
+        ).select_from(bounded)
+        try:
+            async with self._sessions() as session:
+                row = (await session.execute(statement)).one()
+        except DBAPIError as error:
+            raise DispatchOutboxPersistenceUnavailable from error
+        pending = min(row.pending, limit)
+        return OutboxBacklogObservation(
+            pending,
+            row.pending > limit,
+            row.oldest_created_at,
+            row.observed_at,
+        )
 
 
 class SQLAlchemyTaskDispatchTransaction:

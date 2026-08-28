@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from taskforge.dead_letters.domain import DeadLetterReason
 from taskforge.persistence.dead_letters import (
+    DeadLetterInsertOutcome,
     DeadLetterPersistenceInvariantViolation,
     ensure_dead_letter,
 )
@@ -223,7 +224,7 @@ class SQLAlchemyRetryTransitionTransaction:
         self,
         prepared: PreparedRetryTransition,
         reason: RetryNotScheduledReason,
-    ) -> None:
+    ) -> bool:
         try:
             transitioned = (
                 await self._required_session().execute(
@@ -270,7 +271,7 @@ class SQLAlchemyRetryTransitionTransaction:
             correlation_id=prepared.correlation_id,
         )
         try:
-            await ensure_dead_letter(
+            dead_letter_outcome = await ensure_dead_letter(
                 self._required_session(),
                 item_id=uuid4(),
                 task_run_id=prepared.task_run_id,
@@ -283,6 +284,7 @@ class SQLAlchemyRetryTransitionTransaction:
             raise RetryTransitionPersistenceInvariantViolation from error
         except DBAPIError as error:
             raise RetryTransitionPersistenceUnavailable from error
+        return dead_letter_outcome is DeadLetterInsertOutcome.CREATED
 
     async def _append_retry_event(
         self,

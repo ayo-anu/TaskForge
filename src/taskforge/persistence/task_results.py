@@ -12,6 +12,7 @@ from taskforge.dead_letters.domain import DeadLetterReason
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.schema import worker_credentials, worker_identities
 from taskforge.persistence.dead_letters import (
+    DeadLetterInsertOutcome,
     DeadLetterPersistenceInvariantViolation,
     ensure_dead_letter,
 )
@@ -345,19 +346,25 @@ class SQLAlchemyTaskResultRepository:
                     result,
                     "result_accepted",
                 )
+                dead_letter_created = False
                 if result.result_kind is TaskExecutionResultKind.PERMANENT_FAILURE:
                     try:
-                        await ensure_dead_letter(
+                        dead_letter_outcome = await ensure_dead_letter(
                             session,
                             item_id=uuid4(),
                             task_run_id=result.task_run_id,
                             source_task_attempt_id=result.task_attempt_id,
                             reason=DeadLetterReason.PERMANENT_FAILURE,
                         )
+                        dead_letter_created = (
+                            dead_letter_outcome is DeadLetterInsertOutcome.CREATED
+                        )
                     except DeadLetterPersistenceInvariantViolation as error:
                         raise TaskResultPersistenceInvariantViolation from error
                 return PersistedTaskResult(
-                    PersistedTaskResultOutcome.ACCEPTED, result.task_attempt_id
+                    PersistedTaskResultOutcome.ACCEPTED,
+                    result.task_attempt_id,
+                    dead_letter_created,
                 )
         except _EXPECTED_REJECTIONS:
             raise

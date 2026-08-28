@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from time import perf_counter
 from uuid import uuid4
 
 from opentelemetry.trace import Link, SpanKind
@@ -29,10 +32,21 @@ from taskforge.dispatch.publisher_ports import (
     UnpublishedDispatchCursor,
 )
 from taskforge.logging import bind_log_context, log_event
+from taskforge.metrics import (
+    OUTBOX_OBSERVATION_LIMIT,
+    update_outbox_observation,
+)
+from taskforge.metrics import (
+    add as add_metric,
+)
+from taskforge.metrics import (
+    record as record_metric,
+)
 from taskforge.tracing import link_from_trace_context, set_attributes, set_error, span
 
 MAX_PUBLICATION_PAGE_SIZE = 100
 MAX_PUBLICATION_PASS_SIZE = 1_000
+OUTBOX_OBSERVATION_TIMEOUT_SECONDS = 2.0
 logger = logging.getLogger(__name__)
 
 
@@ -65,10 +79,13 @@ class TaskDispatchPublisher:
         _validate_bounds(page_size, pass_limit)
         operation_id = uuid4()
         with bind_log_context(**{"operation.id": operation_id}):
-            with span("taskforge.dispatch.publish_pass", root=True):
-                return await self._reconcile_unpublished_bound(
-                    page_size=page_size, pass_limit=pass_limit
-                )
+            try:
+                with span("taskforge.dispatch.publish_pass", root=True):
+                    return await self._reconcile_unpublished_bound(
+                        page_size=page_size, pass_limit=pass_limit
+                    )
+            finally:
+                await self._observe_backlog()
 
     async def _reconcile_unpublished_bound(
         self, *, page_size: int, pass_limit: int
@@ -91,6 +108,7 @@ class TaskDispatchPublisher:
                 validated = _validated_publication(stored)
                 if validated is None:
                     durable_invalid += 1
+                    add_metric("taskforge.dispatch.outbox.invalid")
                     with bind_log_context(
                         **{
                             "dispatch.id": stored.dispatch_id,
@@ -109,6 +127,7 @@ class TaskDispatchPublisher:
                 publication, identifiers, predecessor_link = validated
                 with bind_log_context(**identifiers):
                     links = (predecessor_link,) if predecessor_link is not None else ()
+                    publish_started = perf_counter()
                     with span(
                         "taskforge.dispatch.publish",
                         kind=SpanKind.PRODUCER,
@@ -127,6 +146,20 @@ class TaskDispatchPublisher:
                             BrokerPublicationTimeout,
                             BrokerPublicationRejected,
                         ) as error:
+                            publish_outcome = {
+                                BrokerUnavailable: "unavailable",
+                                BrokerPublicationTimeout: "timeout",
+                                BrokerPublicationRejected: "rejected",
+                            }[type(error)]
+                            add_metric(
+                                "taskforge.dispatch.publications",
+                                attributes={"taskforge.outcome": publish_outcome},
+                            )
+                            record_metric(
+                                "taskforge.dispatch.publish.duration",
+                                perf_counter() - publish_started,
+                                {"taskforge.outcome": publish_outcome},
+                            )
                             set_error(publish_span, error, "broker_publication_failure")
                             log_event(
                                 logger,
@@ -139,6 +172,19 @@ class TaskDispatchPublisher:
                                 error=error,
                             )
                             raise
+                    add_metric(
+                        "taskforge.dispatch.publications",
+                        attributes={"taskforge.outcome": "accepted"},
+                    )
+                    record_metric(
+                        "taskforge.dispatch.publish.duration",
+                        perf_counter() - publish_started,
+                        {"taskforge.outcome": "accepted"},
+                    )
+                    record_metric(
+                        "taskforge.dispatch.outbox.duration",
+                        (datetime.now(UTC) - stored.created_at).total_seconds(),
+                    )
                     with span(
                         "taskforge.dispatch.record_publication",
                         attributes={"db.system.name": "postgresql"},
@@ -154,6 +200,17 @@ class TaskDispatchPublisher:
                             DispatchOutboxPersistenceUnavailable,
                             DispatchPublicationInvariantConflict,
                         ) as error:
+                            record_outcome = (
+                                "invariant_failure"
+                                if isinstance(
+                                    error, DispatchPublicationInvariantConflict
+                                )
+                                else "persistence_failure"
+                            )
+                            add_metric(
+                                "taskforge.dispatch.publication_records",
+                                attributes={"taskforge.outcome": record_outcome},
+                            )
                             set_error(record_span, error, "publication_record_failure")
                             raise
                         set_attributes(
@@ -163,6 +220,10 @@ class TaskDispatchPublisher:
                         acknowledged += 1
                     else:
                         already_acknowledged += 1
+                    add_metric(
+                        "taskforge.dispatch.publication_records",
+                        attributes={"taskforge.outcome": outcome.value},
+                    )
                     log_event(
                         logger,
                         logging.INFO,
@@ -197,6 +258,27 @@ class TaskDispatchPublisher:
             },
         )
         return result
+
+    async def _observe_backlog(self) -> None:
+        try:
+            async with asyncio.timeout(OUTBOX_OBSERVATION_TIMEOUT_SECONDS):
+                observation = await self._repository.observe_unpublished_backlog(
+                    limit=OUTBOX_OBSERVATION_LIMIT
+                )
+            oldest_age = (
+                None
+                if observation.oldest_created_at is None
+                else (
+                    observation.observed_at - observation.oldest_created_at
+                ).total_seconds()
+            )
+            update_outbox_observation(
+                pending=observation.pending,
+                saturated=observation.saturated,
+                oldest_age_seconds=oldest_age,
+            )
+        except Exception:
+            pass
 
 
 def _validate_bounds(page_size: int, pass_limit: int) -> None:

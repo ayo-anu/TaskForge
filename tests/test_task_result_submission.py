@@ -34,13 +34,23 @@ from taskforge.worker.results import (
 
 
 class Repository:
-    def __init__(self, outcome: PersistedTaskResultOutcome) -> None:
+    def __init__(
+        self,
+        outcome: PersistedTaskResultOutcome,
+        *,
+        dead_letter_created: bool = False,
+    ) -> None:
         self.outcome = outcome
+        self.dead_letter_created = dead_letter_created
         self.received: PersistableTaskResult | None = None
 
     async def submit_result(self, *args: Any) -> PersistedTaskResult:
         self.received = args[-1]
-        return PersistedTaskResult(self.outcome, self.received.task_attempt_id)
+        return PersistedTaskResult(
+            self.outcome,
+            self.received.task_attempt_id,
+            self.dead_letter_created,
+        )
 
 
 def request(
@@ -103,6 +113,86 @@ def test_service_verifies_authority_and_maps_committed_outcomes() -> None:
                 worker, uuid4(), submission
             )
         )
+
+
+def test_result_metrics_add_kinds_only_for_new_authoritative_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str] | None]] = []
+
+    def capture(
+        name: str,
+        value: int = 1,
+        attributes: dict[str, str] | None = None,
+    ) -> None:
+        assert value == 1
+        calls.append((name, attributes))
+
+    monkeypatch.setattr("taskforge.worker.result_submission.add_metric", capture)
+    issuer, worker, session_id, submission = request(
+        TaskExecutionResult.retryable_handler_reported()
+    )
+    asyncio.run(
+        TaskResultSubmissionService(
+            Repository(PersistedTaskResultOutcome.ACCEPTED), issuer
+        ).submit_result(worker, session_id, submission)
+    )
+    accepted = calls[0]
+    assert accepted == (
+        "taskforge.task.result_submissions",
+        {
+            "taskforge.outcome": "accepted",
+            "taskforge.result.kind": "retryable_failure",
+            "taskforge.failure.kind": "handler_reported",
+        },
+    )
+
+    calls.clear()
+    asyncio.run(
+        TaskResultSubmissionService(
+            Repository(PersistedTaskResultOutcome.REPLAYED_IDENTICAL), issuer
+        ).submit_result(worker, session_id, submission)
+    )
+    assert calls == [
+        (
+            "taskforge.task.result_submissions",
+            {"taskforge.outcome": "replayed_identical"},
+        )
+    ]
+
+
+def test_dead_letter_creation_metric_requires_new_authoritative_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str] | None]] = []
+
+    def capture(
+        name: str,
+        value: int = 1,
+        attributes: dict[str, str] | None = None,
+    ) -> None:
+        assert value == 1
+        calls.append((name, attributes))
+
+    monkeypatch.setattr("taskforge.worker.result_submission.add_metric", capture)
+    issuer, worker, session_id, submission = request(
+        TaskExecutionResult.permanent_failure()
+    )
+    for created in (True, False):
+        calls.clear()
+        asyncio.run(
+            TaskResultSubmissionService(
+                Repository(
+                    PersistedTaskResultOutcome.ACCEPTED,
+                    dead_letter_created=created,
+                ),
+                issuer,
+            ).submit_result(worker, session_id, submission)
+        )
+        creations = [
+            item for item in calls if item[0] == "taskforge.dead_letters.created"
+        ]
+        assert len(creations) == (1 if created else 0)
 
 
 @pytest.mark.parametrize(

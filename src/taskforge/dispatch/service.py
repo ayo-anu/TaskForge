@@ -18,6 +18,7 @@ from taskforge.dispatch.persistence_ports import (
     TaskDispatchRepository,
     TaskDispatchStateConflict,
 )
+from taskforge.metrics import add as add_metric
 from taskforge.tracing import inject_trace_context, set_attributes, set_error, span
 from taskforge.workflows.task_types import TaskTypeRegistry
 
@@ -139,6 +140,8 @@ class TaskDispatchService:
                     "taskforge.outcome": "dispatched",
                 },
             )
+
+        add_metric("taskforge.dispatch.created")
 
         return DispatchedTask(
             workflow_run_id,
