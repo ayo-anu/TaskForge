@@ -52,7 +52,7 @@ async def verify_reconciliation(database_url: URL) -> None:
         owner_id, workflow_id, _ = await seed_failure_graph(sessions)
         created = await service.create_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=create_workflow_run_input({}, {}),

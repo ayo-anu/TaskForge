@@ -8,6 +8,7 @@ from types import TracebackType
 from typing import Protocol
 from uuid import UUID
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.workflows.domain import (
     DraftDependency,
     DraftWorkflowStep,
@@ -42,6 +43,7 @@ class WorkflowTimestamps:
 @dataclass(frozen=True)
 class LockedWorkflowDefinition:
     id: UUID
+    owner_principal_id: UUID
     status: WorkflowDefinitionStatus
 
 
@@ -147,7 +149,7 @@ class WorkflowTransaction(Protocol):
     async def lock_definition_for_availability(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> LockedWorkflowDefinition | None: ...
 
     async def has_published_version(self, workflow_id: UUID) -> bool: ...
@@ -156,13 +158,14 @@ class WorkflowTransaction(Protocol):
         self,
         workflow_id: UUID,
         status: WorkflowDefinitionStatus,
+        actor_principal_id: UUID,
         correlation_id: str | None = None,
     ) -> None: ...
 
     async def lock_draft_for_publication(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> StoredWorkflowDraft | None:
         """Lock the definition before any version allocation or insertion."""
 
@@ -174,6 +177,7 @@ class WorkflowTransaction(Protocol):
         version_id: UUID,
         version_number: int,
         workflow: WorkflowDraft,
+        actor_principal_id: UUID,
         correlation_id: str | None = None,
     ) -> datetime: ...
 
@@ -209,12 +213,12 @@ class WorkflowRepository(Protocol):
     async def find_draft(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> StoredWorkflowDraft | None: ...
 
     async def list_summaries(
         self,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         *,
         limit: int,
         cursor: WorkflowPageCursor | None,
@@ -223,7 +227,7 @@ class WorkflowRepository(Protocol):
     async def list_versions(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         *,
         limit: int,
         cursor: WorkflowVersionPageCursor | None,
@@ -233,5 +237,5 @@ class WorkflowRepository(Protocol):
         self,
         workflow_id: UUID,
         version_number: int,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> WorkflowVersionSnapshot | None: ...

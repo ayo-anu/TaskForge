@@ -63,7 +63,7 @@ async def create_source(
 ) -> UUID:
     created = await service.create_run(
         workflow_id,
-        owner_principal_id=owner_id,
+        owner_filter=OwnerFilter.only(owner_id),
         requested_by_principal_id=owner_id,
         selection=ExplicitWorkflowVersion(1),
         input_snapshot=create_workflow_run_input(

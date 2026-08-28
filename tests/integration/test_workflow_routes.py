@@ -12,10 +12,12 @@ import httpx2
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import select
 from sqlalchemy.engine import URL
 
 from taskforge.api.application import create_app
 from taskforge.api.health import ReadinessCoordinator
+from taskforge.audit.schema import audit_records
 from taskforge.identity.authorization import Role
 from taskforge.identity.credentials import (
     DEFAULT_VERIFIER_ALGORITHM,
@@ -27,6 +29,7 @@ from taskforge.identity.schema import (
     api_principals,
 )
 from taskforge.persistence.database import build_async_engine
+from taskforge.workflows.schema import workflow_definitions
 from taskforge.workflows.task_types import (
     JSONMapping,
     TaskTypeDefinition,
@@ -58,9 +61,17 @@ def credential_value(credential_id: UUID, secret: bytes) -> str:
 async def verify_workflow_routes(database_url: URL) -> None:
     settings = settings_for(database_url)
     engine = build_async_engine(settings)
-    owner_id, other_id = uuid4(), uuid4()
-    owner_credential_id, other_credential_id = uuid4(), uuid4()
-    owner_secret, other_secret = secrets.token_bytes(32), secrets.token_bytes(32)
+    owner_id, other_id, administrator_id = uuid4(), uuid4(), uuid4()
+    owner_credential_id, other_credential_id, administrator_credential_id = (
+        uuid4(),
+        uuid4(),
+        uuid4(),
+    )
+    owner_secret, other_secret, administrator_secret = (
+        secrets.token_bytes(32),
+        secrets.token_bytes(32),
+        secrets.token_bytes(32),
+    )
 
     def verifier(secret: bytes) -> str:
         return DEFAULT_VERIFIERS.encode(secret, algorithm=DEFAULT_VERIFIER_ALGORITHM)
@@ -72,6 +83,7 @@ async def verify_workflow_routes(database_url: URL) -> None:
                 [
                     {"id": owner_id, "name": "workflow-owner"},
                     {"id": other_id, "name": "other-operator"},
+                    {"id": administrator_id, "name": "administrator"},
                 ],
             )
             await connection.execute(
@@ -79,6 +91,10 @@ async def verify_workflow_routes(database_url: URL) -> None:
                 [
                     {"principal_id": owner_id, "role": Role.WORKFLOW_OPERATOR.value},
                     {"principal_id": other_id, "role": Role.WORKFLOW_OPERATOR.value},
+                    {
+                        "principal_id": administrator_id,
+                        "role": Role.ADMINISTRATOR.value,
+                    },
                 ],
             )
             await connection.execute(
@@ -93,6 +109,11 @@ async def verify_workflow_routes(database_url: URL) -> None:
                         "id": other_credential_id,
                         "principal_id": other_id,
                         "credential_verifier": verifier(other_secret),
+                    },
+                    {
+                        "id": administrator_credential_id,
+                        "principal_id": administrator_id,
+                        "credential_verifier": verifier(administrator_secret),
                     },
                 ],
             )
@@ -109,6 +130,9 @@ async def verify_workflow_routes(database_url: URL) -> None:
     )
     owner_token = credential_value(owner_credential_id, owner_secret)
     other_token = credential_value(other_credential_id, other_secret)
+    administrator_token = credential_value(
+        administrator_credential_id, administrator_secret
+    )
     body = {
         "name": "Integrated draft",
         "steps": [
@@ -238,6 +262,19 @@ async def verify_workflow_routes(database_url: URL) -> None:
                 f"/api/v1/workflows/{uuid4()}",
                 headers={"Authorization": f"Bearer {other_token}"},
             )
+            administrator_headers = {"Authorization": f"Bearer {administrator_token}"}
+            administrator_page = await client.get(
+                "/api/v1/workflows", headers=administrator_headers
+            )
+            administrator_detail = await client.get(
+                location, headers=administrator_headers
+            )
+            administrator_version = await client.get(
+                published.headers["Location"], headers=administrator_headers
+            )
+            administrator_publication = await client.post(
+                publish_path, headers=administrator_headers
+            )
 
     assert validated.status_code == 200
     assert validated.json() == {
@@ -299,11 +336,38 @@ async def verify_workflow_routes(database_url: URL) -> None:
     assert inserted_between_pages.json()["id"] not in traversed_ids
     assert other_owner_page.json()["items"] == []
     assert hidden.status_code == missing.status_code == 404
+    assert {item["id"] for item in administrator_page.json()["items"]} >= initial_ids
+    assert administrator_detail.json()["owner_principal_id"] == str(owner_id)
+    assert administrator_version.status_code == 200
+    assert administrator_publication.status_code == 201
+    assert administrator_publication.json()["version_number"] == 5
     hidden_body, missing_body = hidden.json(), missing.json()
     hidden_body["error"].pop("request_id")
     missing_body["error"].pop("request_id")
     assert hidden_body == missing_body
     assert set(hidden.headers) == set(missing.headers)
+
+    verification_engine = build_async_engine(settings)
+    try:
+        async with verification_engine.connect() as connection:
+            persisted_owner = await connection.scalar(
+                select(workflow_definitions.c.owner_principal_id).where(
+                    workflow_definitions.c.id == UUID(workflow_id)
+                )
+            )
+            publication_actor = await connection.scalar(
+                select(audit_records.c.api_principal_id)
+                .where(
+                    audit_records.c.action == "workflow.publish",
+                    audit_records.c.resource_id == UUID(workflow_id),
+                )
+                .order_by(audit_records.c.occurred_at.desc())
+                .limit(1)
+            )
+    finally:
+        await verification_engine.dispose()
+    assert persisted_owner == owner_id
+    assert publication_actor == administrator_id
 
 
 def test_real_authorized_workflow_create_and_owner_scoped_read() -> None:

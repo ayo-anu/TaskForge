@@ -15,6 +15,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.identity.schema import api_principals
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
@@ -173,14 +174,14 @@ async def verify_creation(database_url: URL) -> None:
         )
         explicit = await service.create_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=ExplicitWorkflowVersion(1),
             input_snapshot=accepted,
         )
         latest = await service.create_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=create_workflow_run_input({}, {}),
@@ -238,7 +239,7 @@ async def verify_creation(database_url: URL) -> None:
         with pytest.raises(WorkflowRunTargetNotFound):
             await service.create_run(
                 workflow_id,
-                owner_principal_id=other_owner_id,
+                owner_filter=OwnerFilter.only(other_owner_id),
                 requested_by_principal_id=other_owner_id,
                 selection=LatestWorkflowVersion(),
                 input_snapshot=create_workflow_run_input({}, {}),
@@ -248,7 +249,7 @@ async def verify_creation(database_url: URL) -> None:
         with pytest.raises(WorkflowRunPersistenceConflict):
             await service.create_run(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
                 requested_by_principal_id=uuid4(),
                 selection=LatestWorkflowVersion(),
                 input_snapshot=create_workflow_run_input({}, {}),
@@ -259,7 +260,9 @@ async def verify_creation(database_url: URL) -> None:
         creation = repository.creation_transaction()
         async with creation:
             prepared = await creation.prepare_creation_target(
-                workflow_id, owner_id, ExplicitWorkflowVersion(1)
+                workflow_id,
+                OwnerFilter.only(owner_id),
+                ExplicitWorkflowVersion(1),
             )
             assert prepared is not None and prepared.snapshot is not None
             initial = materialize_initial_tasks(prepared.snapshot)
@@ -296,7 +299,9 @@ async def verify_creation(database_url: URL) -> None:
         transaction = repository.creation_transaction()
         async with transaction:
             prepared = await transaction.prepare_creation_target(
-                workflow_id, owner_id, LatestWorkflowVersion()
+                workflow_id,
+                OwnerFilter.only(owner_id),
+                LatestWorkflowVersion(),
             )
             assert prepared is not None
             async with sessions.begin() as contender:
@@ -317,7 +322,7 @@ async def verify_creation(database_url: URL) -> None:
         with pytest.raises(WorkflowRunTargetUnavailable):
             await service.create_run(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
                 requested_by_principal_id=owner_id,
                 selection=LatestWorkflowVersion(),
                 input_snapshot=create_workflow_run_input({}, {}),

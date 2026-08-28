@@ -137,7 +137,7 @@ async def workflow_run_execution_stream(
         run_id = _parse_run_id(raw_run_id)
         await runtime.workflow_run_service.get_run(
             run_id,
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.VIEW),
         )
     except (
         CredentialFormatError,

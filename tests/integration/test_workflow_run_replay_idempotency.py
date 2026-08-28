@@ -434,7 +434,7 @@ async def verify_corrupt_lineage_is_rejected(database_url: URL) -> None:
 
         malformed = await service.create_run(
             workflow_id,
-            owner_principal_id=owner,
+            owner_filter=OwnerFilter.only(owner),
             requested_by_principal_id=owner,
             selection=ExplicitWorkflowVersion(1),
             input_snapshot=create_workflow_run_input({}, {}),

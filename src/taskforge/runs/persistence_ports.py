@@ -215,14 +215,14 @@ class WorkflowRunCreationTransaction(Protocol):
     async def prepare_creation_target(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         selection: WorkflowVersionSelection,
     ) -> PreparedWorkflowRunCreation | None: ...
 
     async def prepare_idempotent_creation(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         principal_id: UUID,
         selection: WorkflowVersionSelection,
         key_digest: str,
@@ -300,19 +300,19 @@ class WorkflowRunRepository(Protocol):
     async def get_run(
         self,
         run_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> InspectedWorkflowRun | None: ...
 
     async def list_task_runs(
         self,
         run_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> tuple[InspectedTaskRun, ...] | None: ...
 
     async def get_task_run(
         self,
         task_run_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> InspectedTaskRun | None: ...
 
     async def transition_runnable_tasks(
@@ -354,7 +354,7 @@ class WorkflowRunRepository(Protocol):
     async def resolve_workflow_version(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         selection: WorkflowVersionSelection,
     ) -> WorkflowVersionResolutionRecord | None:
         """Resolve availability and version without locking the definition row."""
@@ -364,7 +364,7 @@ class RetryEventInspectionRepository(Protocol):
     async def list_retry_events(
         self,
         task_run_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         *,
         limit: int,
         cursor: RetryEventCursor | None,

@@ -20,6 +20,7 @@ from taskforge.audit.domain import (
     AuditRecord,
     bounded_string_set,
 )
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.identity.schema import api_principals
 from taskforge.persistence.audit import append_audit_record
 from taskforge.workflows.domain import (
@@ -67,7 +68,7 @@ class SQLAlchemyWorkflowRepository:
     async def find_draft(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> StoredWorkflowDraft | None:
         try:
             async with self._sessions() as session, session.begin():
@@ -78,8 +79,7 @@ class SQLAlchemyWorkflowRepository:
                     await session.execute(
                         select(workflow_definitions).where(
                             workflow_definitions.c.id == workflow_id,
-                            workflow_definitions.c.owner_principal_id
-                            == owner_principal_id,
+                            _owner_predicate(owner_filter),
                         )
                     )
                 ).one_or_none()
@@ -117,12 +117,12 @@ class SQLAlchemyWorkflowRepository:
 
     async def list_summaries(
         self,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         *,
         limit: int,
         cursor: WorkflowPageCursor | None,
     ) -> WorkflowPage:
-        statement = _workflow_list_statement(owner_principal_id, limit, cursor)
+        statement = _workflow_list_statement(owner_filter, limit, cursor)
         try:
             async with self._sessions() as session:
                 rows = (await session.execute(statement)).all()
@@ -133,7 +133,7 @@ class SQLAlchemyWorkflowRepository:
     async def list_versions(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         *,
         limit: int,
         cursor: WorkflowVersionPageCursor | None,
@@ -144,7 +144,7 @@ class SQLAlchemyWorkflowRepository:
                     await session.execute(
                         _workflow_version_list_statement(
                             workflow_id,
-                            owner_principal_id,
+                            owner_filter,
                             limit,
                             cursor,
                         )
@@ -162,7 +162,7 @@ class SQLAlchemyWorkflowRepository:
         self,
         workflow_id: UUID,
         version_number: int,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> WorkflowVersionSnapshot | None:
         try:
             async with self._sessions() as session, session.begin():
@@ -177,8 +177,7 @@ class SQLAlchemyWorkflowRepository:
                         .where(
                             workflow_versions.c.workflow_definition_id == workflow_id,
                             workflow_versions.c.version_number == version_number,
-                            workflow_definitions.c.owner_principal_id
-                            == owner_principal_id,
+                            _owner_predicate(owner_filter),
                         )
                     )
                 ).one_or_none()
@@ -211,8 +210,14 @@ class SQLAlchemyWorkflowRepository:
         return _stored_version(version, steps, dependencies)
 
 
+def _owner_predicate(owner_filter: OwnerFilter) -> Any:
+    if owner_filter.unrestricted:
+        return True
+    return workflow_definitions.c.owner_principal_id == owner_filter.principal_id
+
+
 def _workflow_list_statement(
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
     limit: int,
     cursor: WorkflowPageCursor | None,
 ) -> Any:
@@ -226,7 +231,7 @@ def _workflow_list_statement(
             workflow_definitions.c.created_at,
             workflow_definitions.c.updated_at,
         )
-        .where(workflow_definitions.c.owner_principal_id == owner_principal_id)
+        .where(_owner_predicate(owner_filter))
         .order_by(
             workflow_definitions.c.created_at.desc(),
             workflow_definitions.c.id.desc(),
@@ -248,7 +253,7 @@ def _workflow_list_statement(
 
 def _workflow_version_list_statement(
     workflow_id: UUID,
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
     limit: int,
     cursor: WorkflowVersionPageCursor | None,
 ) -> Any:
@@ -267,7 +272,7 @@ def _workflow_version_list_statement(
         .select_from(workflow_definitions.outerjoin(workflow_versions, join_condition))
         .where(
             workflow_definitions.c.id == workflow_id,
-            workflow_definitions.c.owner_principal_id == owner_principal_id,
+            _owner_predicate(owner_filter),
         )
         .order_by(workflow_versions.c.version_number.desc())
         .limit(limit + 1)
@@ -492,7 +497,7 @@ class SQLAlchemyWorkflowUnitOfWork:
     async def lock_draft_for_publication(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> StoredWorkflowDraft | None:
         """Lock the definition that serializes all version allocation."""
         session = self._required_session()
@@ -502,7 +507,7 @@ class SQLAlchemyWorkflowUnitOfWork:
                     select(workflow_definitions)
                     .where(
                         workflow_definitions.c.id == workflow_id,
-                        workflow_definitions.c.owner_principal_id == owner_principal_id,
+                        _owner_predicate(owner_filter),
                     )
                     .with_for_update()
                 )
@@ -541,18 +546,19 @@ class SQLAlchemyWorkflowUnitOfWork:
     async def lock_definition_for_availability(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> LockedWorkflowDefinition | None:
         try:
             row = (
                 await self._required_session().execute(
                     select(
                         workflow_definitions.c.id,
+                        workflow_definitions.c.owner_principal_id,
                         workflow_definitions.c.status,
                     )
                     .where(
                         workflow_definitions.c.id == workflow_id,
-                        workflow_definitions.c.owner_principal_id == owner_principal_id,
+                        _owner_predicate(owner_filter),
                     )
                     .with_for_update()
                 )
@@ -564,6 +570,7 @@ class SQLAlchemyWorkflowUnitOfWork:
         self._availability_locks.add(workflow_id)
         return LockedWorkflowDefinition(
             id=row.id,
+            owner_principal_id=row.owner_principal_id,
             status=WorkflowDefinitionStatus(row.status),
         )
 
@@ -588,6 +595,7 @@ class SQLAlchemyWorkflowUnitOfWork:
         self,
         workflow_id: UUID,
         status: WorkflowDefinitionStatus,
+        actor_principal_id: UUID,
         correlation_id: str | None = None,
     ) -> None:
         self._require_availability_lock(workflow_id)
@@ -604,18 +612,14 @@ class SQLAlchemyWorkflowUnitOfWork:
             raise WorkflowPersistenceUnavailable from error
         if updated_id != workflow_id:
             raise WorkflowRecordConflict
-        owner_id = await self._required_session().scalar(
-            select(workflow_definitions.c.owner_principal_id).where(
-                workflow_definitions.c.id == workflow_id
-            )
-        )
-        if not isinstance(owner_id, UUID):
-            raise WorkflowRecordConflict
         await append_audit_record(
             self._required_session(),
             AuditRecord(
                 uuid4(),
-                AuditActor(AuditActorKind.API_PRINCIPAL, api_principal_id=owner_id),
+                AuditActor(
+                    AuditActorKind.API_PRINCIPAL,
+                    api_principal_id=actor_principal_id,
+                ),
                 "workflow.availability_change",
                 AuditOutcome.ACCEPTED,
                 "workflow",
@@ -645,6 +649,7 @@ class SQLAlchemyWorkflowUnitOfWork:
         version_id: UUID,
         version_number: int,
         workflow: WorkflowDraft,
+        actor_principal_id: UUID,
         correlation_id: str | None = None,
     ) -> datetime:
         self._require_publication_lock(workflow.id)
@@ -673,7 +678,7 @@ class SQLAlchemyWorkflowUnitOfWork:
                 uuid4(),
                 AuditActor(
                     AuditActorKind.API_PRINCIPAL,
-                    api_principal_id=workflow.owner_principal_id,
+                    api_principal_id=actor_principal_id,
                 ),
                 "workflow.publish",
                 AuditOutcome.ACCEPTED,

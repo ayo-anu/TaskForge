@@ -115,26 +115,32 @@ class FakeRepository:
         del principal_id, workflow_id, key_digest
         raise AssertionError("idempotency recovery was not expected")
 
+    async def find_idempotent_replay(
+        self, principal_id: UUID, workflow_id: UUID, key_digest: str
+    ) -> ExistingIdempotentWorkflowReplay | None:
+        del principal_id, workflow_id, key_digest
+        raise AssertionError("replay idempotency recovery was not expected")
+
     async def get_run(
-        self, run_id: UUID, owner_principal_id: UUID
+        self, run_id: UUID, owner_filter: OwnerFilter
     ) -> InspectedWorkflowRun | None:
-        del run_id, owner_principal_id
+        del run_id, owner_filter
         if self.failure is not None:
             raise self.failure
         return self.run_result
 
     async def list_task_runs(
-        self, run_id: UUID, owner_principal_id: UUID
+        self, run_id: UUID, owner_filter: OwnerFilter
     ) -> tuple[InspectedTaskRun, ...] | None:
-        del run_id, owner_principal_id
+        del run_id, owner_filter
         if self.failure is not None:
             raise self.failure
         return self.task_results
 
     async def get_task_run(
-        self, task_run_id: UUID, owner_principal_id: UUID
+        self, task_run_id: UUID, owner_filter: OwnerFilter
     ) -> InspectedTaskRun | None:
-        del task_run_id, owner_principal_id
+        del task_run_id, owner_filter
         if self.failure is not None:
             raise self.failure
         return self.task_result
@@ -197,10 +203,10 @@ class FakeRepository:
     async def resolve_workflow_version(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         selection: WorkflowVersionSelection,
     ) -> WorkflowVersionResolutionRecord | None:
-        self.calls.append((workflow_id, owner_principal_id, selection))
+        self.calls.append((workflow_id, owner_filter, selection))
         if self.failure is not None:
             raise self.failure
         return self.result
@@ -231,11 +237,11 @@ def test_service_resolves_explicit_and_latest_owner_scoped_targets(
 
     resolved = asyncio.run(
         service.resolve_version(
-            workflow_id, owner_principal_id=owner_id, selection=selection
+            workflow_id, owner_filter=OwnerFilter.only(owner_id), selection=selection
         )
     )
 
-    assert repository.calls == [(workflow_id, owner_id, selection)]
+    assert repository.calls == [(workflow_id, OwnerFilter.only(owner_id), selection)]
     assert resolved.workflow_definition_id == repository.result.workflow_definition_id  # type: ignore[union-attr]
     assert resolved.workflow_version_id == repository.result.workflow_version_id  # type: ignore[union-attr]
     assert resolved.version_number == 3
@@ -248,7 +254,7 @@ def test_absent_or_cross_owner_target_is_concealed_as_not_found() -> None:
         asyncio.run(
             service.resolve_version(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 selection=LatestWorkflowVersion(),
             )
         )
@@ -271,7 +277,7 @@ def test_unavailable_status_takes_precedence_over_absent_version(
         asyncio.run(
             service.resolve_version(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 selection=LatestWorkflowVersion(),
             )
         )
@@ -286,7 +292,7 @@ def test_enabled_target_without_selected_version_is_unavailable() -> None:
         asyncio.run(
             service.resolve_version(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 selection=ExplicitWorkflowVersion(9),
             )
         )
@@ -301,7 +307,7 @@ def test_persistence_unavailability_is_normalized() -> None:
         asyncio.run(
             service.resolve_version(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 selection=LatestWorkflowVersion(),
             )
         )
@@ -346,17 +352,21 @@ def test_service_returns_owner_scoped_run_and_task_inspection() -> None:
 
     assert (
         asyncio.run(
-            service.get_run(run.id, owner_principal_id=run.requested_by_principal_id)
+            service.get_run(
+                run.id, owner_filter=OwnerFilter.only(run.requested_by_principal_id)
+            )
         )
         is run
     )
     assert asyncio.run(
-        service.list_task_runs(run.id, owner_principal_id=run.requested_by_principal_id)
+        service.list_task_runs(
+            run.id, owner_filter=OwnerFilter.only(run.requested_by_principal_id)
+        )
     ) == (task,)
     assert (
         asyncio.run(
             service.get_task_run(
-                task.id, owner_principal_id=run.requested_by_principal_id
+                task.id, owner_filter=OwnerFilter.only(run.requested_by_principal_id)
             )
         )
         is task
@@ -367,17 +377,23 @@ def test_inspection_not_found_and_unavailability_are_normalized() -> None:
     service = WorkflowRunService(FakeRepository())
 
     with pytest.raises(WorkflowRunNotFound):
-        asyncio.run(service.get_run(uuid4(), owner_principal_id=uuid4()))
+        asyncio.run(service.get_run(uuid4(), owner_filter=OwnerFilter.only(uuid4())))
     with pytest.raises(WorkflowRunNotFound):
-        asyncio.run(service.list_task_runs(uuid4(), owner_principal_id=uuid4()))
+        asyncio.run(
+            service.list_task_runs(uuid4(), owner_filter=OwnerFilter.only(uuid4()))
+        )
     with pytest.raises(TaskRunNotFound):
-        asyncio.run(service.get_task_run(uuid4(), owner_principal_id=uuid4()))
+        asyncio.run(
+            service.get_task_run(uuid4(), owner_filter=OwnerFilter.only(uuid4()))
+        )
 
     unavailable = WorkflowRunService(
         FakeRepository(failure=WorkflowRunPersistenceUnavailable())
     )
     with pytest.raises(WorkflowRunServiceUnavailable):
-        asyncio.run(unavailable.get_run(uuid4(), owner_principal_id=uuid4()))
+        asyncio.run(
+            unavailable.get_run(uuid4(), owner_filter=OwnerFilter.only(uuid4()))
+        )
 
 
 def test_service_delegates_runnable_transition_without_reinterpreting_result() -> None:
@@ -490,7 +506,7 @@ def test_unexpected_and_cancellation_failures_are_not_normalized(
         asyncio.run(
             service.resolve_version(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 selection=LatestWorkflowVersion(),
             )
         )
@@ -561,10 +577,10 @@ class FakeCreationTransaction:
     async def prepare_creation_target(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         selection: WorkflowVersionSelection,
     ) -> PreparedWorkflowRunCreation | None:
-        self._record("prepare", workflow_id, owner_principal_id, selection)
+        self._record("prepare", workflow_id, owner_filter, selection)
         return (
             self.prepared
             if isinstance(self.prepared, PreparedWorkflowRunCreation)
@@ -635,7 +651,7 @@ class FakeCreationTransaction:
     async def prepare_idempotent_creation(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         principal_id: UUID,
         selection: WorkflowVersionSelection,
         key_digest: str,
@@ -643,7 +659,7 @@ class FakeCreationTransaction:
         self._record(
             "prepare_idempotent",
             workflow_id,
-            owner_principal_id,
+            owner_filter,
             principal_id,
             selection,
             key_digest,
@@ -752,10 +768,10 @@ class CreationRepository:
     async def resolve_workflow_version(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         selection: WorkflowVersionSelection,
     ) -> WorkflowVersionResolutionRecord | None:
-        del workflow_id, owner_principal_id, selection
+        del workflow_id, owner_filter, selection
         raise AssertionError("unlocked Task 2 resolution must not admit a run")
 
     async def find_idempotent_run(
@@ -781,16 +797,16 @@ class CreationRepository:
             raise self.recovery_failure
         return self.replay_recovery
 
-    async def get_run(self, run_id: UUID, owner_principal_id: UUID) -> None:
-        del run_id, owner_principal_id
+    async def get_run(self, run_id: UUID, owner_filter: OwnerFilter) -> None:
+        del run_id, owner_filter
         raise AssertionError("run inspection was not expected")
 
-    async def list_task_runs(self, run_id: UUID, owner_principal_id: UUID) -> None:
-        del run_id, owner_principal_id
+    async def list_task_runs(self, run_id: UUID, owner_filter: OwnerFilter) -> None:
+        del run_id, owner_filter
         raise AssertionError("task inspection was not expected")
 
-    async def get_task_run(self, task_run_id: UUID, owner_principal_id: UUID) -> None:
-        del task_run_id, owner_principal_id
+    async def get_task_run(self, task_run_id: UUID, owner_filter: OwnerFilter) -> None:
+        del task_run_id, owner_filter
         raise AssertionError("task inspection was not expected")
 
     async def transition_runnable_tasks(
@@ -1021,7 +1037,7 @@ def test_create_run_inserts_one_pending_complete_graph_then_commits() -> None:
     created = asyncio.run(
         service.create_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=requester_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=accepted_input,
@@ -1080,7 +1096,7 @@ def test_rejected_creation_exits_without_inserting_or_committing(
         asyncio.run(
             service.create_run(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 requested_by_principal_id=uuid4(),
                 selection=ExplicitWorkflowVersion(1),
                 input_snapshot=WorkflowRunInput({}, {}),
@@ -1098,7 +1114,7 @@ def test_create_run_revalidates_input_before_opening_transaction() -> None:
         asyncio.run(
             service.create_run(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 requested_by_principal_id=uuid4(),
                 selection=LatestWorkflowVersion(),
                 input_snapshot=WorkflowRunInput({"bad": float("nan")}, {}),
@@ -1118,7 +1134,7 @@ def test_creation_transaction_entry_unavailability_is_service_normalized() -> No
         asyncio.run(
             service.create_run(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 requested_by_principal_id=uuid4(),
                 selection=LatestWorkflowVersion(),
                 input_snapshot=WorkflowRunInput({}, {}),
@@ -1171,7 +1187,7 @@ def test_identical_idempotent_replay_returns_existing_without_generating_ids(
     result = asyncio.run(
         service.create_idempotent_run(
             workflow_id,
-            owner_principal_id=principal_id,
+            owner_filter=OwnerFilter.only(principal_id),
             requested_by_principal_id=principal_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=accepted,
@@ -1202,7 +1218,7 @@ def test_conflicting_idempotent_reuse_writes_nothing_and_generates_no_ids(
         asyncio.run(
             service.create_idempotent_run(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
                 requested_by_principal_id=principal_id,
                 selection=LatestWorkflowVersion(),
                 input_snapshot=WorkflowRunInput({}, {}),
@@ -1224,7 +1240,7 @@ def test_first_idempotent_use_inserts_fact_with_complete_graph() -> None:
     created = asyncio.run(
         service.create_idempotent_run(
             uuid4(),
-            owner_principal_id=uuid4(),
+            owner_filter=OwnerFilter.only(uuid4()),
             requested_by_principal_id=uuid4(),
             selection=ExplicitWorkflowVersion(4),
             input_snapshot=WorkflowRunInput({"value": 1}, {}),
@@ -1266,7 +1282,7 @@ def test_uniqueness_conflict_recovers_identical_winner_once() -> None:
     result = asyncio.run(
         service.create_idempotent_run(
             workflow_id,
-            owner_principal_id=principal_id,
+            owner_filter=OwnerFilter.only(principal_id),
             requested_by_principal_id=principal_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=WorkflowRunInput({}, {}),
@@ -1300,7 +1316,7 @@ def test_idempotent_first_use_rejects_unavailable_targets_before_writing(
         asyncio.run(
             service.create_idempotent_run(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 requested_by_principal_id=uuid4(),
                 selection=LatestWorkflowVersion(),
                 input_snapshot=WorkflowRunInput({}, {}),
@@ -1335,7 +1351,7 @@ def test_idempotent_creation_normalizes_persistence_failures(
         asyncio.run(
             service.create_idempotent_run(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 requested_by_principal_id=uuid4(),
                 selection=LatestWorkflowVersion(),
                 input_snapshot=WorkflowRunInput({}, {}),
@@ -1368,7 +1384,7 @@ def test_idempotency_conflict_recovery_fails_closed(
         asyncio.run(
             service.create_idempotent_run(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 requested_by_principal_id=uuid4(),
                 selection=LatestWorkflowVersion(),
                 input_snapshot=WorkflowRunInput({}, {}),

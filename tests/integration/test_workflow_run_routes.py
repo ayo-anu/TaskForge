@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import secrets
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 import httpx2
@@ -60,9 +60,17 @@ pytestmark = [
 async def verify_workflow_run_routes(database_url: URL) -> None:
     settings = settings_for(database_url)
     engine = build_async_engine(settings)
-    owner_id, other_id = uuid4(), uuid4()
-    owner_credential_id, other_credential_id = uuid4(), uuid4()
-    owner_secret, other_secret = secrets.token_bytes(32), secrets.token_bytes(32)
+    owner_id, other_id, administrator_id = uuid4(), uuid4(), uuid4()
+    owner_credential_id, other_credential_id, administrator_credential_id = (
+        uuid4(),
+        uuid4(),
+        uuid4(),
+    )
+    owner_secret, other_secret, administrator_secret = (
+        secrets.token_bytes(32),
+        secrets.token_bytes(32),
+        secrets.token_bytes(32),
+    )
 
     def verifier(secret: bytes) -> str:
         return DEFAULT_VERIFIERS.encode(secret, algorithm=DEFAULT_VERIFIER_ALGORITHM)
@@ -74,6 +82,7 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
                 [
                     {"id": owner_id, "name": "run-owner"},
                     {"id": other_id, "name": "other-run-owner"},
+                    {"id": administrator_id, "name": "run-administrator"},
                 ],
             )
             await connection.execute(
@@ -81,6 +90,10 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
                 [
                     {"principal_id": owner_id, "role": Role.WORKFLOW_OPERATOR.value},
                     {"principal_id": other_id, "role": Role.WORKFLOW_OPERATOR.value},
+                    {
+                        "principal_id": administrator_id,
+                        "role": Role.ADMINISTRATOR.value,
+                    },
                 ],
             )
             await connection.execute(
@@ -95,6 +108,11 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
                         "id": other_credential_id,
                         "principal_id": other_id,
                         "credential_verifier": verifier(other_secret),
+                    },
+                    {
+                        "id": administrator_credential_id,
+                        "principal_id": administrator_id,
+                        "credential_verifier": verifier(administrator_secret),
                     },
                 ],
             )
@@ -114,6 +132,9 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
     }
     other_headers = {
         "Authorization": f"Bearer {credential_value(other_credential_id, other_secret)}"
+    }
+    administrator_headers = {
+        "Authorization": f"Bearer {credential_value(administrator_credential_id, administrator_secret)}"
     }
     workflow_body = {
         "name": "Run route workflow",
@@ -213,6 +234,17 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
             hidden_tasks = await client.get(
                 f"{keyed.headers['Location']}/tasks", headers=other_headers
             )
+            administrator_run = await client.get(
+                keyed.headers["Location"], headers=administrator_headers
+            )
+            administrator_tasks = await client.get(
+                f"{keyed.headers['Location']}/tasks", headers=administrator_headers
+            )
+            administrator_start = await client.post(
+                f"/api/v1/workflows/{workflow_id}/runs",
+                json={"version_number": 1},
+                headers=administrator_headers,
+            )
             listener = await asyncpg.connect(asyncpg_dsn(database_url))
             notifications: asyncio.Queue[dict[str, str]] = asyncio.Queue()
 
@@ -286,6 +318,11 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
         "root",
     ]
     assert hidden_run.status_code == hidden_tasks.status_code == 404
+    assert administrator_run.status_code == administrator_tasks.status_code == 200
+    assert administrator_start.status_code == 201
+    assert administrator_start.json()["requested_by_principal_id"] == str(
+        administrator_id
+    )
     assert full_replay.status_code == full_replay_retry.status_code == 201
     assert full_replay.json()["id"] == full_replay_retry.json()["id"]
     assert full_replay.json()["source_workflow_run_id"] == keyed.json()["id"]
@@ -343,7 +380,7 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
             assert {
                 str(row.id): row.last_execution_event_cursor for row in cursors
             } == {
-                keyed.json()["id"]: 0,
+                keyed.json()["id"]: 1,
                 replay_target_id: 1,
             }
             counts = [
@@ -358,9 +395,21 @@ async def verify_workflow_run_routes(database_url: URL) -> None:
                     workflow_run_idempotency,
                 )
             ]
+            administrator_owner = await connection.scalar(
+                select(workflow_definitions.c.owner_principal_id)
+                .select_from(
+                    workflow_runs.join(
+                        workflow_definitions,
+                        workflow_definitions.c.id
+                        == workflow_runs.c.workflow_definition_id,
+                    )
+                )
+                .where(workflow_runs.c.id == UUID(administrator_start.json()["id"]))
+            )
     finally:
         await verification_engine.dispose()
-    assert counts == [4, 4, 8, 2]
+    assert counts == [5, 5, 10, 2]
+    assert administrator_owner == owner_id
 
 
 def test_workflow_run_routes_are_atomic_idempotent_and_owner_scoped() -> None:

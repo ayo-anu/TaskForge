@@ -15,7 +15,7 @@ from pydantic import SecretStr
 from taskforge.api.application import create_app
 from taskforge.api.health import ReadinessCoordinator
 from taskforge.identity.authentication import APIAuthenticator, WorkerAuthenticator
-from taskforge.identity.authorization import AuthorizationService, Role
+from taskforge.identity.authorization import AuthorizationService, OwnerFilter, Role
 from taskforge.identity.credentials import (
     DEFAULT_VERIFIER_ALGORITHM,
     DEFAULT_VERIFIERS,
@@ -202,7 +202,7 @@ class RunServiceStub:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         requested_by_principal_id: UUID,
         selection: WorkflowVersionSelection,
         input_snapshot: WorkflowRunInput,
@@ -212,7 +212,7 @@ class RunServiceStub:
             (
                 "create",
                 workflow_id,
-                owner_principal_id,
+                owner_filter,
                 requested_by_principal_id,
                 selection,
                 input_snapshot,
@@ -225,7 +225,7 @@ class RunServiceStub:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         requested_by_principal_id: UUID,
         selection: WorkflowVersionSelection,
         input_snapshot: WorkflowRunInput,
@@ -236,7 +236,7 @@ class RunServiceStub:
             (
                 "create_idempotent",
                 workflow_id,
-                owner_principal_id,
+                owner_filter,
                 requested_by_principal_id,
                 selection,
                 input_snapshot,
@@ -351,9 +351,9 @@ class RunServiceStub:
         )
 
     async def get_run(
-        self, run_id: UUID, *, owner_principal_id: UUID
+        self, run_id: UUID, *, owner_filter: OwnerFilter
     ) -> InspectedWorkflowRun:
-        self.calls.append(("get_run", run_id, owner_principal_id))
+        self.calls.append(("get_run", run_id, owner_filter))
         self._raise()
         return self.inspected
 
@@ -381,16 +381,16 @@ class RunServiceStub:
         return self.cancellation
 
     async def list_task_runs(
-        self, run_id: UUID, *, owner_principal_id: UUID
+        self, run_id: UUID, *, owner_filter: OwnerFilter
     ) -> tuple[InspectedTaskRun, ...]:
-        self.calls.append(("list_tasks", run_id, owner_principal_id))
+        self.calls.append(("list_tasks", run_id, owner_filter))
         self._raise()
         return (self.task,)
 
     async def get_task_run(
-        self, task_run_id: UUID, *, owner_principal_id: UUID
+        self, task_run_id: UUID, *, owner_filter: OwnerFilter
     ) -> InspectedTaskRun:
-        self.calls.append(("get_task", task_run_id, owner_principal_id))
+        self.calls.append(("get_task", task_run_id, owner_filter))
         self._raise()
         return self.task
 
@@ -398,12 +398,12 @@ class RunServiceStub:
         self,
         task_run_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         limit: int,
         cursor: RetryEventCursor | None,
     ) -> InspectedRetryEventPage:
         self.calls.append(
-            ("list_retry_events", task_run_id, owner_principal_id, limit, cursor)
+            ("list_retry_events", task_run_id, owner_filter, limit, cursor)
         )
         self._raise()
         return self.retry_page
@@ -1006,9 +1006,9 @@ def test_run_and_task_inspection_are_owner_scoped_and_minimal() -> None:
         == task.json()
     )
     assert service.calls == [
-        ("get_run", service.run_id, runtime.principal_id),
-        ("list_tasks", service.run_id, runtime.principal_id),
-        ("get_task", service.task_id, runtime.principal_id),
+        ("get_run", service.run_id, OwnerFilter.only(runtime.principal_id)),
+        ("list_tasks", service.run_id, OwnerFilter.only(runtime.principal_id)),
+        ("get_task", service.task_id, OwnerFilter.only(runtime.principal_id)),
     ]
 
 
@@ -1208,3 +1208,25 @@ def test_inspection_unavailability_is_normalized_without_metadata() -> None:
         response.json()["error"]["code"] == "service_unavailable"
         for response in responses
     )
+
+
+def test_administrator_uses_unrestricted_scope_for_start_and_inspection() -> None:
+    app, runtime, service = make_app(frozenset({Role.ADMINISTRATOR.value}))
+    started = request(
+        app,
+        "POST",
+        f"/api/v1/workflows/{uuid4()}/runs",
+        runtime.api_credential,
+        json={},
+    )
+    inspected = request(
+        app,
+        "GET",
+        f"/api/v1/workflow-runs/{service.run_id}",
+        runtime.api_credential,
+    )
+    assert started.status_code == 201
+    assert inspected.status_code == 200
+    assert service.calls[0][2] == OwnerFilter.all_owners()
+    assert service.calls[0][3] == runtime.principal_id
+    assert service.calls[1][2] == OwnerFilter.all_owners()

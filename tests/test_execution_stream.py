@@ -21,7 +21,7 @@ from taskforge.api.application import create_app
 from taskforge.api.execution_stream import workflow_run_execution_stream
 from taskforge.api.health import ReadinessCoordinator
 from taskforge.identity.authentication import APIAuthenticator, WorkerAuthenticator
-from taskforge.identity.authorization import AuthorizationService, Role
+from taskforge.identity.authorization import AuthorizationService, OwnerFilter, Role
 from taskforge.identity.credentials import (
     DEFAULT_VERIFIER_ALGORITHM,
     DEFAULT_VERIFIERS,
@@ -98,7 +98,7 @@ class RoleRepository:
 
 class RunServiceStub:
     def __init__(self, principal_id: UUID, run_id: UUID) -> None:
-        self.calls: list[tuple[UUID, UUID]] = []
+        self.calls: list[tuple[UUID, OwnerFilter]] = []
         self.error: Exception | None = None
         now = datetime.now(UTC)
         self.run = InspectedWorkflowRun(
@@ -113,9 +113,9 @@ class RunServiceStub:
         )
 
     async def get_run(
-        self, run_id: UUID, *, owner_principal_id: UUID
+        self, run_id: UUID, *, owner_filter: OwnerFilter
     ) -> InspectedWorkflowRun:
-        self.calls.append((run_id, owner_principal_id))
+        self.calls.append((run_id, owner_filter))
         if self.error is not None:
             raise self.error
         return self.run
@@ -281,7 +281,9 @@ def assert_denied(
     code: int,
     reason: str,
 ) -> None:
-    outbound = asyncio.run(websocket_exchange(app, run_id, credential))
+    outbound = asyncio.run(
+        websocket_exchange(app, run_id, credential, {"type": "websocket.disconnect"})
+    )
     assert outbound == [{"type": "websocket.close", "code": code, "reason": reason}]
 
 
@@ -320,7 +322,9 @@ def test_authenticated_owner_handshake_and_clean_disconnect() -> None:
     assert outbound == [
         {"type": "websocket.accept", "subprotocol": None, "headers": []}
     ]
-    assert runtime.workflow_run_service.calls == [(run_id, principal_id)]
+    assert runtime.workflow_run_service.calls == [
+        (run_id, OwnerFilter.only(principal_id))
+    ]
 
 
 @pytest.mark.parametrize("credential", [None, "malformed", "Basic secret"])
@@ -461,7 +465,9 @@ def test_accept_follows_authorization_and_inbound_messages_are_discarded(
 
     assert socket.accepted is True
     assert socket.received == 3
-    assert runtime.workflow_run_service.calls == [(run_id, principal_id)]
+    assert runtime.workflow_run_service.calls == [
+        (run_id, OwnerFilter.only(principal_id))
+    ]
 
 
 def test_no_cursor_baselines_at_latest_without_replay() -> None:
@@ -506,6 +512,19 @@ def test_malformed_cursor_is_protocol_error_without_bounds_lookup(cursor: str) -
         "reason": "invalid cursor",
     }
     assert runtime.workflow_run_execution_event_repository.inspect_calls == []
+
+
+def test_administrator_handshake_uses_unrestricted_run_scope() -> None:
+    app, runtime, credential, _, run_id = make_app(
+        roles=frozenset({Role.ADMINISTRATOR.value})
+    )
+
+    outbound = asyncio.run(
+        websocket_exchange(app, run_id, credential, {"type": "websocket.disconnect"})
+    )
+
+    assert runtime.workflow_run_service.calls == [(run_id, OwnerFilter.all_owners())]
+    assert outbound[0]["type"] == "websocket.accept"
 
 
 def test_cursor_ahead_is_protocol_error_without_disclosing_bounds() -> None:

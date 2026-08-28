@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.persistence.workflows import (
     SQLAlchemyWorkflowRepository,
     SQLAlchemyWorkflowUnitOfWork,
@@ -125,7 +126,9 @@ def test_version_insert_cannot_bypass_definition_lock() -> None:
     async def exercise() -> None:
         async with unit_of_work(session) as transaction:
             with pytest.raises(RuntimeError, match="definition lock"):
-                await transaction.insert_version(uuid4(), 1, workflow)
+                await transaction.insert_version(
+                    uuid4(), 1, workflow, workflow.owner_principal_id
+                )
 
     asyncio.run(exercise())
 
@@ -144,7 +147,7 @@ def test_availability_operations_cannot_bypass_definition_lock(operation: str) -
                     await transaction.has_published_version(workflow_id)
                 else:
                     await transaction.update_availability(
-                        workflow_id, WorkflowDefinitionStatus.ENABLED
+                        workflow_id, WorkflowDefinitionStatus.ENABLED, uuid4()
                     )
 
     asyncio.run(exercise())
@@ -209,7 +212,7 @@ def test_list_statement_is_owner_scoped_stably_ordered_and_keyset_bounded() -> N
     owner_id = uuid4()
     cursor = WorkflowPageCursor(datetime.now(UTC), uuid4())
 
-    statement = _workflow_list_statement(owner_id, 2, cursor)
+    statement = _workflow_list_statement(OwnerFilter.only(owner_id), 2, cursor)
     sql = " ".join(str(statement).split())
 
     assert "workflow_definitions.owner_principal_id =" in sql
@@ -289,7 +292,7 @@ def test_version_read_models_reject_invalid_numbers_and_timestamps() -> None:
 
 def test_version_list_statement_uses_strict_descending_keyset_boundary() -> None:
     statement = _workflow_version_list_statement(
-        uuid4(), uuid4(), 2, WorkflowVersionPageCursor(4)
+        uuid4(), OwnerFilter.only(uuid4()), 2, WorkflowVersionPageCursor(4)
     )
     sql = " ".join(str(statement).split())
 

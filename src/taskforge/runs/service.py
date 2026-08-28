@@ -700,14 +700,14 @@ class WorkflowRunService:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         selection: WorkflowVersionSelection,
     ) -> ResolvedWorkflowVersion:
         """Resolve a target valid at lookup time, without admitting a run."""
         try:
             record = await self._repository.resolve_workflow_version(
                 workflow_id,
-                owner_principal_id,
+                owner_filter,
                 selection,
             )
         except WorkflowRunPersistenceUnavailable as error:
@@ -727,10 +727,10 @@ class WorkflowRunService:
         self,
         run_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> InspectedWorkflowRun:
         try:
-            run = await self._repository.get_run(run_id, owner_principal_id)
+            run = await self._repository.get_run(run_id, owner_filter)
         except WorkflowRunPersistenceUnavailable as error:
             raise WorkflowRunServiceUnavailable from error
         if run is None:
@@ -741,10 +741,10 @@ class WorkflowRunService:
         self,
         run_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> tuple[InspectedTaskRun, ...]:
         try:
-            tasks = await self._repository.list_task_runs(run_id, owner_principal_id)
+            tasks = await self._repository.list_task_runs(run_id, owner_filter)
         except WorkflowRunInspectionInvariantViolation as error:
             raise WorkflowRunInspectionInvariantError from error
         except WorkflowRunPersistenceUnavailable as error:
@@ -757,10 +757,10 @@ class WorkflowRunService:
         self,
         task_run_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> InspectedTaskRun:
         try:
-            task = await self._repository.get_task_run(task_run_id, owner_principal_id)
+            task = await self._repository.get_task_run(task_run_id, owner_filter)
         except WorkflowRunInspectionInvariantViolation as error:
             raise WorkflowRunInspectionInvariantError from error
         except WorkflowRunPersistenceUnavailable as error:
@@ -773,7 +773,7 @@ class WorkflowRunService:
         self,
         task_run_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         limit: int,
         cursor: RetryEventCursor | None,
     ) -> InspectedRetryEventPage:
@@ -782,7 +782,7 @@ class WorkflowRunService:
                 RetryEventInspectionRepository, self._repository
             ).list_retry_events(
                 task_run_id,
-                owner_principal_id,
+                owner_filter,
                 limit=limit,
                 cursor=cursor,
             )
@@ -1050,7 +1050,7 @@ class WorkflowRunService:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         requested_by_principal_id: UUID,
         selection: WorkflowVersionSelection,
         input_snapshot: WorkflowRunInput,
@@ -1068,7 +1068,7 @@ class WorkflowRunService:
         try:
             async with self._repository.creation_transaction() as transaction:
                 prepared = await transaction.prepare_creation_target(
-                    workflow_id, owner_principal_id, selection
+                    workflow_id, owner_filter, selection
                 )
                 if prepared is None:
                     raise WorkflowRunTargetNotFound
@@ -1090,7 +1090,7 @@ class WorkflowRunService:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         requested_by_principal_id: UUID,
         selection: WorkflowVersionSelection,
         input_snapshot: WorkflowRunInput,
@@ -1113,7 +1113,7 @@ class WorkflowRunService:
             async with self._repository.creation_transaction() as transaction:
                 preparation = await transaction.prepare_idempotent_creation(
                     workflow_id,
-                    owner_principal_id,
+                    owner_filter,
                     requested_by_principal_id,
                     selection,
                     idempotency.key_digest,

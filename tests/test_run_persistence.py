@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.persistence.runs import (
     SQLAlchemyWorkflowRunCreationTransaction,
     SQLAlchemyWorkflowRunRepository,
@@ -117,7 +118,7 @@ def normalized_sql(statement: object) -> str:
 
 def test_explicit_resolution_is_owner_and_workflow_scoped_without_locking() -> None:
     statement = _version_resolution_statement(
-        uuid4(), uuid4(), ExplicitWorkflowVersion(4)
+        uuid4(), OwnerFilter.only(uuid4()), ExplicitWorkflowVersion(4)
     )
     sql = normalized_sql(statement)
 
@@ -131,7 +132,9 @@ def test_explicit_resolution_is_owner_and_workflow_scoped_without_locking() -> N
 
 
 def test_latest_resolution_orders_only_by_unique_version_number() -> None:
-    statement = _version_resolution_statement(uuid4(), uuid4(), LatestWorkflowVersion())
+    statement = _version_resolution_statement(
+        uuid4(), OwnerFilter.only(uuid4()), LatestWorkflowVersion()
+    )
     sql = normalized_sql(statement)
 
     assert "ORDER BY workflow_versions.version_number DESC" in sql
@@ -141,7 +144,7 @@ def test_latest_resolution_orders_only_by_unique_version_number() -> None:
 
 
 def test_creation_admission_lock_is_exclusive_and_owner_scoped() -> None:
-    statement = _definition_lock_statement(uuid4(), uuid4())
+    statement = _definition_lock_statement(uuid4(), OwnerFilter.only(uuid4()))
     sql = normalized_sql(statement)
 
     assert "workflow_definitions.id =" in sql
@@ -221,10 +224,14 @@ def test_replay_idempotency_conversion_rejects_missing_or_malformed_lineage() ->
 
 
 def test_run_and_task_inspection_sql_is_owner_scoped_read_only_and_ordered() -> None:
-    run = normalized_sql(_run_inspection_statement(uuid4(), uuid4()))
-    exists = normalized_sql(_owner_scoped_run_exists_statement(uuid4(), uuid4()))
-    tasks = normalized_sql(_task_run_list_statement(uuid4(), uuid4()))
-    task = normalized_sql(_task_run_inspection_statement(uuid4(), uuid4()))
+    run = normalized_sql(_run_inspection_statement(uuid4(), OwnerFilter.only(uuid4())))
+    exists = normalized_sql(
+        _owner_scoped_run_exists_statement(uuid4(), OwnerFilter.only(uuid4()))
+    )
+    tasks = normalized_sql(_task_run_list_statement(uuid4(), OwnerFilter.only(uuid4())))
+    task = normalized_sql(
+        _task_run_inspection_statement(uuid4(), OwnerFilter.only(uuid4()))
+    )
 
     for sql in (run, exists, tasks, task):
         assert "workflow_definitions.owner_principal_id =" in sql
@@ -688,7 +695,7 @@ def test_creation_transaction_prepares_snapshot_in_locked_transaction() -> None:
     async def exercise() -> PreparedWorkflowRunCreation | None:
         async with transaction(session) as creation:
             return await creation.prepare_creation_target(
-                workflow_id, uuid4(), LatestWorkflowVersion()
+                workflow_id, OwnerFilter.only(uuid4()), LatestWorkflowVersion()
             )
 
     prepared = asyncio.run(exercise())

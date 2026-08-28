@@ -14,6 +14,7 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.identity.schema import api_principals
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
@@ -157,7 +158,7 @@ async def verify_failure_propagation(database_url: URL) -> None:
         owner_id, workflow_id, version_id = await seed_failure_graph(sessions)
         created = await service.create_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=create_workflow_run_input({}, {}),

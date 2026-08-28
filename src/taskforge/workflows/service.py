@@ -11,6 +11,7 @@ from taskforge.audit.domain import (
     AuditRecord,
     AuditRejected,
 )
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.persistence.audit import RejectedAuditRecorder
 from taskforge.workflows.dag_validation import DAGEdge, validate_dag
 from taskforge.workflows.domain import (
@@ -181,12 +182,12 @@ class WorkflowService:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> StoredWorkflowDraft:
         try:
             stored = await self._repository.find_draft(
                 workflow_id,
-                owner_principal_id,
+                owner_filter,
             )
         except WorkflowPersistenceUnavailable as error:
             raise WorkflowServiceUnavailable from error
@@ -198,20 +199,21 @@ class WorkflowService:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
+        actor_principal_id: UUID,
         correlation_id: UUID | None = None,
     ) -> PublishedWorkflowVersion:
         """Revalidate and atomically snapshot one owner-scoped draft."""
         version_id = uuid4()
         try:
             async with self._repository.transaction() as transaction:
-                await transaction.require_enabled_owner(owner_principal_id)
                 stored = await transaction.lock_draft_for_publication(
                     workflow_id,
-                    owner_principal_id,
+                    owner_filter,
                 )
                 if stored is None:
                     raise WorkflowNotFound
+                await transaction.require_enabled_owner(stored.draft.owner_principal_id)
                 validated = _revalidate_for_publication(
                     stored.draft,
                     self._task_types,
@@ -221,6 +223,7 @@ class WorkflowService:
                     version_id,
                     version_number,
                     validated,
+                    actor_principal_id,
                     str(correlation_id) if correlation_id else None,
                 )
                 await transaction.insert_version_steps(
@@ -245,7 +248,7 @@ class WorkflowService:
                 error,
                 action="workflow.publish",
                 workflow_id=workflow_id,
-                principal_id=owner_principal_id,
+                principal_id=actor_principal_id,
                 correlation_id=correlation_id,
             )
             raise WorkflowOwnerNotFound from error
@@ -254,7 +257,7 @@ class WorkflowService:
                 error,
                 action="workflow.publish",
                 workflow_id=workflow_id,
-                principal_id=owner_principal_id,
+                principal_id=actor_principal_id,
                 correlation_id=correlation_id,
             )
             raise WorkflowOwnerDisabled from error
@@ -263,7 +266,7 @@ class WorkflowService:
                 error,
                 action="workflow.publish",
                 workflow_id=workflow_id,
-                principal_id=owner_principal_id,
+                principal_id=actor_principal_id,
                 correlation_id=correlation_id,
             )
             raise WorkflowPersistenceConflict from error
@@ -272,7 +275,7 @@ class WorkflowService:
                 error,
                 action="workflow.publish",
                 workflow_id=workflow_id,
-                principal_id=owner_principal_id,
+                principal_id=actor_principal_id,
                 correlation_id=correlation_id,
             )
             raise
@@ -289,20 +292,21 @@ class WorkflowService:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
+        actor_principal_id: UUID,
         intent: WorkflowAvailabilityIntent,
         correlation_id: UUID | None = None,
     ) -> WorkflowAvailabilityResult:
         """Apply one owner-scoped availability change transactionally."""
         try:
             async with self._repository.transaction() as transaction:
-                await transaction.require_enabled_owner(owner_principal_id)
                 definition = await transaction.lock_definition_for_availability(
                     workflow_id,
-                    owner_principal_id,
+                    owner_filter,
                 )
                 if definition is None:
                     raise WorkflowNotFound
+                await transaction.require_enabled_owner(definition.owner_principal_id)
                 requires_published_version = availability_requires_published_version(
                     definition.status,
                     intent,
@@ -322,6 +326,7 @@ class WorkflowService:
                     await transaction.update_availability(
                         workflow_id,
                         result.status,
+                        actor_principal_id,
                         str(correlation_id) if correlation_id else None,
                     )
                 await transaction.commit()
@@ -330,7 +335,7 @@ class WorkflowService:
                 error,
                 action="workflow.availability_change",
                 workflow_id=workflow_id,
-                principal_id=owner_principal_id,
+                principal_id=actor_principal_id,
                 correlation_id=correlation_id,
             )
             raise WorkflowOwnerNotFound from error
@@ -339,7 +344,7 @@ class WorkflowService:
                 error,
                 action="workflow.availability_change",
                 workflow_id=workflow_id,
-                principal_id=owner_principal_id,
+                principal_id=actor_principal_id,
                 correlation_id=correlation_id,
             )
             raise WorkflowOwnerDisabled from error
@@ -348,7 +353,7 @@ class WorkflowService:
                 error,
                 action="workflow.availability_change",
                 workflow_id=workflow_id,
-                principal_id=owner_principal_id,
+                principal_id=actor_principal_id,
                 correlation_id=correlation_id,
             )
             raise WorkflowPersistenceConflict from error
@@ -357,7 +362,7 @@ class WorkflowService:
                 error,
                 action="workflow.availability_change",
                 workflow_id=workflow_id,
-                principal_id=owner_principal_id,
+                principal_id=actor_principal_id,
                 correlation_id=correlation_id,
             )
             raise
@@ -399,7 +404,7 @@ class WorkflowService:
     async def list(
         self,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         limit: int,
         cursor: WorkflowPageCursor | None = None,
     ) -> WorkflowPage:
@@ -407,7 +412,7 @@ class WorkflowService:
             raise InvalidWorkflowListQuery("limit must be a positive integer")
         try:
             return await self._repository.list_summaries(
-                owner_principal_id,
+                owner_filter,
                 limit=limit,
                 cursor=cursor,
             )
@@ -418,7 +423,7 @@ class WorkflowService:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         limit: int,
         cursor: WorkflowVersionPageCursor | None = None,
     ) -> WorkflowVersionPage:
@@ -427,7 +432,7 @@ class WorkflowService:
         try:
             page = await self._repository.list_versions(
                 workflow_id,
-                owner_principal_id,
+                owner_filter,
                 limit=limit,
                 cursor=cursor,
             )
@@ -442,7 +447,7 @@ class WorkflowService:
         workflow_id: UUID,
         version_number: int,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> WorkflowVersionSnapshot:
         if (
             isinstance(version_number, bool)
@@ -454,7 +459,7 @@ class WorkflowService:
             version = await self._repository.find_version(
                 workflow_id,
                 version_number,
-                owner_principal_id,
+                owner_filter,
             )
         except WorkflowPersistenceUnavailable as error:
             raise WorkflowServiceUnavailable from error

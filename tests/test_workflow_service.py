@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.workflows.domain import (
     DraftDependency,
     DraftWorkflowStep,
@@ -110,8 +111,8 @@ class FakeTransaction:
         del exception_type, exception, traceback
         self.calls.append(("exit",))
 
-    async def require_enabled_owner(self, owner_principal_id: UUID) -> None:
-        self._record("require_enabled_owner", owner_principal_id)
+    async def require_enabled_owner(self, owner_filter: OwnerFilter) -> None:
+        self._record("require_enabled_owner", owner_filter)
 
     async def insert_definition(
         self, workflow: WorkflowDraft, correlation_id: str | None = None
@@ -136,19 +137,17 @@ class FakeTransaction:
     async def lock_draft_for_publication(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> StoredWorkflowDraft | None:
-        self._record("lock_draft_for_publication", workflow_id, owner_principal_id)
+        self._record("lock_draft_for_publication", workflow_id, owner_filter)
         return self.draft_value
 
     async def lock_definition_for_availability(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> LockedWorkflowDefinition | None:
-        self._record(
-            "lock_definition_for_availability", workflow_id, owner_principal_id
-        )
+        self._record("lock_definition_for_availability", workflow_id, owner_filter)
         return self.locked_definition
 
     async def has_published_version(self, workflow_id: UUID) -> bool:
@@ -159,6 +158,7 @@ class FakeTransaction:
         self,
         workflow_id: UUID,
         status: WorkflowDefinitionStatus,
+        actor_principal_id: UUID,
         correlation_id: str | None = None,
     ) -> None:
         self._record("update_availability", workflow_id, status)
@@ -172,6 +172,7 @@ class FakeTransaction:
         version_id: UUID,
         version_number: int,
         workflow: WorkflowDraft,
+        actor_principal_id: UUID,
         correlation_id: str | None = None,
     ) -> datetime:
         self._record("insert_version", version_id, version_number, workflow)
@@ -212,12 +213,12 @@ class FakeRepository:
     version_value: WorkflowVersionSnapshot | None = None
 
     def __post_init__(self) -> None:
-        self.find_calls: list[tuple[UUID, UUID]] = []
-        self.list_calls: list[tuple[UUID, int, WorkflowPageCursor | None]] = []
+        self.find_calls: list[tuple[UUID, OwnerFilter]] = []
+        self.list_calls: list[tuple[OwnerFilter, int, WorkflowPageCursor | None]] = []
         self.version_list_calls: list[
-            tuple[UUID, UUID, int, WorkflowVersionPageCursor | None]
+            tuple[UUID, OwnerFilter, int, WorkflowVersionPageCursor | None]
         ] = []
-        self.version_get_calls: list[tuple[UUID, int, UUID]] = []
+        self.version_get_calls: list[tuple[UUID, int, OwnerFilter]] = []
 
     def transaction(self) -> WorkflowTransactionContext:
         return self.transaction_value
@@ -225,21 +226,21 @@ class FakeRepository:
     async def find_draft(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> StoredWorkflowDraft | None:
-        self.find_calls.append((workflow_id, owner_principal_id))
+        self.find_calls.append((workflow_id, owner_filter))
         if self.query_failure is not None:
             raise self.query_failure
         return self.stored
 
     async def list_summaries(
         self,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         *,
         limit: int,
         cursor: WorkflowPageCursor | None,
     ) -> WorkflowPage:
-        self.list_calls.append((owner_principal_id, limit, cursor))
+        self.list_calls.append((owner_filter, limit, cursor))
         if self.query_failure is not None:
             raise self.query_failure
         return self.page
@@ -247,12 +248,12 @@ class FakeRepository:
     async def list_versions(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         *,
         limit: int,
         cursor: WorkflowVersionPageCursor | None,
     ) -> WorkflowVersionPage | None:
-        self.version_list_calls.append((workflow_id, owner_principal_id, limit, cursor))
+        self.version_list_calls.append((workflow_id, owner_filter, limit, cursor))
         if self.query_failure is not None:
             raise self.query_failure
         return self.version_page
@@ -261,9 +262,9 @@ class FakeRepository:
         self,
         workflow_id: UUID,
         version_number: int,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> WorkflowVersionSnapshot | None:
-        self.version_get_calls.append((workflow_id, version_number, owner_principal_id))
+        self.version_get_calls.append((workflow_id, version_number, owner_filter))
         if self.query_failure is not None:
             raise self.query_failure
         return self.version_value
@@ -394,14 +395,15 @@ def test_publish_locks_revalidates_allocates_and_copies_deterministically() -> N
     published = asyncio.run(
         workflow_service(FakeRepository(transaction)).publish(
             original.id,
-            owner_principal_id=original.owner_principal_id,
+            owner_filter=OwnerFilter.only(original.owner_principal_id),
+            actor_principal_id=original.owner_principal_id,
         )
     )
 
     assert [call[0] for call in transaction.calls] == [
         "enter",
-        "require_enabled_owner",
         "lock_draft_for_publication",
+        "require_enabled_owner",
         "next_version_number",
         "insert_version",
         "insert_version_steps",
@@ -478,14 +480,15 @@ def test_invalid_persisted_draft_rolls_back_before_allocation(
         asyncio.run(
             workflow_service(FakeRepository(transaction)).publish(
                 invalid.id,
-                owner_principal_id=invalid.owner_principal_id,
+                owner_filter=OwnerFilter.only(invalid.owner_principal_id),
+                actor_principal_id=invalid.owner_principal_id,
             )
         )
 
     assert [call[0] for call in transaction.calls] == [
         "enter",
-        "require_enabled_owner",
         "lock_draft_for_publication",
+        "require_enabled_owner",
         "exit",
     ]
 
@@ -497,13 +500,13 @@ def test_missing_owner_scoped_publication_stops_after_definition_lock() -> None:
         asyncio.run(
             workflow_service(FakeRepository(transaction)).publish(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
+                actor_principal_id=uuid4(),
             )
         )
 
     assert [call[0] for call in transaction.calls] == [
         "enter",
-        "require_enabled_owner",
         "lock_draft_for_publication",
         "exit",
     ]
@@ -521,13 +524,19 @@ def test_publication_normalizes_owner_failures(
     expected: type[Exception],
 ) -> None:
     transaction = FakeTransaction()
+    workflow = draft()
+    transaction.draft_value = StoredWorkflowDraft(
+        workflow, transaction.timestamps.created_at, transaction.timestamps.updated_at
+    )
     transaction.failure_for = "require_enabled_owner"
     transaction.failure = failure
 
     with pytest.raises(expected):
         asyncio.run(
             workflow_service(FakeRepository(transaction)).publish(
-                uuid4(), owner_principal_id=uuid4()
+                workflow.id,
+                owner_filter=OwnerFilter.only(workflow.owner_principal_id),
+                actor_principal_id=workflow.owner_principal_id,
             )
         )
 
@@ -566,7 +575,8 @@ def test_publication_failure_never_commits_partial_snapshot(
         asyncio.run(
             workflow_service(FakeRepository(transaction)).publish(
                 workflow.id,
-                owner_principal_id=workflow.owner_principal_id,
+                owner_filter=OwnerFilter.only(workflow.owner_principal_id),
+                actor_principal_id=workflow.owner_principal_id,
             )
         )
 
@@ -584,27 +594,30 @@ def test_get_is_owner_scoped_and_non_enumerating() -> None:
     )
     service = workflow_service(repository)
 
-    found = asyncio.run(service.get(workflow.id, owner_principal_id=owner_id))
+    found = asyncio.run(
+        service.get(workflow.id, owner_filter=OwnerFilter.only(owner_id))
+    )
     repository.stored = None
     with pytest.raises(WorkflowNotFound):
-        asyncio.run(service.get(workflow.id, owner_principal_id=uuid4()))
+        asyncio.run(service.get(workflow.id, owner_filter=OwnerFilter.only(uuid4())))
 
     assert found.draft is workflow
-    assert repository.find_calls[0] == (workflow.id, owner_id)
+    assert repository.find_calls[0] == (workflow.id, OwnerFilter.only(owner_id))
 
 
 def test_availability_locks_before_publication_check_and_updates_once() -> None:
     workflow_id, owner_id = uuid4(), uuid4()
     transaction = FakeTransaction()
     transaction.locked_definition = LockedWorkflowDefinition(
-        workflow_id, WorkflowDefinitionStatus.DRAFT
+        workflow_id, owner_id, WorkflowDefinitionStatus.DRAFT
     )
     transaction.published_version_exists = True
 
     result = asyncio.run(
         workflow_service(FakeRepository(transaction)).set_availability(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
+            actor_principal_id=owner_id,
             intent=WorkflowAvailabilityIntent.ENABLE,
         )
     )
@@ -613,8 +626,8 @@ def test_availability_locks_before_publication_check_and_updates_once() -> None:
     assert result.changed is True
     assert [call[0] for call in transaction.calls] == [
         "enter",
-        "require_enabled_owner",
         "lock_definition_for_availability",
+        "require_enabled_owner",
         "has_published_version",
         "update_availability",
         "commit",
@@ -659,13 +672,16 @@ def test_existing_availability_changes_never_query_versions(
 ) -> None:
     workflow_id, owner_id = uuid4(), uuid4()
     transaction = FakeTransaction()
-    transaction.locked_definition = LockedWorkflowDefinition(workflow_id, status)
+    transaction.locked_definition = LockedWorkflowDefinition(
+        workflow_id, owner_id, status
+    )
     transaction.published_version_exists = True
 
     result = asyncio.run(
         workflow_service(FakeRepository(transaction)).set_availability(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
+            actor_principal_id=owner_id,
             intent=intent,
         )
     )
@@ -682,14 +698,15 @@ def test_invalid_availability_rolls_back_without_update_or_commit() -> None:
     workflow_id, owner_id = uuid4(), uuid4()
     transaction = FakeTransaction()
     transaction.locked_definition = LockedWorkflowDefinition(
-        workflow_id, WorkflowDefinitionStatus.DRAFT
+        workflow_id, owner_id, WorkflowDefinitionStatus.DRAFT
     )
 
     with pytest.raises(WorkflowAvailabilityTransitionRejected):
         asyncio.run(
             workflow_service(FakeRepository(transaction)).set_availability(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
+                actor_principal_id=owner_id,
                 intent=WorkflowAvailabilityIntent.ENABLE,
             )
         )
@@ -704,14 +721,15 @@ def test_draft_disable_does_not_query_versions() -> None:
     workflow_id, owner_id = uuid4(), uuid4()
     transaction = FakeTransaction()
     transaction.locked_definition = LockedWorkflowDefinition(
-        workflow_id, WorkflowDefinitionStatus.DRAFT
+        workflow_id, owner_id, WorkflowDefinitionStatus.DRAFT
     )
 
     with pytest.raises(WorkflowAvailabilityTransitionRejected):
         asyncio.run(
             workflow_service(FakeRepository(transaction)).set_availability(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
+                actor_principal_id=owner_id,
                 intent=WorkflowAvailabilityIntent.DISABLE,
             )
         )
@@ -726,14 +744,14 @@ def test_missing_owner_scoped_availability_stops_after_lock() -> None:
         asyncio.run(
             workflow_service(FakeRepository(transaction)).set_availability(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
+                actor_principal_id=uuid4(),
                 intent=WorkflowAvailabilityIntent.ENABLE,
             )
         )
 
     assert [call[0] for call in transaction.calls] == [
         "enter",
-        "require_enabled_owner",
         "lock_definition_for_availability",
         "exit",
     ]
@@ -754,7 +772,7 @@ def test_expected_availability_failures_are_normalized(
 ) -> None:
     transaction = FakeTransaction()
     transaction.locked_definition = LockedWorkflowDefinition(
-        uuid4(), WorkflowDefinitionStatus.ENABLED
+        uuid4(), uuid4(), WorkflowDefinitionStatus.ENABLED
     )
     transaction.failure_for = "require_enabled_owner"
     transaction.failure = failure
@@ -763,7 +781,8 @@ def test_expected_availability_failures_are_normalized(
         asyncio.run(
             workflow_service(FakeRepository(transaction)).set_availability(
                 uuid4(),
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
+                actor_principal_id=uuid4(),
                 intent=WorkflowAvailabilityIntent.DISABLE,
             )
         )
@@ -778,7 +797,7 @@ def test_list_requires_an_explicit_positive_integer_limit(limit: object) -> None
     with pytest.raises(InvalidWorkflowListQuery):
         asyncio.run(
             workflow_service(repository).list(
-                owner_principal_id=uuid4(),
+                owner_filter=OwnerFilter.only(uuid4()),
                 limit=limit,  # type: ignore[arg-type]
             )
         )
@@ -793,14 +812,14 @@ def test_list_passes_owner_and_unbounded_policy_free_limit() -> None:
 
     result = asyncio.run(
         workflow_service(repository).list(
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             limit=10_000,
             cursor=cursor,
         )
     )
 
     assert result == WorkflowPage((), None)
-    assert repository.list_calls == [(owner_id, 10_000, cursor)]
+    assert repository.list_calls == [(OwnerFilter.only(owner_id), 10_000, cursor)]
 
 
 @pytest.mark.parametrize("operation", ("get", "list"))
@@ -812,9 +831,9 @@ def test_expected_query_failure_is_normalized(operation: str) -> None:
 
     with pytest.raises(WorkflowServiceUnavailable):
         if operation == "get":
-            asyncio.run(service.get(uuid4(), owner_principal_id=uuid4()))
+            asyncio.run(service.get(uuid4(), owner_filter=OwnerFilter.only(uuid4())))
         else:
-            asyncio.run(service.list(owner_principal_id=uuid4(), limit=1))
+            asyncio.run(service.list(owner_filter=OwnerFilter.only(uuid4()), limit=1))
 
 
 def test_version_list_is_owner_scoped_and_passes_cursor() -> None:
@@ -825,14 +844,16 @@ def test_version_list_is_owner_scoped_and_passes_cursor() -> None:
     page = asyncio.run(
         workflow_service(repository).list_versions(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             limit=3,
             cursor=cursor,
         )
     )
 
     assert page == WorkflowVersionPage((), None)
-    assert repository.version_list_calls == [(workflow_id, owner_id, 3, cursor)]
+    assert repository.version_list_calls == [
+        (workflow_id, OwnerFilter.only(owner_id), 3, cursor)
+    ]
 
 
 def test_missing_version_collection_and_detail_are_non_enumerating() -> None:
@@ -842,9 +863,15 @@ def test_missing_version_collection_and_detail_are_non_enumerating() -> None:
     service = workflow_service(repository)
 
     with pytest.raises(WorkflowNotFound):
-        asyncio.run(service.list_versions(uuid4(), owner_principal_id=uuid4(), limit=1))
+        asyncio.run(
+            service.list_versions(
+                uuid4(), owner_filter=OwnerFilter.only(uuid4()), limit=1
+            )
+        )
     with pytest.raises(WorkflowNotFound):
-        asyncio.run(service.get_version(uuid4(), 1, owner_principal_id=uuid4()))
+        asyncio.run(
+            service.get_version(uuid4(), 1, owner_filter=OwnerFilter.only(uuid4()))
+        )
 
 
 def test_version_detail_uses_only_workflow_scoped_number_and_owner() -> None:
@@ -857,12 +884,14 @@ def test_version_detail_uses_only_workflow_scoped_number_and_owner() -> None:
 
     found = asyncio.run(
         workflow_service(repository).get_version(
-            workflow_id, 4, owner_principal_id=owner_id
+            workflow_id, 4, owner_filter=OwnerFilter.only(owner_id)
         )
     )
 
     assert found is version
-    assert repository.version_get_calls == [(workflow_id, 4, owner_id)]
+    assert repository.version_get_calls == [
+        (workflow_id, 4, OwnerFilter.only(owner_id))
+    ]
 
 
 @pytest.mark.parametrize("operation", ("list", "get"))
@@ -875,10 +904,14 @@ def test_version_query_unavailability_is_normalized(operation: str) -> None:
     with pytest.raises(WorkflowServiceUnavailable):
         if operation == "list":
             asyncio.run(
-                service.list_versions(uuid4(), owner_principal_id=uuid4(), limit=1)
+                service.list_versions(
+                    uuid4(), owner_filter=OwnerFilter.only(uuid4()), limit=1
+                )
             )
         else:
-            asyncio.run(service.get_version(uuid4(), 1, owner_principal_id=uuid4()))
+            asyncio.run(
+                service.get_version(uuid4(), 1, owner_filter=OwnerFilter.only(uuid4()))
+            )
 
 
 @pytest.mark.parametrize("value", (0, -1, True, "1"))
@@ -891,14 +924,16 @@ def test_version_queries_validate_positive_values_before_repository(
     with pytest.raises((InvalidWorkflowListQuery, ValueError)):
         if value is True:
             asyncio.run(
-                service.list_versions(uuid4(), owner_principal_id=uuid4(), limit=value)
+                service.list_versions(
+                    uuid4(), owner_filter=OwnerFilter.only(uuid4()), limit=value
+                )
             )
         else:
             asyncio.run(
                 service.get_version(
                     uuid4(),
                     value,  # type: ignore[arg-type]
-                    owner_principal_id=uuid4(),
+                    owner_filter=OwnerFilter.only(uuid4()),
                 )
             )
     assert repository.version_list_calls == []

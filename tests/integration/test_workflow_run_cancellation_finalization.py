@@ -54,7 +54,7 @@ async def _create_cancelling_run(
 ) -> UUID:
     created = await service.create_run(
         workflow_id,
-        owner_principal_id=owner_id,
+        owner_filter=OwnerFilter.only(owner_id),
         requested_by_principal_id=owner_id,
         selection=LatestWorkflowVersion(),
         input_snapshot=create_workflow_run_input({}, {}),
@@ -136,7 +136,7 @@ async def _verify(database_url: URL) -> None:
         # Cancellation states without their canonical intent fail closed.
         corrupt = await service.create_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=create_workflow_run_input({}, {}),
@@ -152,7 +152,9 @@ async def _verify(database_url: URL) -> None:
 
         # Inspection exposes only canonical metadata, recovery count, and caveats.
         inspected_id = await _create_cancelling_run(service, workflow_id, owner_id)
-        inspected = await service.get_run(inspected_id, owner_principal_id=owner_id)
+        inspected = await service.get_run(
+            inspected_id, owner_filter=OwnerFilter.only(owner_id)
+        )
         assert inspected.cancellation is not None
         assert inspected.cancellation.requested_by_principal_id == owner_id
         assert inspected.cancellation.reason == "operator requested"

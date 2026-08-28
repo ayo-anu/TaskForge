@@ -27,7 +27,7 @@ from taskforge.api.workflows import (
     _encode_version_cursor,
 )
 from taskforge.identity.authentication import APIAuthenticator, WorkerAuthenticator
-from taskforge.identity.authorization import AuthorizationService, Role
+from taskforge.identity.authorization import AuthorizationService, OwnerFilter, Role
 from taskforge.identity.credentials import (
     DEFAULT_VERIFIER_ALGORITHM,
     DEFAULT_VERIFIERS,
@@ -126,12 +126,12 @@ class WorkflowServiceStub:
         self.publish_error: Exception | None = None
         self.version_list_error: Exception | None = None
         self.version_get_error: Exception | None = None
-        self.publish_calls: list[tuple[UUID, UUID]] = []
+        self.publish_calls: list[tuple[UUID, OwnerFilter, UUID]] = []
         self.version_list_calls: list[
-            tuple[UUID, UUID, int, WorkflowVersionPageCursor | None]
+            tuple[UUID, OwnerFilter, int, WorkflowVersionPageCursor | None]
         ] = []
-        self.version_get_calls: list[tuple[UUID, int, UUID]] = []
-        self.list_calls: list[tuple[UUID, int, WorkflowPageCursor | None]] = []
+        self.version_get_calls: list[tuple[UUID, int, OwnerFilter]] = []
+        self.list_calls: list[tuple[OwnerFilter, int, WorkflowPageCursor | None]] = []
 
     async def create(
         self, workflow: WorkflowDraft, *, correlation_id: UUID | None = None
@@ -145,23 +145,26 @@ class WorkflowServiceStub:
         return stored
 
     async def get(
-        self, workflow_id: UUID, *, owner_principal_id: UUID
+        self, workflow_id: UUID, *, owner_filter: OwnerFilter
     ) -> StoredWorkflowDraft:
         if self.get_error:
             raise self.get_error
         stored = self.stored.get(workflow_id)
-        if stored is None or stored.draft.owner_principal_id != owner_principal_id:
+        if stored is None or (
+            not owner_filter.unrestricted
+            and stored.draft.owner_principal_id != owner_filter.principal_id
+        ):
             raise WorkflowNotFound
         return stored
 
     async def list(
         self,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         limit: int,
         cursor: WorkflowPageCursor | None = None,
     ) -> WorkflowPage:
-        self.list_calls.append((owner_principal_id, limit, cursor))
+        self.list_calls.append((owner_filter, limit, cursor))
         if self.list_error:
             raise self.list_error
         return self.page
@@ -170,10 +173,11 @@ class WorkflowServiceStub:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
+        actor_principal_id: UUID,
         correlation_id: UUID | None = None,
     ) -> PublishedWorkflowVersion:
-        self.publish_calls.append((workflow_id, owner_principal_id))
+        self.publish_calls.append((workflow_id, owner_filter, actor_principal_id))
         if self.publish_error:
             raise self.publish_error
         return PublishedWorkflowVersion(uuid4(), workflow_id, 1, datetime.now(UTC))
@@ -182,11 +186,11 @@ class WorkflowServiceStub:
         self,
         workflow_id: UUID,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         limit: int,
         cursor: WorkflowVersionPageCursor | None = None,
     ) -> WorkflowVersionPage:
-        self.version_list_calls.append((workflow_id, owner_principal_id, limit, cursor))
+        self.version_list_calls.append((workflow_id, owner_filter, limit, cursor))
         if self.version_list_error:
             raise self.version_list_error
         return self.version_page
@@ -196,9 +200,9 @@ class WorkflowServiceStub:
         workflow_id: UUID,
         version_number: int,
         *,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> WorkflowVersionSnapshot:
-        self.version_get_calls.append((workflow_id, version_number, owner_principal_id))
+        self.version_get_calls.append((workflow_id, version_number, owner_filter))
         if self.version_get_error:
             raise self.version_get_error
         if self.version_value is None:
@@ -648,7 +652,13 @@ def test_operator_publishes_using_existing_application_result() -> None:
     assert response.status_code == 201
     assert response.json()["workflow_definition_id"] == str(workflow_id)
     assert response.headers["Location"].endswith("/versions/1")
-    assert service.publish_calls == [(workflow_id, runtime.caller_id)]
+    assert service.publish_calls == [
+        (
+            workflow_id,
+            OwnerFilter.only(runtime.caller_id),
+            runtime.caller_id,
+        )
+    ]
 
 
 def test_publish_authorization_and_errors_are_safe() -> None:
@@ -719,7 +729,7 @@ def test_viewer_lists_versions_with_stable_cursor_contract() -> None:
     assert second.status_code == 200
     assert service.version_list_calls[-1] == (
         workflow_id,
-        runtime.caller_id,
+        OwnerFilter.only(runtime.caller_id),
         1,
         WorkflowVersionPageCursor(3),
     )
@@ -777,7 +787,9 @@ def test_viewer_retrieves_complete_version_by_number_only() -> None:
     assert response.json()["dependencies"] == [
         {"predecessor": "first", "successor": "second"}
     ]
-    assert service.version_get_calls == [(workflow_id, 2, runtime.caller_id)]
+    assert service.version_get_calls == [
+        (workflow_id, 2, OwnerFilter.only(runtime.caller_id))
+    ]
     assert (
         request(
             app,
@@ -838,9 +850,9 @@ def test_viewer_lists_only_service_owner_scope_with_default_page_size() -> None:
     assert response.status_code == 200
     assert response.json()["page"] == {"limit": 50, "next_cursor": None}
     assert response.json()["items"][0]["id"] == str(item.id)
-    assert "owner_principal_id" not in response.json()["items"][0]
+    assert "owner_filter" not in response.json()["items"][0]
     assert "steps" not in response.json()["items"][0]
-    assert service.list_calls == [(item.owner_principal_id, 50, None)]
+    assert service.list_calls == [(OwnerFilter.only(item.owner_principal_id), 50, None)]
 
 
 def test_returned_cursor_round_trips_utc_microseconds_and_next_page() -> None:
@@ -865,7 +877,7 @@ def test_returned_cursor_round_trips_utc_microseconds_and_next_page() -> None:
         runtime.api_credential,
     )
     assert second.status_code == 200
-    assert service.list_calls[-1] == (owner_id, 1, decoded)
+    assert service.list_calls[-1] == (OwnerFilter.only(owner_id), 1, decoded)
 
 
 def test_invalid_and_oversized_cursors_fail_before_service_access() -> None:
@@ -954,3 +966,22 @@ def test_cursor_codec_rejects_unsupported_and_naive_payloads() -> None:
         )
         with pytest.raises(ValueError, match="invalid cursor"):
             _decode_cursor(raw)
+
+
+def test_administrator_uses_unrestricted_workflow_scope_and_remains_actor() -> None:
+    app, runtime, service, _ = make_app(frozenset({Role.ADMINISTRATOR.value}))
+    workflow_id = uuid4()
+    assert (
+        request(app, "GET", "/api/v1/workflows", runtime.api_credential).status_code
+        == 200
+    )
+    published = request(
+        app, "POST", f"/api/v1/workflows/{workflow_id}/versions", runtime.api_credential
+    )
+    assert published.status_code == 201
+    assert service.list_calls[-1][0] == OwnerFilter.all_owners()
+    assert service.publish_calls[-1] == (
+        workflow_id,
+        OwnerFilter.all_owners(),
+        runtime.caller_id,
+    )

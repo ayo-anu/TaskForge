@@ -13,6 +13,7 @@ from sqlalchemy import func, insert, select, update
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.runs.domain import (
@@ -76,7 +77,7 @@ async def verify_idempotency(database_url: URL) -> None:
         )
         first = await service.create_idempotent_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=accepted,
@@ -84,7 +85,7 @@ async def verify_idempotency(database_url: URL) -> None:
         )
         replay = await service.create_idempotent_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=accepted,
@@ -97,7 +98,7 @@ async def verify_idempotency(database_url: URL) -> None:
         with pytest.raises(WorkflowRunIdempotencyConflict):
             await service.create_idempotent_run(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
                 requested_by_principal_id=owner_id,
                 selection=LatestWorkflowVersion(),
                 input_snapshot=create_workflow_run_input({"value": 2}, {}),
@@ -125,7 +126,7 @@ async def verify_idempotency(database_url: URL) -> None:
             )
         after_publication = await service.create_idempotent_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=accepted,
@@ -142,7 +143,7 @@ async def verify_idempotency(database_url: URL) -> None:
             )
         after_disable = await service.create_idempotent_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=LatestWorkflowVersion(),
             input_snapshot=accepted,
@@ -152,7 +153,7 @@ async def verify_idempotency(database_url: URL) -> None:
         with pytest.raises(WorkflowRunTargetUnavailable):
             await service.create_idempotent_run(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
                 requested_by_principal_id=owner_id,
                 selection=LatestWorkflowVersion(),
                 input_snapshot=accepted,
@@ -169,7 +170,7 @@ async def verify_idempotency(database_url: URL) -> None:
             *(
                 service.create_idempotent_run(
                     workflow_id,
-                    owner_principal_id=owner_id,
+                    owner_filter=OwnerFilter.only(owner_id),
                     requested_by_principal_id=owner_id,
                     selection=LatestWorkflowVersion(),
                     input_snapshot=create_workflow_run_input({}, {}),
@@ -184,7 +185,7 @@ async def verify_idempotency(database_url: URL) -> None:
         outcomes = await asyncio.gather(
             service.create_idempotent_run(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
                 requested_by_principal_id=owner_id,
                 selection=LatestWorkflowVersion(),
                 input_snapshot=create_workflow_run_input({"side": "a"}, {}),
@@ -192,7 +193,7 @@ async def verify_idempotency(database_url: URL) -> None:
             ),
             service.create_idempotent_run(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
                 requested_by_principal_id=owner_id,
                 selection=LatestWorkflowVersion(),
                 input_snapshot=create_workflow_run_input({"side": "b"}, {}),

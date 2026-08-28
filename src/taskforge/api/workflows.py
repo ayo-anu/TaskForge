@@ -246,7 +246,7 @@ async def list_workflows(
         )
     try:
         page = await _runtime(request).workflow_service.list(
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.VIEW),
             limit=limit,
             cursor=decoded_cursor,
         )
@@ -385,7 +385,8 @@ async def publish_workflow(
     try:
         published = await _runtime(request).workflow_service.publish(
             workflow_id,
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.OPERATE_WORKFLOW),
+            actor_principal_id=context.principal_id,
             correlation_id=cast(UUID, request.state.request_id),
         )
     except WorkflowValidationError as error:
@@ -440,7 +441,7 @@ async def list_workflow_versions(
     try:
         page = await _runtime(request).workflow_service.list_versions(
             workflow_id,
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.VIEW),
             limit=limit,
             cursor=decoded,
         )
@@ -482,7 +483,7 @@ async def get_workflow_version(
         version = await _runtime(request).workflow_service.get_version(
             workflow_id,
             version_number,
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.VIEW),
         )
     except WorkflowNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
@@ -511,7 +512,7 @@ async def get_workflow(
     try:
         stored = await runtime.workflow_service.get(
             workflow_id,
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.VIEW),
         )
     except WorkflowNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error

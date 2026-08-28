@@ -248,7 +248,7 @@ async def start_workflow_run(
         if idempotency_key is None:
             created = await service.create_run(
                 workflow_id,
-                owner_principal_id=context.principal_id,
+                owner_filter=context.owner_filter_for(Permission.OPERATE_WORKFLOW),
                 requested_by_principal_id=context.principal_id,
                 selection=selection,
                 input_snapshot=input_snapshot,
@@ -257,7 +257,7 @@ async def start_workflow_run(
         else:
             created = await service.create_idempotent_run(
                 workflow_id,
-                owner_principal_id=context.principal_id,
+                owner_filter=context.owner_filter_for(Permission.OPERATE_WORKFLOW),
                 requested_by_principal_id=context.principal_id,
                 selection=selection,
                 input_snapshot=input_snapshot,
@@ -453,7 +453,7 @@ async def get_workflow_run(
     try:
         run = await _runtime(request).workflow_run_service.get_run(
             run_id,
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.VIEW),
         )
     except WorkflowRunNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
@@ -482,7 +482,7 @@ async def list_workflow_run_tasks(
     try:
         tasks = await _runtime(request).workflow_run_service.list_task_runs(
             run_id,
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.VIEW),
         )
     except WorkflowRunNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
@@ -511,7 +511,7 @@ async def get_task_run(
     try:
         task = await _runtime(request).workflow_run_service.get_task_run(
             task_run_id,
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.VIEW),
         )
     except TaskRunNotFound as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
@@ -562,7 +562,7 @@ async def list_task_retry_events(
     try:
         page = await _runtime(request).workflow_run_service.list_retry_events(
             task_run_id,
-            owner_principal_id=context.principal_id,
+            owner_filter=context.owner_filter_for(Permission.VIEW),
             limit=limit,
             cursor=decoded,
         )

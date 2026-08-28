@@ -12,6 +12,7 @@ from alembic.config import Config
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.engine import URL
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.identity.schema import api_principals
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
@@ -99,12 +100,12 @@ async def verify_resolution(database_url: URL) -> None:
 
         explicit = await service.resolve_version(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             selection=ExplicitWorkflowVersion(1),
         )
         latest = await service.resolve_version(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             selection=LatestWorkflowVersion(),
         )
         assert explicit.workflow_version_id == version_one_id
@@ -114,13 +115,13 @@ async def verify_resolution(database_url: URL) -> None:
         with pytest.raises(WorkflowRunTargetNotFound):
             await service.resolve_version(
                 workflow_id,
-                owner_principal_id=other_owner_id,
+                owner_filter=OwnerFilter.only(other_owner_id),
                 selection=LatestWorkflowVersion(),
             )
         with pytest.raises(WorkflowVersionUnavailable):
             await service.resolve_version(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
                 selection=ExplicitWorkflowVersion(3),
             )
 
@@ -135,7 +136,7 @@ async def verify_resolution(database_url: URL) -> None:
         with pytest.raises(WorkflowRunTargetUnavailable):
             await service.resolve_version(
                 workflow_id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
                 selection=LatestWorkflowVersion(),
             )
 

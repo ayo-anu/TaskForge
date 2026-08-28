@@ -76,7 +76,7 @@ async def create_failure_source(
 ) -> UUID:
     created = await service.create_run(
         workflow_id,
-        owner_principal_id=owner_id,
+        owner_filter=OwnerFilter.only(owner_id),
         requested_by_principal_id=owner_id,
         selection=ExplicitWorkflowVersion(1),
         input_snapshot=create_workflow_run_input(
@@ -300,7 +300,7 @@ async def verify_eligibility_integrity_and_authorization(database_url: URL) -> N
         owner_id, other_id, simple_id, _, _ = await seed_workflow(sessions)
         simple = await service.create_run(
             simple_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=ExplicitWorkflowVersion(1),
             input_snapshot=create_workflow_run_input({}, {}),
@@ -409,7 +409,7 @@ async def verify_concurrency_and_terminalization(database_url: URL) -> None:
         owner_id, _, workflow_id, _, _ = await seed_workflow(sessions)
         source = await service.create_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=ExplicitWorkflowVersion(1),
             input_snapshot=create_workflow_run_input({}, {}),
@@ -479,7 +479,7 @@ async def verify_atomic_rollback(database_url: URL) -> None:
         owner_id, _, workflow_id, _, _ = await seed_workflow(sessions)
         source = await service.create_run(
             workflow_id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             requested_by_principal_id=owner_id,
             selection=ExplicitWorkflowVersion(1),
             input_snapshot=create_workflow_run_input({}, {}),

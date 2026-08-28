@@ -524,13 +524,13 @@ class SQLAlchemyWorkflowRunRepository:
     async def get_run(
         self,
         run_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> InspectedWorkflowRun | None:
         try:
             async with self._sessions() as session, session.begin():
                 row = (
                     await session.execute(
-                        _run_inspection_statement(run_id, owner_principal_id)
+                        _run_inspection_statement(run_id, owner_filter)
                     )
                 ).one_or_none()
         except DBAPIError as error:
@@ -540,18 +540,18 @@ class SQLAlchemyWorkflowRunRepository:
     async def list_task_runs(
         self,
         run_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> tuple[InspectedTaskRun, ...] | None:
         try:
             async with self._sessions() as session, session.begin():
                 exists = await session.scalar(
-                    _owner_scoped_run_exists_statement(run_id, owner_principal_id)
+                    _owner_scoped_run_exists_statement(run_id, owner_filter)
                 )
                 if not exists:
                     return None
                 rows = (
                     await session.execute(
-                        _task_run_list_statement(run_id, owner_principal_id)
+                        _task_run_list_statement(run_id, owner_filter)
                     )
                 ).all()
         except DBAPIError as error:
@@ -561,13 +561,13 @@ class SQLAlchemyWorkflowRunRepository:
     async def get_task_run(
         self,
         task_run_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
     ) -> InspectedTaskRun | None:
         try:
             async with self._sessions() as session, session.begin():
                 row = (
                     await session.execute(
-                        _task_run_inspection_statement(task_run_id, owner_principal_id)
+                        _task_run_inspection_statement(task_run_id, owner_filter)
                     )
                 ).one_or_none()
         except DBAPIError as error:
@@ -577,7 +577,7 @@ class SQLAlchemyWorkflowRunRepository:
     async def list_retry_events(
         self,
         task_run_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         *,
         limit: int,
         cursor: RetryEventCursor | None,
@@ -585,14 +585,14 @@ class SQLAlchemyWorkflowRunRepository:
         try:
             async with self._sessions() as session, session.begin():
                 if not await session.scalar(
-                    _owner_scoped_task_exists_statement(task_run_id, owner_principal_id)
+                    _owner_scoped_task_exists_statement(task_run_id, owner_filter)
                 ):
                     return None
                 rows = (
                     await session.execute(
                         _retry_event_history_statement(
                             task_run_id,
-                            owner_principal_id,
+                            owner_filter,
                             limit=limit,
                             cursor=cursor,
                         )
@@ -746,12 +746,10 @@ class SQLAlchemyWorkflowRunRepository:
     async def resolve_workflow_version(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         selection: WorkflowVersionSelection,
     ) -> WorkflowVersionResolutionRecord | None:
-        statement = _version_resolution_statement(
-            workflow_id, owner_principal_id, selection
-        )
+        statement = _version_resolution_statement(workflow_id, owner_filter, selection)
         try:
             async with self._sessions() as session, session.begin():
                 row = (await session.execute(statement)).one_or_none()
@@ -812,14 +810,14 @@ class SQLAlchemyWorkflowRunCreationTransaction:
     async def prepare_creation_target(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         selection: WorkflowVersionSelection,
     ) -> PreparedWorkflowRunCreation | None:
         session = self._required_session()
         try:
             definition = (
                 await session.execute(
-                    _definition_lock_statement(workflow_id, owner_principal_id)
+                    _definition_lock_statement(workflow_id, owner_filter)
                 )
             ).one_or_none()
             if definition is None:
@@ -1015,7 +1013,7 @@ class SQLAlchemyWorkflowRunCreationTransaction:
     async def prepare_idempotent_creation(
         self,
         workflow_id: UUID,
-        owner_principal_id: UUID,
+        owner_filter: OwnerFilter,
         principal_id: UUID,
         selection: WorkflowVersionSelection,
         key_digest: str,
@@ -1024,7 +1022,7 @@ class SQLAlchemyWorkflowRunCreationTransaction:
         try:
             definition = (
                 await session.execute(
-                    _definition_lock_statement(workflow_id, owner_principal_id)
+                    _definition_lock_statement(workflow_id, owner_filter)
                 )
             ).one_or_none()
             if definition is None:
@@ -1398,19 +1396,26 @@ async def _append_replay_created_event(
 
 def _definition_lock_statement(
     workflow_id: UUID,
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
 ) -> Select[Any]:
     return (
         select(
             workflow_definitions.c.id,
+            workflow_definitions.c.owner_principal_id,
             workflow_definitions.c.status,
         )
         .where(
             workflow_definitions.c.id == workflow_id,
-            workflow_definitions.c.owner_principal_id == owner_principal_id,
+            _workflow_owner_predicate(owner_filter),
         )
         .with_for_update()
     )
+
+
+def _workflow_owner_predicate(owner_filter: OwnerFilter) -> Any:
+    if owner_filter.unrestricted:
+        return true()
+    return workflow_definitions.c.owner_principal_id == owner_filter.principal_id
 
 
 def _full_replay_source_lock_statement(
@@ -1523,7 +1528,7 @@ def _idempotent_replay_statement(
 
 def _run_inspection_statement(
     run_id: UUID,
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
 ) -> Select[Any]:
     recovered_cancellation_count = (
         select(func.count(task_result_events.c.id))
@@ -1594,14 +1599,14 @@ def _run_inspection_statement(
         )
         .where(
             workflow_runs.c.id == run_id,
-            workflow_definitions.c.owner_principal_id == owner_principal_id,
+            _workflow_owner_predicate(owner_filter),
         )
     )
 
 
 def _owner_scoped_run_exists_statement(
     run_id: UUID,
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
 ) -> Select[Any]:
     return (
         select(workflow_runs.c.id)
@@ -1613,7 +1618,7 @@ def _owner_scoped_run_exists_statement(
         )
         .where(
             workflow_runs.c.id == run_id,
-            workflow_definitions.c.owner_principal_id == owner_principal_id,
+            _workflow_owner_predicate(owner_filter),
         )
     )
 
@@ -1735,7 +1740,7 @@ def _task_run_projection() -> tuple[tuple[Any, ...], Any]:
 
 def _task_run_list_statement(
     run_id: UUID,
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
 ) -> Select[Any]:
     columns, relation = _task_run_projection()
     return (
@@ -1743,7 +1748,7 @@ def _task_run_list_statement(
         .select_from(relation)
         .where(
             task_runs.c.workflow_run_id == run_id,
-            workflow_definitions.c.owner_principal_id == owner_principal_id,
+            _workflow_owner_predicate(owner_filter),
         )
         .order_by(task_runs.c.step_identifier)
     )
@@ -1751,7 +1756,7 @@ def _task_run_list_statement(
 
 def _task_run_inspection_statement(
     task_run_id: UUID,
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
 ) -> Select[Any]:
     columns, relation = _task_run_projection()
     return (
@@ -1759,14 +1764,14 @@ def _task_run_inspection_statement(
         .select_from(relation)
         .where(
             task_runs.c.id == task_run_id,
-            workflow_definitions.c.owner_principal_id == owner_principal_id,
+            _workflow_owner_predicate(owner_filter),
         )
     )
 
 
 def _owner_scoped_task_exists_statement(
     task_run_id: UUID,
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
 ) -> Select[Any]:
     return (
         select(task_runs.c.id)
@@ -1781,14 +1786,14 @@ def _owner_scoped_task_exists_statement(
         )
         .where(
             task_runs.c.id == task_run_id,
-            workflow_definitions.c.owner_principal_id == owner_principal_id,
+            _workflow_owner_predicate(owner_filter),
         )
     )
 
 
 def _retry_event_history_statement(
     task_run_id: UUID,
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
     *,
     limit: int,
     cursor: RetryEventCursor | None,
@@ -1846,7 +1851,7 @@ def _retry_event_history_statement(
         )
         .where(
             task_retry_events.c.task_run_id == task_run_id,
-            workflow_definitions.c.owner_principal_id == owner_principal_id,
+            _workflow_owner_predicate(owner_filter),
         )
     )
     if cursor is not None:
@@ -2616,7 +2621,7 @@ def _creation_snapshot(
 
 def _version_resolution_statement(
     workflow_id: UUID,
-    owner_principal_id: UUID,
+    owner_filter: OwnerFilter,
     selection: WorkflowVersionSelection,
 ) -> Select[Any]:
     version_query = select(
@@ -2641,9 +2646,7 @@ def _version_resolution_statement(
         )
         .select_from(workflow_definitions.outerjoin(selected_version, true()))
         .where(
-            and_(
-                workflow_definitions.c.id == workflow_id,
-                workflow_definitions.c.owner_principal_id == owner_principal_id,
-            )
+            workflow_definitions.c.id == workflow_id,
+            _workflow_owner_predicate(owner_filter),
         )
     )

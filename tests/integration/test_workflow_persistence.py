@@ -14,6 +14,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from taskforge.identity.authorization import OwnerFilter
 from taskforge.identity.schema import api_principals
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.workflows import SQLAlchemyWorkflowRepository
@@ -238,7 +239,7 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         created = await service.create(created_input)
         found = await service.get(
             created_input.id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
         )
         assert found == created
         assert found.draft.steps[0].identifier == "first"
@@ -249,7 +250,8 @@ async def verify_workflow_persistence(database_url: URL) -> None:
 
         first_publication = await service.publish(
             created_input.id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
+            actor_principal_id=owner_id,
         )
         assert first_publication.version_number == 1
         assert first_publication.published_at.tzinfo is not None
@@ -301,7 +303,8 @@ async def verify_workflow_persistence(database_url: URL) -> None:
 
         enabled = await service.set_availability(
             created_input.id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
+            actor_principal_id=owner_id,
             intent=WorkflowAvailabilityIntent.ENABLE,
         )
         assert enabled.status is WorkflowDefinitionStatus.ENABLED
@@ -321,7 +324,8 @@ async def verify_workflow_persistence(database_url: URL) -> None:
             ).one()
         unchanged = await service.set_availability(
             created_input.id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
+            actor_principal_id=owner_id,
             intent=WorkflowAvailabilityIntent.ENABLE,
         )
         assert unchanged.changed is False
@@ -336,14 +340,16 @@ async def verify_workflow_persistence(database_url: URL) -> None:
             )
         disabled = await service.set_availability(
             created_input.id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
+            actor_principal_id=owner_id,
             intent=WorkflowAvailabilityIntent.DISABLE,
         )
         assert disabled.status is WorkflowDefinitionStatus.DISABLED
         assert disabled.changed is True
         await service.set_availability(
             created_input.id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
+            actor_principal_id=owner_id,
             intent=WorkflowAvailabilityIntent.ENABLE,
         )
         async with sessions() as session:
@@ -361,34 +367,39 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         with pytest.raises(WorkflowAvailabilityTransitionRejected):
             await service.set_availability(
                 unpublished.id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
+                actor_principal_id=owner_id,
                 intent=WorkflowAvailabilityIntent.ENABLE,
             )
         with pytest.raises(WorkflowAvailabilityTransitionRejected):
             await service.set_availability(
                 unpublished.id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
+                actor_principal_id=owner_id,
                 intent=WorkflowAvailabilityIntent.DISABLE,
             )
         assert (
-            await service.get(unpublished.id, owner_principal_id=owner_id)
+            await service.get(unpublished.id, owner_filter=OwnerFilter.only(owner_id))
         ).draft.status is WorkflowDefinitionStatus.DRAFT
         with pytest.raises(WorkflowNotFound):
             await service.set_availability(
                 created_input.id,
-                owner_principal_id=other_owner_id,
+                owner_filter=OwnerFilter.only(other_owner_id),
+                actor_principal_id=other_owner_id,
                 intent=WorkflowAvailabilityIntent.DISABLE,
             )
 
         concurrent_availability = await asyncio.gather(
             service.set_availability(
                 created_input.id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
+                actor_principal_id=owner_id,
                 intent=WorkflowAvailabilityIntent.DISABLE,
             ),
             service.set_availability(
                 created_input.id,
-                owner_principal_id=owner_id,
+                owner_filter=OwnerFilter.only(owner_id),
+                actor_principal_id=owner_id,
                 intent=WorkflowAvailabilityIntent.ENABLE,
             ),
         )
@@ -444,11 +455,20 @@ async def verify_workflow_persistence(database_url: URL) -> None:
 
         second_publication = await service.publish(
             created_input.id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
+            actor_principal_id=owner_id,
         )
         concurrent = await asyncio.gather(
-            service.publish(created_input.id, owner_principal_id=owner_id),
-            service.publish(created_input.id, owner_principal_id=owner_id),
+            service.publish(
+                created_input.id,
+                owner_filter=OwnerFilter.only(owner_id),
+                actor_principal_id=owner_id,
+            ),
+            service.publish(
+                created_input.id,
+                owner_filter=OwnerFilter.only(owner_id),
+                actor_principal_id=owner_id,
+            ),
         )
         assert second_publication.version_number == 2
         assert sorted(item.version_number for item in concurrent) == [3, 4]
@@ -456,18 +476,20 @@ async def verify_workflow_persistence(database_url: URL) -> None:
 
         version_page = await service.list_versions(
             created_input.id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             limit=2,
         )
         assert [item.version_number for item in version_page.items] == [4, 3]
         assert version_page.next_cursor is not None
         later_publication = await service.publish(
-            created_input.id, owner_principal_id=owner_id
+            created_input.id,
+            owner_filter=OwnerFilter.only(owner_id),
+            actor_principal_id=owner_id,
         )
         assert later_publication.version_number == 5
         older_page = await service.list_versions(
             created_input.id,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             limit=2,
             cursor=version_page.next_cursor,
         )
@@ -478,7 +500,7 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         historical = await service.get_version(
             created_input.id,
             1,
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
         )
         assert historical.name == created_input.name
         assert [step.identifier for step in historical.steps] == ["first", "second"]
@@ -492,28 +514,31 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         ] == [("first", "second")]
         with pytest.raises(WorkflowNotFound):
             await service.get_version(
-                created_input.id, 1, owner_principal_id=other_owner_id
+                created_input.id, 1, owner_filter=OwnerFilter.only(other_owner_id)
             )
         with pytest.raises(WorkflowNotFound):
             await service.list_versions(
                 created_input.id,
-                owner_principal_id=other_owner_id,
+                owner_filter=OwnerFilter.only(other_owner_id),
                 limit=10,
             )
 
         with pytest.raises(WorkflowNotFound):
             await service.get(
                 created_input.id,
-                owner_principal_id=other_owner_id,
+                owner_filter=OwnerFilter.only(other_owner_id),
             )
         with pytest.raises(WorkflowNotFound):
             await service.publish(
                 created_input.id,
-                owner_principal_id=other_owner_id,
+                owner_filter=OwnerFilter.only(other_owner_id),
+                actor_principal_id=other_owner_id,
             )
-        owner_list = await service.list(owner_principal_id=owner_id, limit=10_000)
+        owner_list = await service.list(
+            owner_filter=OwnerFilter.only(owner_id), limit=10_000
+        )
         other_list = await service.list(
-            owner_principal_id=other_owner_id,
+            owner_filter=OwnerFilter.only(other_owner_id),
             limit=10_000,
         )
         assert {summary.id for summary in owner_list.items} == {
@@ -550,7 +575,11 @@ async def verify_workflow_persistence(database_url: URL) -> None:
                 )
             )
         with pytest.raises(WorkflowValidationError) as publication_error:
-            await service.publish(cyclic.id, owner_principal_id=owner_id)
+            await service.publish(
+                cyclic.id,
+                owner_filter=OwnerFilter.only(owner_id),
+                actor_principal_id=owner_id,
+            )
         assert publication_error.value.graph_result is not None
         assert await count_version_rows(sessions, cyclic.id) == (0, 0, 0)
         async with sessions.begin() as session:
@@ -612,12 +641,14 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         with pytest.raises(WorkflowOwnerDisabled):
             await service.publish(
                 disabled_workflow.id,
-                owner_principal_id=disabled_owner_id,
+                owner_filter=OwnerFilter.only(disabled_owner_id),
+                actor_principal_id=disabled_owner_id,
             )
         with pytest.raises(WorkflowOwnerDisabled):
             await service.set_availability(
                 disabled_workflow.id,
-                owner_principal_id=disabled_owner_id,
+                owner_filter=OwnerFilter.only(disabled_owner_id),
+                actor_principal_id=disabled_owner_id,
                 intent=WorkflowAvailabilityIntent.ENABLE,
             )
         assert await count_version_rows(sessions, disabled_workflow.id) == (0, 0, 0)
@@ -640,11 +671,19 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         same_name = workflow(owner_id)
         await service.create(same_name)
         assert (
-            len((await service.list(owner_principal_id=owner_id, limit=10_000)).items)
+            len(
+                (
+                    await service.list(
+                        owner_filter=OwnerFilter.only(owner_id), limit=10_000
+                    )
+                ).items
+            )
             == 4
         )
 
-        first_page = await service.list(owner_principal_id=owner_id, limit=2)
+        first_page = await service.list(
+            owner_filter=OwnerFilter.only(owner_id), limit=2
+        )
         assert len(first_page.items) == 2
         assert first_page.next_cursor is not None
         initial_ids = {
@@ -656,7 +695,7 @@ async def verify_workflow_persistence(database_url: URL) -> None:
         inserted_between_pages = workflow(owner_id)
         await service.create(inserted_between_pages)
         second_page = await service.list(
-            owner_principal_id=owner_id,
+            owner_filter=OwnerFilter.only(owner_id),
             limit=2,
             cursor=first_page.next_cursor,
         )
@@ -673,7 +712,11 @@ async def verify_workflow_persistence(database_url: URL) -> None:
             await service.create(independent)
         independent_versions = await asyncio.gather(
             *(
-                service.publish(item.id, owner_principal_id=owner_id)
+                service.publish(
+                    item.id,
+                    owner_filter=OwnerFilter.only(owner_id),
+                    actor_principal_id=owner_id,
+                )
                 for item in independent_inputs
             )
         )
