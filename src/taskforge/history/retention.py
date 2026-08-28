@@ -48,6 +48,7 @@ RETENTION_CLASSIFICATIONS = MappingProxyType(
         "api_principal_roles": RetentionClass.CURRENT_STATE_OUTSIDE_RETENTION,
         "api_credentials": RetentionClass.CURRENT_STATE_OUTSIDE_RETENTION,
         "worker_credentials": RetentionClass.CURRENT_STATE_OUTSIDE_RETENTION,
+        "rate_limit_counters": RetentionClass.CURRENT_STATE_OUTSIDE_RETENTION,
     }
 )
 

@@ -38,6 +38,7 @@ from taskforge.persistence.recovery import (
 from taskforge.persistence.retries import SQLAlchemyRetryTransitionRepository
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.persistence.task_results import SQLAlchemyTaskResultRepository
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.recovery.domain import (
     ExpiredClaimCandidate,
     PreparedExpiredClaimRecovery,
@@ -299,7 +300,9 @@ async def exercise_recovery(database_url: URL) -> None:
         lease_seconds=60,
     )
     result_service = TaskResultSubmissionService(
-        SQLAlchemyTaskResultRepository(build_session_factory(engine)), issuer
+        SQLAlchemyTaskResultRepository(build_session_factory(engine)),
+        issuer,
+        rate_limiter=AllowAllRateLimiter(),
     )
     run_service = WorkflowRunService(
         SQLAlchemyWorkflowRunRepository(build_session_factory(engine))
@@ -805,7 +808,9 @@ async def exercise_recovery(database_url: URL) -> None:
             },
         )
         result_service = TaskResultSubmissionService(
-            SQLAlchemyTaskResultRepository(build_session_factory(result_engine)), issuer
+            SQLAlchemyTaskResultRepository(build_session_factory(result_engine)),
+            issuer,
+            rate_limiter=AllowAllRateLimiter(),
         )
         result_context = repository.recovery_transaction()
         result_transaction = await result_context.__aenter__()

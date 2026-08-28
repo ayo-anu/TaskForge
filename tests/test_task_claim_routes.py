@@ -31,6 +31,7 @@ from taskforge.identity.credentials import (
     CredentialScope,
 )
 from taskforge.identity.ports import CredentialRecord
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.runs.domain import TaskRunStatus
 from taskforge.settings import Settings
 
@@ -98,6 +99,7 @@ class Runtime:
         task_claim_inspection_service: TaskClaimInspectionService,
     ) -> None:
         self.api_authenticator = api_authenticator
+        self.rate_limiter = AllowAllRateLimiter()
         self.worker_authenticator = worker_authenticator
         self.authorization_service = authorization_service
         self.task_claim_inspection_service = task_claim_inspection_service

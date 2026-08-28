@@ -24,6 +24,7 @@ from taskforge.identity.credentials import (
 )
 from taskforge.identity.ports import CredentialRecord
 from taskforge.identity.principals import PrincipalProfile, PrincipalProfileService
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.settings import Settings
 
 
@@ -98,6 +99,7 @@ class Runtime:
         principal_profile_service: PrincipalProfileService,
     ) -> None:
         self.api_authenticator = api_authenticator
+        self.rate_limiter = AllowAllRateLimiter()
         self.worker_authenticator = worker_authenticator
         self.authorization_service = authorization_service
         self.principal_profile_service = principal_profile_service

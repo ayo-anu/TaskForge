@@ -15,6 +15,7 @@ from taskforge.api.execution_stream_runtime import (
     SERVICE_FAILURE,
     SLOW_CONSUMER,
     ExecutionStreamCapacityExceeded,
+    ExecutionStreamPrincipalCapacityExceeded,
     ExecutionStreamRuntime,
     ExecutionStreamSubscription,
     ExecutionStreamUnavailable,
@@ -181,10 +182,10 @@ def test_shared_pass_cursor_stays_stable_when_lagging_client_overflows() -> None
         runtime, _ = await started_runtime(repository)
         try:
             a = await runtime.open_subscription(
-                cast(WebSocket, Socket()), run_id, 2, None
+                cast(WebSocket, Socket()), run_id, 2, None, principal_id=uuid4()
             )
             b = await runtime.open_subscription(
-                cast(WebSocket, Socket()), run_id, 5, None
+                cast(WebSocket, Socket()), run_id, 5, None, principal_id=uuid4()
             )
             a.state = SubscriptionState.LIVE
             b.state = SubscriptionState.LIVE
@@ -224,13 +225,13 @@ def test_blocked_slow_socket_cleanup_never_blocks_healthy_fanout() -> None:
         release_send = asyncio.Event()
         slow_socket = Socket(block_close=release_close, block_send=release_send)
         slow = await runtime.open_subscription(
-            cast(WebSocket, slow_socket), run_a, 0, None
+            cast(WebSocket, slow_socket), run_a, 0, None, principal_id=uuid4()
         )
         healthy = await runtime.open_subscription(
-            cast(WebSocket, Socket()), run_a, 0, None
+            cast(WebSocket, Socket()), run_a, 0, None, principal_id=uuid4()
         )
         other = await runtime.open_subscription(
-            cast(WebSocket, Socket()), run_b, 0, None
+            cast(WebSocket, Socket()), run_b, 0, None, principal_id=uuid4()
         )
         slow.state = healthy.state = other.state = SubscriptionState.LIVE
         slow.queue.put_nowait(event(run_a, 99))
@@ -291,7 +292,7 @@ def test_generation_change_at_empty_catchup_read_cannot_create_handoff_gap() -> 
         runtime, _ = await started_runtime(repository, queue_size=4)
         socket = Socket()
         subscription = await runtime.open_subscription(
-            cast(WebSocket, socket), run_id, 0, None
+            cast(WebSocket, socket), run_id, 0, None, principal_id=uuid4()
         )
         supervisor = asyncio.create_task(runtime.serve(subscription))
 
@@ -319,7 +320,7 @@ def test_notification_is_run_scoped_and_capacity_is_bounded() -> None:
         runtime, listener = await started_runtime(repository, max_connections=1)
         try:
             subscription = await runtime.open_subscription(
-                cast(WebSocket, Socket()), run_id, 0, None
+                cast(WebSocket, Socket()), run_id, 0, None, principal_id=uuid4()
             )
             assert listener.callback is not None
             listener.callback(
@@ -338,7 +339,7 @@ def test_notification_is_run_scoped_and_capacity_is_bounded() -> None:
             assert runtime._groups[run_id].generation == 1
             try:
                 await runtime.open_subscription(
-                    cast(WebSocket, Socket()), run_id, 0, None
+                    cast(WebSocket, Socket()), run_id, 0, None, principal_id=uuid4()
                 )
             except ExecutionStreamCapacityExceeded:
                 pass
@@ -359,7 +360,7 @@ def test_sender_is_sequential_and_expiry_uses_supervisor_cleanup() -> None:
         socket = Socket()
         deadline = asyncio.get_running_loop().time()
         subscription = await runtime.open_subscription(
-            cast(WebSocket, socket), run_id, 0, deadline
+            cast(WebSocket, socket), run_id, 0, deadline, principal_id=uuid4()
         )
         subscription.queue.put_nowait(event(run_id, 1))
         subscription.queue.put_nowait(event(run_id, 2))
@@ -379,7 +380,7 @@ def test_send_failure_uses_one_service_failure_cleanup() -> None:
         runtime, _ = await started_runtime(Repository({}), queue_size=2)
         socket = Socket(send_error=RuntimeError("transport failed"))
         subscription = await runtime.open_subscription(
-            cast(WebSocket, socket), run_id, 0, None
+            cast(WebSocket, socket), run_id, 0, None, principal_id=uuid4()
         )
         subscription.queue.put_nowait(event(run_id, 1))
 
@@ -400,7 +401,7 @@ def test_normal_disconnect_cleans_up_without_server_close() -> None:
         socket = Socket()
         socket.receive_block.set()
         subscription = await runtime.open_subscription(
-            cast(WebSocket, socket), run_id, 0, None
+            cast(WebSocket, socket), run_id, 0, None, principal_id=uuid4()
         )
 
         await runtime.serve(subscription)
@@ -419,7 +420,7 @@ def test_shutdown_closes_active_subscription_once_for_service_restart() -> None:
         runtime, _ = await started_runtime(Repository({}))
         socket = Socket()
         subscription = await runtime.open_subscription(
-            cast(WebSocket, socket), run_id, 0, None
+            cast(WebSocket, socket), run_id, 0, None, principal_id=uuid4()
         )
         supervisor = asyncio.create_task(runtime.serve(subscription))
         await wait_until_supervised(subscription)
@@ -440,7 +441,7 @@ def test_competing_termination_signals_release_capacity_and_close_once() -> None
         runtime, _ = await started_runtime(Repository({}), max_connections=1)
         socket = Socket()
         subscription = await runtime.open_subscription(
-            cast(WebSocket, socket), run_id, 0, None
+            cast(WebSocket, socket), run_id, 0, None, principal_id=uuid4()
         )
         runtime._signal_termination(subscription, SLOW_CONSUMER)
         runtime._signal_termination(subscription, SERVICE_FAILURE)
@@ -452,7 +453,7 @@ def test_competing_termination_signals_release_capacity_and_close_once() -> None
         assert socket.close_calls == [(1008, "slow consumer")]
         assert runtime.active_connections == 0
         replacement = await runtime.open_subscription(
-            cast(WebSocket, Socket()), run_id, 0, None
+            cast(WebSocket, Socket()), run_id, 0, None, principal_id=uuid4()
         )
         assert runtime.active_connections == 1
         await runtime.abort_subscription(replacement)
@@ -482,7 +483,9 @@ def test_initial_listener_failure_rejects_until_reconnect_is_usable() -> None:
         await runtime.start()
         assert runtime.listener_ready is False
         try:
-            await runtime.open_subscription(cast(WebSocket, Socket()), uuid4(), 0, None)
+            await runtime.open_subscription(
+                cast(WebSocket, Socket()), uuid4(), 0, None, principal_id=uuid4()
+            )
         except ExecutionStreamUnavailable:
             pass
         else:
@@ -491,7 +494,7 @@ def test_initial_listener_failure_rejects_until_reconnect_is_usable() -> None:
         await connected.wait()
         await wait_until_listener_ready(runtime)
         subscription = await runtime.open_subscription(
-            cast(WebSocket, Socket()), uuid4(), 0, None
+            cast(WebSocket, Socket()), uuid4(), 0, None, principal_id=uuid4()
         )
         assert runtime.active_connections == 1
         await runtime.abort_subscription(subscription)
@@ -538,10 +541,10 @@ def test_same_run_clients_share_coalesced_duplicate_wakeup_reconciliation() -> N
         repository = Repository({run_id: (event(run_id, 1),)})
         runtime, listener = await started_runtime(repository, queue_size=4)
         first = await runtime.open_subscription(
-            cast(WebSocket, Socket()), run_id, 0, None
+            cast(WebSocket, Socket()), run_id, 0, None, principal_id=uuid4()
         )
         second = await runtime.open_subscription(
-            cast(WebSocket, Socket()), run_id, 0, None
+            cast(WebSocket, Socket()), run_id, 0, None, principal_id=uuid4()
         )
         first.state = second.state = SubscriptionState.LIVE
         assert listener.callback is not None
@@ -558,6 +561,54 @@ def test_same_run_clients_share_coalesced_duplicate_wakeup_reconciliation() -> N
         assert [cursor for _, cursor, _ in repository.calls] == [0, 1]
         await runtime.abort_subscription(first)
         await runtime.abort_subscription(second)
+        await runtime.close()
+
+    asyncio.run(exercise())
+
+
+def test_process_local_principal_capacity_is_independent_and_released() -> None:
+    async def exercise() -> None:
+        runtime, _ = await started_runtime(Repository({}), max_connections=20)
+        principal_id = uuid4()
+        subscriptions = [
+            await runtime.open_subscription(
+                cast(WebSocket, Socket()),
+                uuid4(),
+                0,
+                None,
+                principal_id=principal_id,
+            )
+            for _ in range(5)
+        ]
+        try:
+            await runtime.open_subscription(
+                cast(WebSocket, Socket()),
+                uuid4(),
+                0,
+                None,
+                principal_id=principal_id,
+            )
+        except ExecutionStreamPrincipalCapacityExceeded:
+            pass
+        else:
+            raise AssertionError("principal connection cap was not enforced")
+        independent = await runtime.open_subscription(
+            cast(WebSocket, Socket()),
+            uuid4(),
+            0,
+            None,
+            principal_id=uuid4(),
+        )
+        await runtime.abort_subscription(subscriptions.pop())
+        replacement = await runtime.open_subscription(
+            cast(WebSocket, Socket()),
+            uuid4(),
+            0,
+            None,
+            principal_id=principal_id,
+        )
+        for subscription in (*subscriptions, independent, replacement):
+            await runtime.abort_subscription(subscription)
         await runtime.close()
 
     asyncio.run(exercise())

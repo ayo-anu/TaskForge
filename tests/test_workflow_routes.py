@@ -34,6 +34,7 @@ from taskforge.identity.credentials import (
     CredentialScope,
 )
 from taskforge.identity.ports import CredentialRecord
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.settings import Settings
 from taskforge.workflows.dag_validation import (
     DAGEdge,
@@ -226,6 +227,7 @@ class Runtime:
         self.api_authenticator = APIAuthenticator(
             CredentialRepository(api_record), timeout_seconds=0.05
         )
+        self.rate_limiter = AllowAllRateLimiter()
         self.worker_authenticator = WorkerAuthenticator(
             CredentialRepository(worker_record), timeout_seconds=0.05
         )

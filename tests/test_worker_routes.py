@@ -26,6 +26,11 @@ from taskforge.identity.credentials import (
     CredentialScope,
 )
 from taskforge.identity.ports import CredentialRecord
+from taskforge.rate_limits import (
+    AllowAllRateLimiter,
+    RateLimitDecision,
+    RateLimitPolicy,
+)
 from taskforge.settings import Settings
 from taskforge.worker.domain import (
     InspectedWorkerHealth,
@@ -169,6 +174,7 @@ class Runtime:
     ) -> None:
         repository = CredentialRepository(worker_record)
         self.api_authenticator = APIAuthenticator(repository, timeout_seconds=0.05)
+        self.rate_limiter = AllowAllRateLimiter()
         self.worker_authenticator = WorkerAuthenticator(
             repository, timeout_seconds=0.05
         )
@@ -256,7 +262,6 @@ def test_registration_uses_only_authenticated_worker_and_returns_narrow_contract
     None
 ):
     app, worker_value, _, service, authenticated = make_app()
-
     response = post(
         app,
         {"capabilities": ["email", "documents"]},
@@ -273,6 +278,30 @@ def test_registration_uses_only_authenticated_worker_and_returns_narrow_contract
         f"/api/v1/worker-sessions/{service.registered.id}"
     )
     assert service.calls == [(authenticated, ("email", "documents"))]
+
+
+def test_registration_limit_uses_authenticated_worker_identity() -> None:
+    app, worker_value, _, service, authenticated = make_app()
+    expected_worker_id = authenticated.worker_identity_id
+
+    class Limiter:
+        async def check(self, *args: object) -> RateLimitDecision:
+            return RateLimitDecision(True, 1)
+
+        async def consume(
+            self, policy: RateLimitPolicy, kind: str, value: object
+        ) -> RateLimitDecision:
+            assert policy is RateLimitPolicy.WORKER_REGISTER
+            assert kind == "worker_identity"
+            assert value == expected_worker_id
+            return RateLimitDecision(False, 8)
+
+    runtime = app.state.test_runtime
+    runtime.rate_limiter = Limiter()
+    response = post(app, {"capabilities": []}, worker_value)
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "8"
+    assert service.calls == []
 
 
 def test_registration_rejects_identity_session_availability_and_metadata_fields() -> (

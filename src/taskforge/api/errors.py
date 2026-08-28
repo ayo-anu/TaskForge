@@ -66,6 +66,7 @@ ERROR_CONTRACTS = {
     404: ("resource_not_found", "The requested resource was not found."),
     409: ("resource_conflict", "The request conflicts with current state."),
     422: ("validation_failed", "The request is invalid."),
+    429: ("rate_limit_exceeded", "The request rate limit was exceeded."),
     500: ("internal_error", "The service encountered an internal error."),
     503: ("service_unavailable", "The service is temporarily unavailable."),
 }

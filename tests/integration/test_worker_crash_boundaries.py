@@ -40,6 +40,7 @@ from taskforge.persistence.recovery import (
 from taskforge.persistence.retries import SQLAlchemyRetryTransitionRepository
 from taskforge.persistence.task_results import SQLAlchemyTaskResultRepository
 from taskforge.persistence.task_start import SQLAlchemyTaskStartRepository
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.recovery.scanner import RecoveryCandidateScanner
 from taskforge.recovery.service import (
     ExpiredClaimRecoveryOutcome,
@@ -205,7 +206,9 @@ def execution_consumer(
     elif crash_point is CrashPoint.AFTER_CLAIM:
         claim = CrashAfterClaim(claim)
     result: Any = TaskResultSubmissionService(
-        SQLAlchemyTaskResultRepository(sessions), issuer
+        SQLAlchemyTaskResultRepository(sessions),
+        issuer,
+        rate_limiter=AllowAllRateLimiter(),
     )
     if crash_point is CrashPoint.AFTER_RESULT_COMMIT:
         result = CrashAfterResultCommit(result)

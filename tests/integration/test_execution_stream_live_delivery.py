@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from typing import Any, cast
+from uuid import uuid4
 
 import asyncpg
 import pytest
@@ -85,13 +86,13 @@ async def verify_multi_instance_and_listener_recovery(database_url: URL) -> None
         await asyncio.gather(first.start(), second.start())
         assert first.listener_ready and second.listener_ready
         first_subscription = await first.open_subscription(
-            cast(WebSocket, Socket()), run_id, 0, None
+            cast(WebSocket, Socket()), run_id, 0, None, principal_id=uuid4()
         )
         second_subscription = await second.open_subscription(
-            cast(WebSocket, Socket()), run_id, 0, None
+            cast(WebSocket, Socket()), run_id, 0, None, principal_id=uuid4()
         )
         unrelated = await first.open_subscription(
-            cast(WebSocket, Socket()), other_run_id, 0, None
+            cast(WebSocket, Socket()), other_run_id, 0, None, principal_id=uuid4()
         )
         first_subscription.state = SubscriptionState.LIVE
         second_subscription.state = SubscriptionState.LIVE

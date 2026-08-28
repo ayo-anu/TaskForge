@@ -30,6 +30,7 @@ from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
 from taskforge.persistence.database import build_session_factory
 from taskforge.persistence.task_results import SQLAlchemyTaskResultRepository
 from taskforge.persistence.task_start import SQLAlchemyTaskStartRepository
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.worker.consumer_ports import (
     BrokerConsumerUnavailable,
     BrokerDispatchDelivery,
@@ -146,7 +147,11 @@ def execution_consumer(
             lease_seconds=60,
         ),
         TaskStartService(SQLAlchemyTaskStartRepository(sessions)),
-        TaskResultSubmissionService(SQLAlchemyTaskResultRepository(sessions), issuer),
+        TaskResultSubmissionService(
+            SQLAlchemyTaskResultRepository(sessions),
+            issuer,
+            rate_limiter=AllowAllRateLimiter(),
+        ),
         registry(handler),
         worker.authenticated,
         worker.session_id,

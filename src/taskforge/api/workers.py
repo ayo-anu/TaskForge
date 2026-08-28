@@ -15,8 +15,10 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Strict
 from taskforge.api.authentication import authenticate_worker
 from taskforge.api.authorization import require_permission
 from taskforge.api.errors import ErrorDetail, ErrorResponse, error_response
+from taskforge.api.rate_limits import require_rate_limit
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.authorization import AuthorizationContext, Permission
+from taskforge.rate_limits import RateLimitPolicy
 from taskforge.worker.domain import (
     MAX_HEARTBEAT_SEQUENCE,
     MAX_WORKER_CAPABILITIES,
@@ -192,6 +194,12 @@ async def register_worker_session(
         Depends(authenticate_worker),
     ],
 ) -> RegisteredWorkerSessionResponse | Response:
+    await require_rate_limit(
+        request,
+        RateLimitPolicy.WORKER_REGISTER,
+        "worker_identity",
+        authenticated_worker.worker_identity_id,
+    )
     try:
         registered = await _runtime(request).worker_registration_service.register(
             authenticated_worker,

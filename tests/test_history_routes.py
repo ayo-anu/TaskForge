@@ -26,6 +26,7 @@ from taskforge.identity.authentication import APIAuthenticator, WorkerAuthentica
 from taskforge.identity.authorization import AuthorizationService, OwnerFilter, Role
 from taskforge.identity.credentials import DEFAULT_VERIFIER_ALGORITHM, DEFAULT_VERIFIERS
 from taskforge.identity.ports import CredentialRecord
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.settings import Settings
 
 
@@ -149,6 +150,7 @@ class Runtime:
         history: HistoryServiceStub,
     ) -> None:
         self.api_authenticator = authenticator
+        self.rate_limiter = AllowAllRateLimiter()
         self.worker_authenticator = WorkerAuthenticator(
             WorkerCredentialRepository(), timeout_seconds=0.05
         )

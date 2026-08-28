@@ -22,6 +22,7 @@ from taskforge.correlation import is_valid_correlation_id
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.metrics import add as add_metric
 from taskforge.persistence.audit import RejectedAuditRecorder
+from taskforge.rate_limits import RateLimitGate, RateLimitPolicy
 from taskforge.tracing import set_attributes, set_error, span
 from taskforge.worker.result_persistence_ports import (
     PersistableTaskResult,
@@ -79,6 +80,12 @@ class TaskResultInvariantError(Exception): ...
 class TaskResultServiceUnavailable(Exception): ...
 
 
+class TaskResultRateLimited(Exception):
+    def __init__(self, retry_after_seconds: int) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__("task result submission rate limited")
+
+
 _RESULT_AUDIT_REASONS: dict[type[Exception], str] = {
     TaskResultAuthorityRejected: "worker_authority_rejected",
     TaskResultNotFound: "result_target_not_found",
@@ -126,9 +133,12 @@ class TaskResultSubmissionService:
         repository: TaskResultRepository,
         authority_issuer: TaskClaimResultAuthorityIssuer,
         rejected_audit: RejectedAuditRecorder | None = None,
+        *,
+        rate_limiter: RateLimitGate,
     ) -> None:
         self._repository = repository
         self._authority_issuer = authority_issuer
+        self._rate_limiter = rate_limiter
         self._rejected_audit = rejected_audit
 
     async def submit_result(
@@ -137,6 +147,17 @@ class TaskResultSubmissionService:
         worker_session_id: UUID,
         request: TaskResultSubmissionRequest,
     ) -> TaskResultSubmissionReceipt:
+        rate_decision = await self._rate_limiter.consume(
+            RateLimitPolicy.WORKER_RESULT,
+            "worker_identity",
+            authenticated_worker.worker_identity_id,
+        )
+        if not rate_decision.allowed:
+            add_metric(
+                "taskforge.task.result_submissions",
+                attributes={"taskforge.outcome": "rate_limited"},
+            )
+            raise TaskResultRateLimited(rate_decision.retry_after_seconds)
         with span(
             "taskforge.result.submit",
             attributes={

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Annotated, Protocol, cast
+from uuid import UUID
 
 from fastapi import HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -41,6 +42,7 @@ from taskforge.persistence.execution_events import (
 )
 from taskforge.persistence.history import SQLAlchemyHistoryRepository
 from taskforge.persistence.principals import SQLAlchemyPrincipalProfileRepository
+from taskforge.persistence.rate_limits import SQLAlchemyRateLimitRepository
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
 from taskforge.persistence.workers import (
     SQLAlchemyWorkerCapabilityRepository,
@@ -49,6 +51,13 @@ from taskforge.persistence.workers import (
     SQLAlchemyWorkerRegistrationRepository,
 )
 from taskforge.persistence.workflows import SQLAlchemyWorkflowRepository
+from taskforge.rate_limits import (
+    BoundedLocalRateLimiter,
+    RateLimit,
+    RateLimiter,
+    RateLimitPolicy,
+    rate_limiter_for,
+)
 from taskforge.runs.persistence_ports import WorkflowRunExecutionEventRepository
 from taskforge.runs.service import WorkflowRunService
 from taskforge.settings import Settings
@@ -70,6 +79,7 @@ class AuthenticationRuntimeProtocol(Protocol):
 
     api_authenticator: APIAuthenticator
     worker_authenticator: WorkerAuthenticator
+    rate_limiter: RateLimiter
 
     async def close(self) -> None:
         """Release authentication persistence resources."""
@@ -97,6 +107,7 @@ class AuthenticationRuntime:
         workflow_run_execution_event_repository: WorkflowRunExecutionEventRepository,
         history_service: HistoryService,
         history_export_service: HistoryExportService,
+        rate_limiter: RateLimiter,
     ) -> None:
         self._engine = engine
         self.api_authenticator = api_authenticator
@@ -117,6 +128,7 @@ class AuthenticationRuntime:
         )
         self.history_service = history_service
         self.history_export_service = history_export_service
+        self.rate_limiter = rate_limiter
 
     @property
     def engine(self) -> AsyncEngine:
@@ -134,6 +146,46 @@ def build_authentication_runtime(
     """Compose separate API and worker authentication services."""
     engine = build_async_engine(settings)
     sessions = build_session_factory(engine)
+    rate_limits = {
+        RateLimitPolicy.API_AUTH_NETWORK: RateLimit(
+            settings.api_auth_network_failures_per_minute, 60
+        ),
+        RateLimitPolicy.API_AUTH_CREDENTIAL: RateLimit(
+            settings.api_auth_credential_failures_per_five_minutes, 300
+        ),
+        RateLimitPolicy.WORKER_AUTH_NETWORK: RateLimit(
+            settings.worker_auth_network_failures_per_minute, 60
+        ),
+        RateLimitPolicy.WORKER_AUTH_CREDENTIAL: RateLimit(
+            settings.worker_auth_credential_failures_per_five_minutes, 300
+        ),
+        RateLimitPolicy.RUN_CREATE: RateLimit(settings.run_creations_per_minute, 60),
+        RateLimitPolicy.RUN_REPLAY: RateLimit(settings.run_replays_per_minute, 60),
+        RateLimitPolicy.DEAD_LETTER_REDRIVE: RateLimit(
+            settings.dead_letter_redrives_per_minute, 60
+        ),
+        RateLimitPolicy.WORKER_REGISTER: RateLimit(
+            settings.worker_registrations_per_minute, 60
+        ),
+        RateLimitPolicy.WORKER_RESULT: RateLimit(
+            settings.worker_results_per_minute, 60
+        ),
+        RateLimitPolicy.WEBSOCKET_NETWORK: RateLimit(
+            settings.websocket_connections_per_network_minute, 60
+        ),
+        RateLimitPolicy.WEBSOCKET_PRINCIPAL: RateLimit(
+            settings.websocket_connections_per_principal_minute, 60
+        ),
+    }
+    rate_limiter = RateLimiter(
+        SQLAlchemyRateLimitRepository(
+            sessions,
+            timeout_seconds=settings.rate_limit_timeout_seconds,
+            cleanup_retention_seconds=settings.rate_limit_cleanup_retention_seconds,
+        ),
+        BoundedLocalRateLimiter(capacity=settings.rate_limit_fallback_capacity),
+        rate_limits,
+    )
     return AuthenticationRuntime(
         engine=engine,
         api_authenticator=APIAuthenticator(
@@ -197,6 +249,7 @@ def build_authentication_runtime(
         history_export_service=HistoryExportService(
             SQLAlchemyHistoryRepository(sessions), AuditUnitOfWork(sessions)
         ),
+        rate_limiter=rate_limiter,
     )
 
 
@@ -206,10 +259,32 @@ async def authenticate_api_principal(
 ) -> AuthenticatedAPIPrincipal:
     """Authenticate an API Bearer value without applying authorization policy."""
     runtime = _runtime(request)
-    credential = _extract_credential(authorization)
+    source = _network_source(request)
+    await _reject_if_blocked(
+        runtime, RateLimitPolicy.API_AUTH_NETWORK, "network", source
+    )
+    try:
+        credential = _extract_credential(authorization)
+    except HTTPException:
+        await _consume_failed_authentication(
+            runtime, RateLimitPolicy.API_AUTH_NETWORK, source, None
+        )
+        raise
+    await _reject_if_blocked(
+        runtime,
+        RateLimitPolicy.API_AUTH_CREDENTIAL,
+        "credential",
+        credential.credential_id,
+    )
     try:
         return await authenticate_api_credential(runtime, credential)
     except AuthenticationFailure as error:
+        await _consume_failed_authentication(
+            runtime,
+            RateLimitPolicy.API_AUTH_NETWORK,
+            source,
+            (RateLimitPolicy.API_AUTH_CREDENTIAL, credential.credential_id),
+        )
         raise _credential_rejected() from error
     except AuthenticationUnavailable as error:
         raise _authentication_unavailable() from error
@@ -229,10 +304,32 @@ async def authenticate_worker(
 ) -> AuthenticatedWorker:
     """Authenticate a worker Bearer value without trusting a claimed identity."""
     runtime = _runtime(request)
-    credential = _extract_credential(authorization)
+    source = _network_source(request)
+    await _reject_if_blocked(
+        runtime, RateLimitPolicy.WORKER_AUTH_NETWORK, "network", source
+    )
+    try:
+        credential = _extract_credential(authorization)
+    except HTTPException:
+        await _consume_failed_authentication(
+            runtime, RateLimitPolicy.WORKER_AUTH_NETWORK, source, None
+        )
+        raise
+    await _reject_if_blocked(
+        runtime,
+        RateLimitPolicy.WORKER_AUTH_CREDENTIAL,
+        "credential",
+        credential.credential_id,
+    )
     try:
         return await runtime.worker_authenticator.authenticate(credential)
     except AuthenticationFailure as error:
+        await _consume_failed_authentication(
+            runtime,
+            RateLimitPolicy.WORKER_AUTH_NETWORK,
+            source,
+            (RateLimitPolicy.WORKER_AUTH_CREDENTIAL, credential.credential_id),
+        )
         raise _credential_rejected() from error
     except AuthenticationUnavailable as error:
         raise _authentication_unavailable() from error
@@ -258,6 +355,47 @@ def _credential_rejected() -> HTTPException:
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="authentication required",
         headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _network_source(request: Request) -> str:
+    client = request.client
+    return client.host if client is not None else "unknown"
+
+
+async def _reject_if_blocked(
+    runtime: AuthenticationRuntimeProtocol,
+    policy: RateLimitPolicy,
+    kind: str,
+    value: str | UUID,
+) -> None:
+    decision = await rate_limiter_for(runtime).check(policy, kind, value)
+    if not decision.allowed:
+        raise _rate_limited(decision.retry_after_seconds)
+
+
+async def _consume_failed_authentication(
+    runtime: AuthenticationRuntimeProtocol,
+    network_policy: RateLimitPolicy,
+    source: str,
+    credential: tuple[RateLimitPolicy, UUID] | None,
+) -> None:
+    limiter = rate_limiter_for(runtime)
+    decisions = [await limiter.consume(network_policy, "network", source)]
+    if credential is not None:
+        decisions.append(
+            await limiter.consume(credential[0], "credential", credential[1])
+        )
+    rejected = [decision for decision in decisions if not decision.allowed]
+    if rejected:
+        raise _rate_limited(max(item.retry_after_seconds for item in rejected))
+
+
+def _rate_limited(retry_after_seconds: int) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="request rate limit exceeded",
+        headers={"Retry-After": str(max(1, retry_after_seconds))},
     )
 
 

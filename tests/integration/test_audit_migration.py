@@ -21,6 +21,7 @@ from taskforge.dead_letters.service import DeadLetterNotFound, DeadLetterService
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.persistence.audit import RejectedAuditUnitOfWork
 from taskforge.persistence.database import build_session_factory
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.runs.service import WorkflowRunService, WorkflowRunServiceUnavailable
 from taskforge.worker.result_submission import (
     TaskResultAuthorityRejected,
@@ -207,7 +208,9 @@ async def assert_all_rejected_families_fail_closed(database_url: object) -> None
                 TaskStartRequest(uuid4(), resource_id, 1, str(correlation_id)),
             )
 
-        result = TaskResultSubmissionService(Any, Any, recorder)  # type: ignore[arg-type]
+        result = TaskResultSubmissionService(  # type: ignore[arg-type]
+            Any, Any, recorder, rate_limiter=AllowAllRateLimiter()
+        )
         with pytest.raises(TaskResultServiceUnavailable):
             await result._audit_rejection(
                 authenticated,

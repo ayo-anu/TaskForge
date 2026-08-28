@@ -209,6 +209,10 @@ _ALLOWED_ATTRIBUTE_VALUES: Final[dict[str, frozenset[str]]] = {
             "infrastructure_failure",
             "not_found",
             "limit_exceeded",
+            "limited",
+            "degraded_allowed",
+            "degraded_limited",
+            "rate_limited",
         }
     ),
     "taskforge.result.kind": frozenset(
@@ -237,6 +241,21 @@ _ALLOWED_ATTRIBUTE_VALUES: Final[dict[str, frozenset[str]]] = {
     "taskforge.recovery.kind": frozenset({"expired_claim", "stale_worker_session"}),
     "taskforge.reason": frozenset({"permanent_failure", "retry_exhausted"}),
     "taskforge.operation": frozenset({"acknowledge", "resolve", "redrive"}),
+    "taskforge.rate_limit.policy": frozenset(
+        {
+            "api_auth_network",
+            "api_auth_credential",
+            "worker_auth_network",
+            "worker_auth_credential",
+            "run_create",
+            "run_replay",
+            "dead_letter_redrive",
+            "worker_register",
+            "worker_result",
+            "websocket_network",
+            "websocket_principal",
+        }
+    ),
     "taskforge.disconnect.kind": frozenset(
         {
             "client",
@@ -305,6 +324,10 @@ _INSTRUMENT_ATTRIBUTE_KEYS: Final[dict[str, frozenset[str]]] = {
     "taskforge.websocket.connection.duration": frozenset({"taskforge.disconnect.kind"}),
     "taskforge.websocket.disconnections": frozenset({"taskforge.disconnect.kind"}),
     "taskforge.websocket.resume.outcomes": frozenset({"taskforge.outcome"}),
+    "taskforge.rate_limit.decisions": frozenset(
+        {"taskforge.rate_limit.policy", "taskforge.outcome"}
+    ),
+    "taskforge.rate_limit.cleanup_failures": frozenset(),
     "taskforge.dependency.state.transitions": frozenset(
         {"taskforge.dependency", "taskforge.dependency.state"}
     ),
@@ -507,6 +530,18 @@ _allow(
     "service_unavailable",
     "capacity_rejected",
     "resume_rejected",
+    "rate_limited",
+)
+_ATTRIBUTE_VALUES_BY_INSTRUMENT_KEY[
+    ("taskforge.rate_limit.decisions", "taskforge.rate_limit.policy")
+] = _ALLOWED_ATTRIBUTE_VALUES["taskforge.rate_limit.policy"]
+_allow(
+    "taskforge.rate_limit.decisions",
+    "taskforge.outcome",
+    "allowed",
+    "limited",
+    "degraded_allowed",
+    "degraded_limited",
 )
 for _disconnect_name in (
     "taskforge.websocket.connection.duration",

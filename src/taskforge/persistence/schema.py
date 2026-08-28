@@ -1,5 +1,6 @@
 """Register every relational schema with Taskforge's shared metadata."""
 
+from taskforge import rate_limits_schema
 from taskforge.audit import schema as audit_schema
 from taskforge.dead_letters import schema as dead_letter_schema
 from taskforge.identity import schema as identity_schema
@@ -17,3 +18,4 @@ assert identity_schema.api_principals is not None
 assert run_schema.workflow_runs is not None
 assert worker_schema.worker_sessions is not None
 assert workflow_schema.workflow_definitions is not None
+assert rate_limits_schema.rate_limit_counters is not None

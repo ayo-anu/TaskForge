@@ -28,6 +28,11 @@ from taskforge.identity.credentials import (
     CredentialScope,
 )
 from taskforge.identity.ports import CredentialRecord
+from taskforge.rate_limits import (
+    AllowAllRateLimiter,
+    RateLimitDecision,
+    RateLimitPolicy,
+)
 from taskforge.runs.domain import (
     InspectedWorkflowRun,
     StoredWorkflowRunExecutionEvent,
@@ -162,6 +167,7 @@ class Runtime:
         run_service: RunServiceStub,
     ) -> None:
         self.api_authenticator = api_authenticator
+        self.rate_limiter = AllowAllRateLimiter()
         self.worker_authenticator = WorkerAuthenticator(
             CredentialRepository(None), timeout_seconds=0.05
         )
@@ -325,6 +331,24 @@ def test_authenticated_owner_handshake_and_clean_disconnect() -> None:
     assert runtime.workflow_run_service.calls == [
         (run_id, OwnerFilter.only(principal_id))
     ]
+
+
+def test_connection_rate_limit_rejects_before_resource_authorization() -> None:
+    class Limiter:
+        async def check(self, *args: object) -> RateLimitDecision:
+            return RateLimitDecision(True, 1)
+
+        async def consume(
+            self, policy: RateLimitPolicy, kind: str, value: object
+        ) -> RateLimitDecision:
+            assert policy is RateLimitPolicy.WEBSOCKET_NETWORK
+            assert kind == "network"
+            return RateLimitDecision(False, 11)
+
+    app, runtime, credential, _, run_id = make_app()
+    runtime.rate_limiter = Limiter()
+    assert_denied(app, run_id, credential, code=1013, reason="try again later")
+    assert runtime.workflow_run_service.calls == []
 
 
 @pytest.mark.parametrize("credential", [None, "malformed", "Basic secret"])

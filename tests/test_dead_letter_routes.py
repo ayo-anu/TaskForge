@@ -27,6 +27,7 @@ from taskforge.dead_letters.domain import (
 from taskforge.dead_letters.persistence_ports import DeadLetterTransitionConflict
 from taskforge.dead_letters.service import DeadLetterNotFound
 from taskforge.identity.authorization import OwnerFilter, Role
+from taskforge.rate_limits import RateLimitDecision, RateLimitPolicy
 from taskforge.worker.results import TaskExecutionFailureKind, TaskExecutionResultKind
 from tests.test_run_routes import Runtime, make_app, request
 
@@ -263,6 +264,33 @@ def test_redrive_returns_lineage_location_and_owner_scope() -> None:
     assert call[3]["reason"] == "corrected configuration"
     assert call[3]["idempotency_key"] == "abcdefghijklmnop"
     assert "idempotency" not in response.text
+
+
+def test_redrive_limit_precedes_resource_lookup() -> None:
+    class Limiter:
+        async def check(self, *args: object) -> RateLimitDecision:
+            return RateLimitDecision(True, 1)
+
+        async def consume(
+            self, policy: RateLimitPolicy, kind: str, value: object
+        ) -> RateLimitDecision:
+            assert policy is RateLimitPolicy.DEAD_LETTER_REDRIVE
+            assert kind == "api_principal"
+            return RateLimitDecision(False, 13)
+
+    app, runtime, service = dlq_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    runtime.rate_limiter = Limiter()
+    response = request(
+        app,
+        "POST",
+        f"/api/v1/dead-letters/{uuid4()}/redrive",
+        runtime.api_credential,
+        json={},
+        headers={"Idempotency-Key": "abcdefghijklmnop"},
+    )
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "13"
+    assert service.calls == []
 
 
 def test_admin_redrive_uses_unrestricted_scope() -> None:

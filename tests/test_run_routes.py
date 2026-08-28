@@ -22,6 +22,11 @@ from taskforge.identity.credentials import (
     CredentialScope,
 )
 from taskforge.identity.ports import CredentialRecord
+from taskforge.rate_limits import (
+    AllowAllRateLimiter,
+    RateLimitDecision,
+    RateLimitPolicy,
+)
 from taskforge.retries.domain import (
     InspectedRetryEvent,
     InspectedRetryEventPage,
@@ -419,6 +424,7 @@ class Runtime:
         self.api_authenticator = APIAuthenticator(
             CredentialRepository(api_record), timeout_seconds=0.05
         )
+        self.rate_limiter = AllowAllRateLimiter()
         self.worker_authenticator = WorkerAuthenticator(
             CredentialRepository(worker_record), timeout_seconds=0.05
         )
@@ -519,6 +525,39 @@ def test_keyless_latest_start_uses_non_idempotent_path_and_minimal_response() ->
         "status",
         "created_at",
     }
+
+
+def test_run_creation_and_replay_are_limited_before_service_lookup() -> None:
+    class Limiter:
+        async def check(self, *args: object) -> RateLimitDecision:
+            return RateLimitDecision(True, 1)
+
+        async def consume(
+            self, policy: RateLimitPolicy, kind: str, value: object
+        ) -> RateLimitDecision:
+            assert kind == "api_principal"
+            assert policy in {RateLimitPolicy.RUN_CREATE, RateLimitPolicy.RUN_REPLAY}
+            return RateLimitDecision(False, 17)
+
+    app, runtime, service = make_app(frozenset({Role.WORKFLOW_OPERATOR.value}))
+    runtime.rate_limiter = Limiter()
+    create = request(
+        app,
+        "POST",
+        f"/api/v1/workflows/{uuid4()}/runs",
+        runtime.api_credential,
+        json={},
+    )
+    replay = request(
+        app,
+        "POST",
+        f"/api/v1/workflow-runs/{uuid4()}/replay",
+        runtime.api_credential,
+        json={"mode": "full"},
+    )
+    assert [create.status_code, replay.status_code] == [429, 429]
+    assert create.headers["Retry-After"] == replay.headers["Retry-After"] == "17"
+    assert service.calls == []
 
 
 def test_supplied_key_uses_idempotent_explicit_path_without_normalization() -> None:

@@ -61,6 +61,7 @@ from taskforge.worker.result_submission import (
     TaskResultInvalidState,
     TaskResultInvariantError,
     TaskResultNotFound,
+    TaskResultRateLimited,
     TaskResultServiceUnavailable,
     TaskResultStale,
     TaskResultSubmissionOutcome,
@@ -417,6 +418,16 @@ class WorkerExecutionConsumer:
             )
             raise WorkerConsumptionPaused(
                 "task result persistence failed closed"
+            ) from error
+        except TaskResultRateLimited as error:
+            log_event(
+                logger,
+                logging.WARNING,
+                "worker.result.rate_limited",
+                {"outcome": "paused", "error.retryable": True},
+            )
+            raise WorkerConsumptionPaused(
+                "task result submission rate limited"
             ) from error
         except (
             TaskResultAuthorityRejected,

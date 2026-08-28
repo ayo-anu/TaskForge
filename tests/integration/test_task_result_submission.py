@@ -19,6 +19,7 @@ from taskforge.dispatch.envelope import DispatchEnvelope
 from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
 from taskforge.persistence.database import build_session_factory
 from taskforge.persistence.task_results import SQLAlchemyTaskResultRepository
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.worker.result_submission import (
     TaskResultConflict,
     TaskResultServiceUnavailable,
@@ -100,7 +101,9 @@ async def exercise_results(database_url: URL) -> None:
         lease_seconds=60,
     )
     result_service = TaskResultSubmissionService(
-        SQLAlchemyTaskResultRepository(sessions), issuer
+        SQLAlchemyTaskResultRepository(sessions),
+        issuer,
+        rate_limiter=AllowAllRateLimiter(),
     )
     try:
         worker, dispatch, issued = await claimed_running_task(setup, claim_service)

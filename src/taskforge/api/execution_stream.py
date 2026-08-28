@@ -17,6 +17,7 @@ from taskforge.api.authentication import (
 )
 from taskforge.api.execution_stream_runtime import (
     ExecutionStreamCapacityExceeded,
+    ExecutionStreamPrincipalCapacityExceeded,
     ExecutionStreamRuntime,
     ExecutionStreamUnavailable,
 )
@@ -36,6 +37,7 @@ from taskforge.identity.credentials import (
     parse_presented_credential,
 )
 from taskforge.metrics import add as add_metric
+from taskforge.rate_limits import RateLimitPolicy, rate_limiter_for
 from taskforge.runs.domain import (
     StoredWorkflowRunExecutionEvent,
     WorkflowRunExecutionEventResumeState,
@@ -128,9 +130,73 @@ async def workflow_run_execution_stream(
 ) -> None:
     """Accept only API principals allowed to inspect the requested owned run."""
     runtime = cast(ExecutionStreamRuntimeProtocol, websocket.app.state.authentication)
+    limiter = rate_limiter_for(runtime)
+    client = getattr(websocket, "client", None)
+    source = client.host if client is not None else "unknown"
+    network_connection = await limiter.consume(
+        RateLimitPolicy.WEBSOCKET_NETWORK, "network", source
+    )
+    if not network_connection.allowed:
+        await _close_rate_limited(websocket)
+        return
+    network_authentication = await limiter.check(
+        RateLimitPolicy.API_AUTH_NETWORK, "network", source
+    )
+    if not network_authentication.allowed:
+        await _close_rate_limited(websocket)
+        return
+    credential: PresentedCredential | None = None
     try:
         credential = _bearer_credential(websocket.headers.get("Authorization"))
+        credential_id = getattr(credential, "credential_id", None)
+        if isinstance(credential_id, UUID):
+            credential_authentication = await limiter.check(
+                RateLimitPolicy.API_AUTH_CREDENTIAL,
+                "credential",
+                credential_id,
+            )
+            if not credential_authentication.allowed:
+                await _close_rate_limited(websocket)
+                return
         identity = await authenticate_api_credential(runtime, credential)
+    except (CredentialFormatError, AuthenticationFailure):
+        decisions = [
+            await limiter.consume(RateLimitPolicy.API_AUTH_NETWORK, "network", source)
+        ]
+        credential_id = getattr(credential, "credential_id", None)
+        if isinstance(credential_id, UUID):
+            decisions.append(
+                await limiter.consume(
+                    RateLimitPolicy.API_AUTH_CREDENTIAL,
+                    "credential",
+                    credential_id,
+                )
+            )
+        if any(not decision.allowed for decision in decisions):
+            await _close_rate_limited(websocket)
+            return
+        _record_connection_attempt("policy_rejected")
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason=POLICY_REJECTION_REASON,
+        )
+        return
+    except AuthenticationUnavailable:
+        _record_connection_attempt("service_unavailable")
+        await websocket.close(
+            code=status.WS_1011_INTERNAL_ERROR,
+            reason=SERVICE_REJECTION_REASON,
+        )
+        return
+    principal_connection = await limiter.consume(
+        RateLimitPolicy.WEBSOCKET_PRINCIPAL,
+        "api_principal",
+        identity.principal_id,
+    )
+    if not principal_connection.allowed:
+        await _close_rate_limited(websocket)
+        return
+    try:
         expiry_deadline = _credential_expiry_deadline(identity)
         context = await runtime.authorization_service.context_for(identity)
         context.require(Permission.VIEW)
@@ -140,8 +206,6 @@ async def workflow_run_execution_stream(
             owner_filter=context.owner_filter_for(Permission.VIEW),
         )
     except (
-        CredentialFormatError,
-        AuthenticationFailure,
         AuthorizationDenied,
         WorkflowRunNotFound,
         _InvalidRunIdentifier,
@@ -153,7 +217,6 @@ async def workflow_run_execution_stream(
         )
         return
     except (
-        AuthenticationUnavailable,
         AuthorizationUnavailable,
         WorkflowRunInspectionInvariantError,
         WorkflowRunServiceUnavailable,
@@ -238,6 +301,7 @@ async def workflow_run_execution_stream(
                 run_id,
                 last_delivered_cursor,
                 expiry_deadline,
+                principal_id=identity.principal_id,
             )
         except ExecutionStreamUnavailable:
             _record_connection_attempt("service_unavailable")
@@ -246,7 +310,10 @@ async def workflow_run_execution_stream(
                 reason=SERVICE_REJECTION_REASON,
             )
             return
-        except ExecutionStreamCapacityExceeded:
+        except (
+            ExecutionStreamCapacityExceeded,
+            ExecutionStreamPrincipalCapacityExceeded,
+        ):
             _record_connection_attempt("capacity_rejected")
             await websocket.close(
                 code=status.WS_1013_TRY_AGAIN_LATER,
@@ -435,6 +502,17 @@ async def _close_accepted_for_service_failure(websocket: WebSocket) -> None:
         await websocket.close(
             code=status.WS_1011_INTERNAL_ERROR,
             reason=SERVICE_REJECTION_REASON,
+        )
+    except (RuntimeError, WebSocketDisconnect):
+        return
+
+
+async def _close_rate_limited(websocket: WebSocket) -> None:
+    _record_connection_attempt("rate_limited")
+    try:
+        await websocket.close(
+            code=status.WS_1013_TRY_AGAIN_LATER,
+            reason="try again later",
         )
     except (RuntimeError, WebSocketDisconnect):
         return

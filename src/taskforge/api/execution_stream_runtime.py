@@ -45,6 +45,10 @@ class ExecutionStreamCapacityExceeded(Exception):
     """The bounded local subscription capacity has been reached."""
 
 
+class ExecutionStreamPrincipalCapacityExceeded(Exception):
+    """One principal reached its process-local live subscription capacity."""
+
+
 class SubscriptionState(StrEnum):
     CATCHING_UP = "catching_up"
     LIVE = "live"
@@ -105,6 +109,7 @@ ListenerFactory = Callable[[], Any]
 class ExecutionStreamSubscription:
     id: UUID
     workflow_run_id: UUID
+    principal_id: UUID
     websocket: WebSocket
     queue: asyncio.Queue[StoredWorkflowRunExecutionEvent]
     last_queued_cursor: int
@@ -145,6 +150,7 @@ class ExecutionStreamRuntime:
         self._availability_changed = availability_changed
         self._groups: dict[UUID, _RunGroup] = {}
         self._active_connections = 0
+        self._principal_connections: dict[UUID, int] = {}
         self._listener_ready = False
         self._listener_observed = False
         self._stopping = False
@@ -174,16 +180,24 @@ class ExecutionStreamRuntime:
         workflow_run_id: UUID,
         baseline_cursor: int,
         expiry_deadline: float | None,
+        *,
+        principal_id: UUID,
     ) -> ExecutionStreamSubscription:
         if self._stopping or not self._listener_ready:
             raise ExecutionStreamUnavailable
         if self._active_connections >= self._settings.execution_stream_max_connections:
             raise ExecutionStreamCapacityExceeded
+        if (
+            self._principal_connections.get(principal_id, 0)
+            >= self._settings.execution_stream_max_connections_per_principal
+        ):
+            raise ExecutionStreamPrincipalCapacityExceeded
         group = self._groups.setdefault(workflow_run_id, _RunGroup(workflow_run_id))
         loop = asyncio.get_running_loop()
         subscription = ExecutionStreamSubscription(
             id=uuid4(),
             workflow_run_id=workflow_run_id,
+            principal_id=principal_id,
             websocket=websocket,
             queue=asyncio.Queue(maxsize=self._settings.execution_stream_queue_size),
             last_queued_cursor=baseline_cursor,
@@ -195,6 +209,9 @@ class ExecutionStreamRuntime:
         )
         group.subscriptions[subscription.id] = subscription
         self._active_connections += 1
+        self._principal_connections[principal_id] = (
+            self._principal_connections.get(principal_id, 0) + 1
+        )
         add_metric("taskforge.websocket.connections.active", 1)
         return subscription
 
@@ -601,6 +618,15 @@ class ExecutionStreamRuntime:
                     group.reconcile_task.cancel()
                 self._groups.pop(subscription.workflow_run_id, None)
         self._active_connections -= 1
+        principal_connections = (
+            self._principal_connections[subscription.principal_id] - 1
+        )
+        if principal_connections:
+            self._principal_connections[subscription.principal_id] = (
+                principal_connections
+            )
+        else:
+            del self._principal_connections[subscription.principal_id]
         add_metric("taskforge.websocket.connections.active", -1)
         attributes = {"taskforge.disconnect.kind": disconnect_kind}
         add_metric("taskforge.websocket.disconnections", attributes=attributes)

@@ -23,7 +23,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from taskforge.api.authorization import require_permission
 from taskforge.api.errors import ErrorDetail, ErrorResponse, error_response
+from taskforge.api.rate_limits import require_rate_limit
 from taskforge.identity.authorization import AuthorizationContext, Permission
+from taskforge.rate_limits import RateLimitPolicy
 from taskforge.retries.domain import (
     InspectedRetryEvent,
     InspectedRetryEventPage,
@@ -234,6 +236,9 @@ async def start_workflow_run(
         Header(alias="Idempotency-Key", max_length=128),
     ] = None,
 ) -> StartedWorkflowRunResponse | Response:
+    await require_rate_limit(
+        request, RateLimitPolicy.RUN_CREATE, "api_principal", context.principal_id
+    )
     selection = (
         LatestWorkflowVersion()
         if body.version_number is None
@@ -307,6 +312,9 @@ async def replay_workflow_run(
         Header(alias="Idempotency-Key", max_length=128),
     ] = None,
 ) -> WorkflowReplayResponse | Response:
+    await require_rate_limit(
+        request, RateLimitPolicy.RUN_REPLAY, "api_principal", context.principal_id
+    )
     service = _runtime(request).workflow_run_service
     owner_filter = context.owner_filter_for(Permission.OPERATE_WORKFLOW)
     correlation_id = cast(UUID, request.state.request_id)

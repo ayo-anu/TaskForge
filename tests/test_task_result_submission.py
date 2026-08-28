@@ -10,6 +10,11 @@ import pytest
 
 from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.rate_limits import (
+    AllowAllRateLimiter,
+    RateLimitDecision,
+    RateLimitPolicy,
+)
 from taskforge.worker.result_persistence_ports import (
     PersistableTaskResult,
     PersistedTaskResult,
@@ -19,6 +24,7 @@ from taskforge.worker.result_submission import (
     TaskResultAuthorityRejected,
     TaskResultConflict,
     TaskResultInvalidOutput,
+    TaskResultRateLimited,
     TaskResultStale,
     TaskResultSubmissionOutcome,
     TaskResultSubmissionRequest,
@@ -51,6 +57,9 @@ class Repository:
             self.received.task_attempt_id,
             self.dead_letter_created,
         )
+
+
+LIMITER = AllowAllRateLimiter()
 
 
 def request(
@@ -100,19 +109,56 @@ def test_service_verifies_authority_and_maps_committed_outcomes() -> None:
     issuer, worker, session_id, submission = request(TaskExecutionResult.success(None))
     repository = Repository(PersistedTaskResultOutcome.ACCEPTED)
     receipt = asyncio.run(
-        TaskResultSubmissionService(repository, issuer).submit_result(
-            worker, session_id, submission
-        )
+        TaskResultSubmissionService(
+            repository, issuer, rate_limiter=LIMITER
+        ).submit_result(worker, session_id, submission)
     )
     assert receipt.outcome is TaskResultSubmissionOutcome.ACCEPTED
     assert repository.received is not None
 
     with pytest.raises(TaskResultAuthorityRejected):
         asyncio.run(
-            TaskResultSubmissionService(repository, issuer).submit_result(
-                worker, uuid4(), submission
-            )
+            TaskResultSubmissionService(
+                repository, issuer, rate_limiter=LIMITER
+            ).submit_result(worker, uuid4(), submission)
         )
+
+
+def test_result_limit_uses_only_authenticated_worker_identity_before_persistence() -> (
+    None
+):
+    class Limiter:
+        def __init__(self) -> None:
+            self.calls: list[tuple[RateLimitPolicy, str, object]] = []
+
+        async def consume(
+            self, policy: RateLimitPolicy, kind: str, value: object
+        ) -> RateLimitDecision:
+            self.calls.append((policy, kind, value))
+            return RateLimitDecision(False, 9)
+
+        async def check(self, *args: object) -> RateLimitDecision:
+            return RateLimitDecision(True, 1)
+
+    issuer, worker, _, submission = request(TaskExecutionResult.success(None))
+    repository = Repository(PersistedTaskResultOutcome.ACCEPTED)
+    limiter = Limiter()
+    attacker_supplied_session_id = uuid4()
+    with pytest.raises(TaskResultRateLimited) as error:
+        asyncio.run(
+            TaskResultSubmissionService(
+                repository, issuer, rate_limiter=limiter
+            ).submit_result(worker, attacker_supplied_session_id, submission)
+        )
+    assert error.value.retry_after_seconds == 9
+    assert limiter.calls == [
+        (
+            RateLimitPolicy.WORKER_RESULT,
+            "worker_identity",
+            worker.worker_identity_id,
+        )
+    ]
+    assert repository.received is None
 
 
 def test_result_metrics_add_kinds_only_for_new_authoritative_acceptance(
@@ -134,7 +180,9 @@ def test_result_metrics_add_kinds_only_for_new_authoritative_acceptance(
     )
     asyncio.run(
         TaskResultSubmissionService(
-            Repository(PersistedTaskResultOutcome.ACCEPTED), issuer
+            Repository(PersistedTaskResultOutcome.ACCEPTED),
+            issuer,
+            rate_limiter=LIMITER,
         ).submit_result(worker, session_id, submission)
     )
     accepted = calls[0]
@@ -150,7 +198,9 @@ def test_result_metrics_add_kinds_only_for_new_authoritative_acceptance(
     calls.clear()
     asyncio.run(
         TaskResultSubmissionService(
-            Repository(PersistedTaskResultOutcome.REPLAYED_IDENTICAL), issuer
+            Repository(PersistedTaskResultOutcome.REPLAYED_IDENTICAL),
+            issuer,
+            rate_limiter=LIMITER,
         ).submit_result(worker, session_id, submission)
     )
     assert calls == [
@@ -187,6 +237,7 @@ def test_dead_letter_creation_metric_requires_new_authoritative_row(
                     dead_letter_created=created,
                 ),
                 issuer,
+                rate_limiter=LIMITER,
             ).submit_result(worker, session_id, submission)
         )
         creations = [
@@ -208,9 +259,9 @@ def test_service_converts_only_committed_repository_rejections(
     issuer, worker, session_id, submission = request(TaskExecutionResult.success(None))
     with pytest.raises(error):
         asyncio.run(
-            TaskResultSubmissionService(Repository(outcome), issuer).submit_result(
-                worker, session_id, submission
-            )
+            TaskResultSubmissionService(
+                Repository(outcome), issuer, rate_limiter=LIMITER
+            ).submit_result(worker, session_id, submission)
         )
 
 

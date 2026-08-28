@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from taskforge.api.authorization import require_permission
 from taskforge.api.errors import ErrorDetail, ErrorResponse, error_response
+from taskforge.api.rate_limits import require_rate_limit
 from taskforge.dead_letters.domain import (
     CreatedDeadLetterRedrive,
     DeadLetterActionCursor,
@@ -48,6 +49,7 @@ from taskforge.dead_letters.persistence_ports import (
 )
 from taskforge.dead_letters.service import DeadLetterNotFound, DeadLetterService
 from taskforge.identity.authorization import AuthorizationContext, Permission
+from taskforge.rate_limits import RateLimitPolicy
 from taskforge.retries.domain import RetryNotScheduledReason
 from taskforge.worker.results import TaskExecutionFailureKind, TaskExecutionResultKind
 
@@ -337,6 +339,12 @@ async def redrive_dead_letter(
         str | None, Header(alias="Idempotency-Key", max_length=128)
     ] = None,
 ) -> DeadLetterRedriveResponse | Response:
+    await require_rate_limit(
+        request,
+        RateLimitPolicy.DEAD_LETTER_REDRIVE,
+        "api_principal",
+        context.principal_id,
+    )
     try:
         redrive = await _runtime(request).dead_letter_service.redrive(
             item_id,

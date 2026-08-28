@@ -30,6 +30,14 @@ from taskforge.identity.credentials import (
     CredentialScope,
 )
 from taskforge.identity.ports import CredentialRecord
+from taskforge.rate_limits import (
+    AllowAllRateLimiter,
+    BoundedLocalRateLimiter,
+    RateLimit,
+    RateLimiter,
+    RateLimitPolicy,
+    RateLimitRepositoryUnavailable,
+)
 from taskforge.settings import Settings
 
 
@@ -61,6 +69,21 @@ class APIRepository:
         return None
 
 
+class ConcurrentFailureRepository(APIRepository):
+    def __init__(self, expected_calls: int) -> None:
+        super().__init__(None)
+        self.expected_calls = expected_calls
+        self.calls = 0
+        self.all_started = asyncio.Event()
+
+    async def find_api_credential(self, credential_id: UUID) -> None:
+        self.calls += 1
+        if self.calls == self.expected_calls:
+            self.all_started.set()
+        await self.all_started.wait()
+        return None
+
+
 class WorkerRepository:
     def __init__(self, record: CredentialRecord | None) -> None:
         self.record = record
@@ -78,9 +101,11 @@ class FakeRuntime:
         self,
         api_authenticator: APIAuthenticator,
         worker_authenticator: WorkerAuthenticator,
+        rate_limiter: object | None = None,
     ) -> None:
         self.api_authenticator = api_authenticator
         self.worker_authenticator = worker_authenticator
+        self.rate_limiter = rate_limiter or AllowAllRateLimiter()
         self.closed = False
 
     async def close(self) -> None:
@@ -99,6 +124,8 @@ def credential_record(
     secret: bytes,
     *,
     revoked: bool = False,
+    expired: bool = False,
+    identity_disabled: bool = False,
 ) -> CredentialRecord:
     return CredentialRecord(
         credential_id=credential_id,
@@ -108,18 +135,20 @@ def credential_record(
             algorithm=DEFAULT_VERIFIER_ALGORITHM,
         ),
         revoked=revoked,
-        expired=False,
-        identity_disabled=False,
+        expired=expired,
+        identity_disabled=identity_disabled,
     )
 
 
 def make_app(
     api_repository: APIRepository,
     worker_repository: WorkerRepository,
+    rate_limiter: object | None = None,
 ) -> tuple[FastAPI, FakeRuntime]:
     runtime = FakeRuntime(
         APIAuthenticator(api_repository, timeout_seconds=0.05),
         WorkerAuthenticator(worker_repository, timeout_seconds=0.05),
+        rate_limiter,
     )
     settings = Settings(
         postgres_password=SecretStr("postgres-test-secret"),
@@ -150,6 +179,221 @@ def make_app(
         return {"identity_id": str(identity.worker_identity_id)}
 
     return app, runtime
+
+
+class UnavailableRateRepository:
+    async def consume(self, *args: object) -> object:
+        raise RateLimitRepositoryUnavailable
+
+    async def check(self, *args: object) -> object:
+        raise RateLimitRepositoryUnavailable
+
+
+def authentication_limiter(*, limit: int = 1) -> RateLimiter:
+    return RateLimiter(
+        UnavailableRateRepository(),  # type: ignore[arg-type]
+        BoundedLocalRateLimiter(capacity=20),
+        {
+            RateLimitPolicy.API_AUTH_NETWORK: RateLimit(limit, 60),
+            RateLimitPolicy.API_AUTH_CREDENTIAL: RateLimit(limit, 60),
+            RateLimitPolicy.WORKER_AUTH_NETWORK: RateLimit(limit, 60),
+            RateLimitPolicy.WORKER_AUTH_CREDENTIAL: RateLimit(limit, 60),
+        },
+    )
+
+
+def test_unknown_canonical_and_malformed_credentials_remain_non_enumerating() -> None:
+    unknown_id = uuid4()
+    secret = secrets.token_bytes(32)
+    canonical_unknown = credential_value(CredentialScope.API, unknown_id, secret)
+    app, _ = make_app(
+        APIRepository(None), WorkerRepository(None), authentication_limiter()
+    )
+    assert request(app, "/test-api", canonical_unknown).status_code == 401
+    limited = request(app, "/test-api", canonical_unknown)
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "rate_limit_exceeded"
+    assert int(limited.headers["Retry-After"]) >= 1
+
+    malformed_app, _ = make_app(
+        APIRepository(None), WorkerRepository(None), authentication_limiter()
+    )
+    assert request(malformed_app, "/test-api", "malformed").status_code == 401
+    malformed_limited = request(malformed_app, "/test-api", "malformed")
+    assert malformed_limited.status_code == 429
+    assert malformed_limited.json()["error"] == {
+        **limited.json()["error"],
+        "request_id": malformed_limited.json()["error"]["request_id"],
+    }
+
+
+def test_canonical_authentication_failures_have_uniform_limiter_behavior() -> None:
+    identity_id = uuid4()
+    valid_secret = secrets.token_bytes(32)
+    invalid_secret = secrets.token_bytes(32)
+    cases = (
+        (
+            APIRepository(None),
+            credential_value(CredentialScope.API, uuid4(), valid_secret),
+        ),
+        (
+            APIRepository(credential_record(uuid4(), identity_id, valid_secret)),
+            None,
+        ),
+        (
+            APIRepository(
+                credential_record(
+                    credential_id := uuid4(), identity_id, valid_secret, revoked=True
+                )
+            ),
+            credential_value(CredentialScope.API, credential_id, valid_secret),
+        ),
+        (
+            APIRepository(
+                credential_record(
+                    credential_id := uuid4(), identity_id, valid_secret, expired=True
+                )
+            ),
+            credential_value(CredentialScope.API, credential_id, valid_secret),
+        ),
+        (
+            APIRepository(
+                credential_record(
+                    credential_id := uuid4(),
+                    identity_id,
+                    valid_secret,
+                    identity_disabled=True,
+                )
+            ),
+            credential_value(CredentialScope.API, credential_id, valid_secret),
+        ),
+        (
+            APIRepository(None),
+            credential_value(CredentialScope.WORKER, uuid4(), valid_secret),
+        ),
+    )
+    invalid_record = cases[1][0].record
+    assert invalid_record is not None
+    cases = (
+        cases[0],
+        (
+            cases[1][0],
+            credential_value(
+                CredentialScope.API, invalid_record.credential_id, invalid_secret
+            ),
+        ),
+        *cases[2:],
+    )
+
+    observed: list[tuple[int, int, str, str]] = []
+    for repository, credential in cases:
+        assert credential is not None
+        app, _ = make_app(repository, WorkerRepository(None), authentication_limiter())
+        first = request(app, "/test-api", credential)
+        second = request(app, "/test-api", credential)
+        observed.append(
+            (
+                first.status_code,
+                second.status_code,
+                first.json()["error"]["code"],
+                second.json()["error"]["code"],
+            )
+        )
+
+    assert observed == [
+        (401, 429, "authentication_required", "rate_limit_exceeded")
+    ] * len(cases)
+
+
+def test_concurrent_authentication_failures_enforce_exact_shared_thresholds() -> None:
+    async def exercise() -> None:
+        limit = 4
+        attempt_count = 12
+        repository = ConcurrentFailureRepository(attempt_count)
+        credential = credential_value(
+            CredentialScope.API, uuid4(), secrets.token_bytes(32)
+        )
+        app, _ = make_app(
+            repository,
+            WorkerRepository(None),
+            authentication_limiter(limit=limit),
+        )
+        transport = httpx2.ASGITransport(app=app, client=("198.51.100.10", 40000))
+        async with app.router.lifespan_context(app):
+            async with httpx2.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                responses = await asyncio.gather(
+                    *(
+                        client.get(
+                            "/test-api",
+                            headers={"Authorization": f"Bearer {credential}"},
+                        )
+                        for _ in range(attempt_count)
+                    )
+                )
+
+        statuses = [response.status_code for response in responses]
+        assert statuses.count(401) == limit
+        assert statuses.count(429) == attempt_count - limit
+
+    asyncio.run(exercise())
+
+
+def test_concurrent_authentication_buckets_are_identity_independent() -> None:
+    async def exercise() -> None:
+        limit = 3
+        attempts_per_identity = 7
+        repository = ConcurrentFailureRepository(attempts_per_identity * 2)
+        credentials = (
+            credential_value(CredentialScope.API, uuid4(), secrets.token_bytes(32)),
+            credential_value(CredentialScope.API, uuid4(), secrets.token_bytes(32)),
+        )
+        app, _ = make_app(
+            repository,
+            WorkerRepository(None),
+            authentication_limiter(limit=limit),
+        )
+        transports = (
+            httpx2.ASGITransport(app=app, client=("198.51.100.11", 40001)),
+            httpx2.ASGITransport(app=app, client=("198.51.100.12", 40002)),
+        )
+        async with app.router.lifespan_context(app):
+            async with (
+                httpx2.AsyncClient(
+                    transport=transports[0], base_url="http://testserver"
+                ) as first,
+                httpx2.AsyncClient(
+                    transport=transports[1], base_url="http://testserver"
+                ) as second,
+            ):
+                grouped = await asyncio.gather(
+                    asyncio.gather(
+                        *(
+                            first.get(
+                                "/test-api",
+                                headers={"Authorization": f"Bearer {credentials[0]}"},
+                            )
+                            for _ in range(attempts_per_identity)
+                        )
+                    ),
+                    asyncio.gather(
+                        *(
+                            second.get(
+                                "/test-api",
+                                headers={"Authorization": f"Bearer {credentials[1]}"},
+                            )
+                            for _ in range(attempts_per_identity)
+                        )
+                    ),
+                )
+
+        for responses in grouped:
+            statuses = [response.status_code for response in responses]
+            assert statuses.count(401) == limit
+            assert statuses.count(429) == attempts_per_identity - limit
+
+    asyncio.run(exercise())
 
 
 def request(

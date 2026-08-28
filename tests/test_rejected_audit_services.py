@@ -18,6 +18,7 @@ from taskforge.dead_letters.persistence_ports import DeadLetterTransitionConflic
 from taskforge.dead_letters.service import DeadLetterService
 from taskforge.dispatch.envelope import DispatchEnvelope
 from taskforge.identity.authentication import AuthenticatedWorker
+from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.runs.service import (
     WorkflowRunNotFound,
     WorkflowRunService,
@@ -195,13 +196,17 @@ def test_result_authority_rejection_and_audit_failure_contract() -> None:
         "result-correlation",
     )
     recorder = Recorder()
-    service = TaskResultSubmissionService(Any, Issuer(), recorder)  # type: ignore[arg-type]
+    service = TaskResultSubmissionService(  # type: ignore[arg-type]
+        Any, Issuer(), recorder, rate_limiter=AllowAllRateLimiter()
+    )
     with pytest.raises(TaskResultAuthorityRejected):
         asyncio.run(service.submit_result(worker(), uuid4(), request))
     assert len(recorder.records) == 1
     assert recorder.records[0].reason_code == "worker_authority_rejected"
 
-    service = TaskResultSubmissionService(Any, Issuer(), Recorder(fail=True))  # type: ignore[arg-type]
+    service = TaskResultSubmissionService(  # type: ignore[arg-type]
+        Any, Issuer(), Recorder(fail=True), rate_limiter=AllowAllRateLimiter()
+    )
     with pytest.raises(TaskResultServiceUnavailable):
         asyncio.run(service.submit_result(worker(), uuid4(), request))
 
