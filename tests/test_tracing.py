@@ -166,6 +166,27 @@ def test_safe_errors_export_no_exception_message_stack_or_event(
     assert exported.attributes["error.type"] == "RuntimeError"
 
 
+def test_authentication_material_cannot_escape_through_error_spans(
+    spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    _, exporter = spans
+    bearer = "tf_worker_v1.00000000-0000-0000-0000-000000000000.raw-secret"
+    raw_secret = "raw-secret"
+    verifier = "v1$sha256$verifier-sentinel"
+
+    with span("taskforge.test.authentication_failure") as active:
+        set_error(
+            active,
+            RuntimeError(f"{bearer} {verifier}"),
+            "authentication_failure",
+        )
+
+    rendered = exporter.get_finished_spans()[0].to_json()
+    assert bearer not in rendered
+    assert raw_secret not in rendered
+    assert verifier not in rendered
+
+
 def test_owned_log_captures_current_ids_and_third_party_log_does_not(
     spans: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:

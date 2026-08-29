@@ -6,7 +6,8 @@ import asyncio
 import base64
 import json
 import secrets
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -165,6 +166,7 @@ class Runtime:
         api_authenticator: APIAuthenticator,
         authorization_service: AuthorizationService,
         run_service: RunServiceStub,
+        credential_repository: CredentialRepository | None = None,
     ) -> None:
         self.api_authenticator = api_authenticator
         self.rate_limiter = AllowAllRateLimiter()
@@ -173,6 +175,7 @@ class Runtime:
         )
         self.authorization_service = authorization_service
         self.workflow_run_service = run_service
+        self.credential_repository = credential_repository
         self.workflow_run_execution_event_repository = ExecutionEventRepositoryStub()
 
     async def close(self) -> None:
@@ -208,12 +211,12 @@ def make_app(
         disabled,
     )
     run_service = RunServiceStub(principal_id, run_id)
+    credential_repository = CredentialRepository(record, credential_error)
     runtime = Runtime(
-        APIAuthenticator(
-            CredentialRepository(record, credential_error), timeout_seconds=0.05
-        ),
+        APIAuthenticator(credential_repository, timeout_seconds=0.05),
         AuthorizationService(RoleRepository(roles, role_error), timeout_seconds=0.05),
         run_service,
+        credential_repository,
     )
     app = create_app(
         settings=Settings(
@@ -241,6 +244,7 @@ async def websocket_exchange(
     cursor: str | None = None,
     send_failure: Exception | None = None,
     send_failure_after: int = 0,
+    after_establishment: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
     inbound = iter(({"type": "websocket.connect"}, *messages))
     outbound: list[dict[str, Any]] = []
@@ -266,7 +270,10 @@ async def websocket_exchange(
     }
 
     async def receive() -> Message:
-        return cast(Message, next(inbound))
+        message = cast(Message, next(inbound))
+        if message["type"] != "websocket.connect" and after_establishment is not None:
+            after_establishment()
+        return message
 
     async def send(message: Message) -> None:
         if message["type"] == "websocket.send" and send_failure is not None:
@@ -374,6 +381,51 @@ def test_wrong_scope_and_invalid_secret_are_denied() -> None:
     for rejected in (wrong_scope, invalid_secret):
         assert_denied(app, run_id, rejected, code=1008, reason="connection denied")
     assert runtime.workflow_run_service.calls == []
+
+
+def test_revoked_credential_is_redacted_and_rejected_for_new_connection() -> None:
+    app, runtime, credential, _, run_id = make_app(revoked=True)
+    repository = runtime.credential_repository
+    assert repository is not None and repository.record is not None
+    verifier = repository.record.credential_verifier
+    _, _, encoded_secret = credential.split(".")
+
+    outbound = asyncio.run(websocket_exchange(app, run_id, credential))
+
+    rendered = json.dumps(outbound)
+    assert outbound == [
+        {"type": "websocket.close", "code": 1008, "reason": "connection denied"}
+    ]
+    assert credential not in rendered
+    assert encoded_secret not in rendered
+    assert verifier not in rendered
+
+
+def test_established_connection_may_continue_after_revocation_but_new_one_cannot() -> (
+    None
+):
+    app, runtime, credential, _, run_id = make_app()
+    repository = runtime.credential_repository
+    assert repository is not None and repository.record is not None
+
+    def revoke_after_establishment() -> None:
+        assert repository.record is not None
+        repository.record = replace(repository.record, revoked=True)
+
+    established = asyncio.run(
+        websocket_exchange(
+            app,
+            run_id,
+            credential,
+            {"type": "websocket.disconnect", "code": 1000},
+            after_establishment=revoke_after_establishment,
+        )
+    )
+
+    assert established == [
+        {"type": "websocket.accept", "subprotocol": None, "headers": []}
+    ]
+    assert_denied(app, run_id, credential, code=1008, reason="connection denied")
 
 
 def test_missing_view_permission_is_denied_before_run_lookup() -> None:

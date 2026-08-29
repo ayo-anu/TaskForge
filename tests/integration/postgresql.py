@@ -42,6 +42,7 @@ SAFE_DATABASE_NAME = re.compile(
     r"taskforge_history_export)_[0-9a-f]{32}\Z"
     r"|taskforge_history_privileges_[0-9a-f]{32}\Z"
     r"|taskforge_rate_limit_[0-9a-f]{32}\Z"
+    r"|taskforge_cred_lifecycle_[0-9a-f]{32}\Z"
 )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import UTC, datetime, timedelta
 
@@ -12,6 +13,7 @@ from alembic.config import Config
 from sqlalchemy import select, update
 from sqlalchemy.engine import URL
 
+from taskforge.audit.schema import audit_records
 from taskforge.identity.authentication import (
     APIAuthenticator,
     AuthenticationFailure,
@@ -19,7 +21,10 @@ from taskforge.identity.authentication import (
     WorkerAuthenticator,
 )
 from taskforge.identity.authorization import Role
-from taskforge.identity.credentials import parse_presented_credential
+from taskforge.identity.credentials import (
+    CredentialFormatError,
+    parse_presented_credential,
+)
 from taskforge.identity.provisioning import (
     CredentialIssuanceService,
     CredentialRevocationService,
@@ -91,6 +96,8 @@ async def verify_credential_bootstrap(database_url: URL) -> None:
         assert stored_verifier == first_api.credential_verifier
         assert api_value not in stored_verifier
         assert api_value.rsplit(".", maxsplit=1)[1] not in stored_verifier
+        with pytest.raises(CredentialFormatError):
+            parse_presented_credential(stored_verifier)
 
         async with repository.transaction() as transaction:
             worker_id = await identities.create_worker_identity(
@@ -152,6 +159,82 @@ async def verify_credential_bootstrap(database_url: URL) -> None:
         with pytest.raises(AuthenticationFailure) as worker_error:
             await worker_authenticator.authenticate(presented_worker)
         assert worker_error.value.reason is AuthenticationFailureReason.REVOKED
+
+        async with sessions() as session:
+            original_revocations = (
+                await session.scalar(
+                    select(api_credentials.c.revoked_at).where(
+                        api_credentials.c.id == first_api.credential_id
+                    )
+                ),
+                await session.scalar(
+                    select(worker_credentials.c.revoked_at).where(
+                        worker_credentials.c.id == first_worker.credential_id
+                    )
+                ),
+            )
+        async with repository.transaction() as transaction:
+            await revocation.revoke_api_credential(
+                transaction,
+                principal_id=principal_id,
+                credential_id=first_api.credential_id,
+            )
+            await revocation.revoke_worker_credential(
+                transaction,
+                worker_id=worker_id,
+                credential_id=first_worker.credential_id,
+            )
+            await transaction.commit()
+        async with sessions() as session:
+            repeated_revocations = (
+                await session.scalar(
+                    select(api_credentials.c.revoked_at).where(
+                        api_credentials.c.id == first_api.credential_id
+                    )
+                ),
+                await session.scalar(
+                    select(worker_credentials.c.revoked_at).where(
+                        worker_credentials.c.id == first_worker.credential_id
+                    )
+                ),
+            )
+            credential_audit = (
+                await session.execute(
+                    select(
+                        audit_records.c.resource_id,
+                        audit_records.c.diagnostic_provenance,
+                    ).where(
+                        audit_records.c.resource_id.in_(
+                            (
+                                first_api.credential_id,
+                                first_worker.credential_id,
+                                rotated_api.credential_id,
+                                rotated_worker.credential_id,
+                            )
+                        )
+                    )
+                )
+            ).all()
+        assert repeated_revocations == original_revocations
+        serialized_audit = json.dumps(
+            [
+                {
+                    "resource_id": str(row.resource_id),
+                    "provenance": row.diagnostic_provenance,
+                }
+                for row in credential_audit
+            ],
+            sort_keys=True,
+        )
+        for secret_value, verifier_value in (
+            (api_value, first_api.credential_verifier),
+            (worker_value, first_worker.credential_verifier),
+            (rotated_api_value, rotated_api.credential_verifier),
+            (rotated_worker_value, rotated_worker.credential_verifier),
+        ):
+            assert secret_value not in serialized_audit
+            assert secret_value.rsplit(".", maxsplit=1)[1] not in serialized_audit
+            assert verifier_value not in serialized_audit
 
         async with sessions.begin() as session:
             await session.execute(

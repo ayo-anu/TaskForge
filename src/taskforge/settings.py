@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ipaddress import ip_address
 from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr, model_validator
@@ -196,6 +197,25 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "production requires an explicit claim result authority secret"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_production_plaintext_listener(self) -> Settings:
+        """Keep the built-in plaintext listener local in production."""
+        if self.environment != "production":
+            return self
+        if self.api_host == "localhost":
+            return self
+        try:
+            address = ip_address(self.api_host)
+        except ValueError as error:
+            raise ValueError(
+                "production plaintext API listener must use a loopback host"
+            ) from error
+        if not address.is_loopback:
+            raise ValueError(
+                "production plaintext API listener must use a loopback host"
             )
         return self
 

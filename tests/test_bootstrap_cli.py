@@ -103,6 +103,39 @@ def test_success_outputs_new_credential_exactly_once() -> None:
     assert "runtime-only-verifier" not in stderr
 
 
+@pytest.mark.parametrize(
+    ("command", "identity_option"),
+    (
+        ("rotate-api-credential", "--principal-id"),
+        ("rotate-worker-credential", "--worker-identity-id"),
+    ),
+)
+def test_rotation_preserves_overlap_and_explains_explicit_revocation(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    identity_option: str,
+) -> None:
+    code, stdout, stderr, _ = invoke(
+        monkeypatch,
+        [
+            command,
+            identity_option,
+            str(uuid4()),
+            "--expires-in",
+            "30d",
+            "--yes",
+        ],
+        result=generated(),
+    )
+
+    assert code == 0
+    assert stdout == "runtime-only-sensitive-value\n"
+    assert "existing credentials remain active" in stderr.lower()
+    assert "explicitly revoking" in stderr.lower()
+    assert "runtime-only-sensitive-value" not in stderr
+    assert "runtime-only-verifier" not in stderr
+
+
 @pytest.mark.parametrize("duration", ("30d", "90d", "365d", "24h", "2w"))
 def test_expires_in_computes_a_future_utc_instant(
     monkeypatch: pytest.MonkeyPatch,

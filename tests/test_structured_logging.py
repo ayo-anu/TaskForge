@@ -78,6 +78,26 @@ def test_third_party_exception_text_and_arguments_cannot_escape() -> None:
     assert "message" not in decoded
 
 
+def test_authentication_material_cannot_escape_through_log_records() -> None:
+    bearer = "tf_api_v1.00000000-0000-0000-0000-000000000000.raw-secret"
+    raw_secret = "raw-secret"
+    verifier = "v1$sha256$verifier-sentinel"
+    error = RuntimeError(f"authentication failed: {bearer} {verifier}")
+
+    output = formatter().format(
+        record(
+            "credential %s failed against %s",
+            args=(bearer, verifier),
+            exc_info=(RuntimeError, error, None),
+        )
+    )
+
+    assert bearer not in output
+    assert raw_secret not in output
+    assert verifier not in output
+    assert json.loads(output)["error.type"] == "RuntimeError"
+
+
 def test_oversized_record_uses_valid_minimal_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

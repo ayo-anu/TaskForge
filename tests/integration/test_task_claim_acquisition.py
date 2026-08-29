@@ -7,7 +7,7 @@ import json
 import os
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -71,6 +71,7 @@ async def add_worker(
     connection: asyncpg.Connection[asyncpg.Record],
     *,
     capability: str = "test-capability",
+    expired: bool = False,
 ) -> WorkerFacts:
     identity_id, credential_id, session_id = uuid4(), uuid4(), uuid4()
     await connection.execute(
@@ -78,11 +79,17 @@ async def add_worker(
         identity_id,
         f"claim-worker-{uuid4().hex}",
     )
+    now = datetime.now(UTC)
+    created_at = now - timedelta(seconds=2) if expired else now
+    expires_at = now - timedelta(seconds=1) if expired else None
     await connection.execute(
         "INSERT INTO worker_credentials "
-        "(id, worker_identity_id, credential_verifier) VALUES ($1, $2, 'unused')",
+        "(id, worker_identity_id, credential_verifier, created_at, expires_at) "
+        "VALUES ($1, $2, 'unused', $3, $4)",
         credential_id,
         identity_id,
+        created_at,
+        expires_at,
     )
     registered_at = await connection.fetchval(
         "INSERT INTO worker_sessions (id, worker_identity_id) VALUES ($1, $2) "
@@ -900,14 +907,8 @@ async def exercise_authority_lifecycle(
         )
     assert revoked.value.reason is TaskClaimRejectionReason.WORKER_AUTHORITY_REJECTED
 
-    expired_worker = await add_worker(setup)
+    expired_worker = await add_worker(setup, expired=True)
     expired_dispatch = await add_dispatched_task(setup)
-    await setup.execute(
-        "UPDATE worker_credentials SET "
-        "created_at = statement_timestamp() - interval '2 seconds', "
-        "expires_at = statement_timestamp() - interval '1 second' WHERE id = $1",
-        expired_worker.authenticated.credential_id,
-    )
     with pytest.raises(TaskClaimRejected) as expired:
         await service.claim_task(
             expired_worker.authenticated,

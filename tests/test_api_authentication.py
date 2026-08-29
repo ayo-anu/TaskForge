@@ -305,6 +305,30 @@ def test_canonical_authentication_failures_have_uniform_limiter_behavior() -> No
     ] * len(cases)
 
 
+def test_revoked_http_credential_error_contains_no_credential_material() -> None:
+    credential_id = uuid4()
+    secret = b"taskforge-auth-secret-sentinel!!"
+    assert len(secret) == 32
+    record = credential_record(
+        credential_id,
+        uuid4(),
+        secret,
+        revoked=True,
+    )
+    bearer = credential_value(CredentialScope.API, credential_id, secret)
+    encoded_secret = bearer.rsplit(".", maxsplit=1)[1]
+    app, _ = make_app(APIRepository(record), WorkerRepository(None))
+
+    response = request(app, "/test-api", bearer)
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "authentication_required"
+    assert bearer not in response.text
+    assert encoded_secret not in response.text
+    assert record.credential_verifier not in response.text
+    assert "revoked" not in response.text.lower()
+
+
 def test_concurrent_authentication_failures_enforce_exact_shared_thresholds() -> None:
     async def exercise() -> None:
         limit = 4

@@ -332,3 +332,52 @@ def test_production_requires_explicit_claim_result_authority_secret(
 
     with pytest.raises(ValidationError, match="claim result authority secret"):
         Settings()
+
+
+@pytest.mark.parametrize(
+    "host",
+    ("127.0.0.1", "127.12.34.56", "::1", "localhost"),
+)
+def test_production_plaintext_listener_accepts_only_canonical_loopback_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+    host: str,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_ENVIRONMENT", "production")
+    monkeypatch.setenv("TASKFORGE_API_HOST", host)
+
+    assert Settings().api_host == host
+
+
+@pytest.mark.parametrize(
+    "host",
+    (
+        "0.0.0.0",
+        "::",
+        "10.0.0.8",
+        "192.168.1.8",
+        "203.0.113.8",
+        "taskforge.internal",
+        "not a host",
+        "LOCALHOST",
+    ),
+)
+def test_production_plaintext_listener_rejects_non_loopback_without_dns(
+    monkeypatch: pytest.MonkeyPatch,
+    host: str,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_ENVIRONMENT", "production")
+    monkeypatch.setenv("TASKFORGE_API_HOST", host)
+
+    with pytest.raises(ValidationError, match="plaintext API listener"):
+        Settings()
+
+
+@pytest.mark.parametrize("environment", ("development", "test"))
+def test_non_production_plaintext_listener_behavior_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_ENVIRONMENT", environment)
+    monkeypatch.setenv("TASKFORGE_API_HOST", "0.0.0.0")
+
+    assert Settings().api_host == "0.0.0.0"

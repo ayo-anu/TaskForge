@@ -67,12 +67,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_expiration(worker)
     _add_confirmation(worker)
 
-    rotate_api = subparsers.add_parser("rotate-api-credential")
+    rotate_api = subparsers.add_parser(
+        "rotate-api-credential",
+        help="issue a new API credential without revoking existing credentials",
+    )
     rotate_api.add_argument("--principal-id", required=True, type=UUID)
     _add_expiration(rotate_api)
     _add_confirmation(rotate_api)
 
-    rotate_worker = subparsers.add_parser("rotate-worker-credential")
+    rotate_worker = subparsers.add_parser(
+        "rotate-worker-credential",
+        help="issue a new worker credential without revoking existing credentials",
+    )
     rotate_worker.add_argument("--worker-identity-id", required=True, type=UUID)
     _add_expiration(rotate_worker)
     _add_confirmation(rotate_worker)
@@ -143,6 +149,12 @@ def main(
         error_stream,
         "Store the following credential now; it cannot be retrieved again.",
     )
+    if arguments.command.startswith("rotate-"):
+        _write_error(
+            error_stream,
+            "Existing credentials remain active; deploy and verify this credential "
+            "before explicitly revoking its predecessor.",
+        )
     try:
         output_stream.write(generated.take_presented_value() + "\n")
         output_stream.flush()

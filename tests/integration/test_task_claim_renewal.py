@@ -485,14 +485,8 @@ async def exercise_lifecycle_races(
         expected=TaskClaimAuthorityRejected,
     )
 
-    expired_worker = await add_worker(setup)
+    expired_worker = await add_worker(setup, expired=True)
     expired_request = await add_current_claim(setup, expired_worker)
-    await setup.execute(
-        "UPDATE worker_credentials SET "
-        "created_at = statement_timestamp() - interval '2 seconds', "
-        "expires_at = statement_timestamp() - interval '1 second' WHERE id = $1",
-        expired_worker.authenticated.credential_id,
-    )
     with pytest.raises(TaskClaimAuthorityRejected):
         await repository.renew_claim(
             expired_worker.authenticated, expired_request, lease_seconds=60

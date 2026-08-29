@@ -178,6 +178,31 @@ def test_forbidden_attributes_and_secrets_are_dropped(
     assert secret not in repr(_metrics(metric_reader))
 
 
+def test_authentication_material_cannot_become_rate_limit_metric_attributes() -> None:
+    bearer = "tf_api_v1.00000000-0000-0000-0000-000000000000.raw-secret"
+    raw_secret = "raw-secret"
+    verifier = "v1$sha256$verifier-sentinel"
+    safe = task_metrics._safe_attributes(
+        "taskforge.rate_limit.decisions",
+        {
+            "taskforge.rate_limit.policy": "api_auth_credential",
+            "taskforge.outcome": "limited",
+            "credential.id": bearer,
+            "credential.secret": raw_secret,
+            "credential.verifier": verifier,
+        },
+    )
+
+    assert safe == {
+        "taskforge.rate_limit.policy": "api_auth_credential",
+        "taskforge.outcome": "limited",
+    }
+    rendered = repr(safe)
+    assert bearer not in rendered
+    assert raw_secret not in rendered
+    assert verifier not in rendered
+
+
 def test_globally_valid_attribute_is_dropped_for_the_wrong_instrument(
     metric_reader: InMemoryMetricReader,
 ) -> None:

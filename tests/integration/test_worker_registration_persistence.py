@@ -141,8 +141,30 @@ def capability_repository_for(
 
 async def seed_registered_session(
     database_url: URL,
+    *,
+    expired: bool = False,
 ) -> tuple[AuthenticatedWorker, UUID]:
-    authority = await seed_authority(database_url)
+    authority = await seed_authority(database_url, expired=expired)
+    if expired:
+        session_id = uuid4()
+        connection = await asyncpg.connect(asyncpg_dsn(database_url))
+        try:
+            registered_at = await connection.fetchval(
+                "INSERT INTO worker_sessions (id, worker_identity_id) "
+                "VALUES ($1, $2) RETURNING registered_at",
+                session_id,
+                authority.worker_identity_id,
+            )
+            await connection.execute(
+                "INSERT INTO worker_session_health "
+                "(worker_session_id, last_seen_at, accepting_work, "
+                "availability_changed_at) VALUES ($1, $2, true, $2)",
+                session_id,
+                registered_at,
+            )
+        finally:
+            await connection.close()
+        return authority, session_id
     repository, engine = repository_for(database_url)
     session_id = uuid4()
     try:
@@ -1460,18 +1482,21 @@ async def assert_capability_authority_recheck(database_url: URL) -> None:
         ("worker_credentials", "expires_at", "id", "credential_id"),
     )
     for table, field, key_column, authority_attribute in cases:
-        authority, session_id = await seed_registered_session(database_url)
+        authority, session_id = await seed_registered_session(
+            database_url,
+            expired=field == "expires_at",
+        )
         capability, engine = capability_repository_for(
             database_url, f"capability-authority-{field}"
         )
         connection = await asyncpg.connect(asyncpg_dsn(database_url))
         try:
-            operator = "- interval '1 second'" if field == "expires_at" else ""
-            await connection.execute(
-                f"UPDATE {table} SET {field} = statement_timestamp() {operator} "
-                f"WHERE {key_column} = $1",
-                getattr(authority, authority_attribute),
-            )
+            if field != "expires_at":
+                await connection.execute(
+                    f"UPDATE {table} SET {field} = statement_timestamp() "
+                    f"WHERE {key_column} = $1",
+                    getattr(authority, authority_attribute),
+                )
             with pytest.raises(WorkerCapabilityAuthorityRejected):
                 await capability.replace_capabilities(
                     authority,
