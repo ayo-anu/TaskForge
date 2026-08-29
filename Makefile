@@ -1,7 +1,11 @@
-.PHONY: install format format-check lint typecheck test coverage privilege-bootstrap migrations-check migration-test claim-test renewal-test retry-test recovery-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test check clean
+.PHONY: install security format format-check lint typecheck test coverage privilege-bootstrap migrations-check migration-test claim-test renewal-test retry-test recovery-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test check clean
 
 install:
-	uv sync --locked --dev
+	uv sync --locked --all-groups --no-install-project
+	uv sync --offline --locked --all-groups --no-build-isolation-package taskforge
+
+security: install
+	uv run --no-sync python scripts/security_scan.py
 
 format:
 	uv run ruff format src tests migrations

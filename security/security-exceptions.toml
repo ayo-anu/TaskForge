@@ -1,0 +1,17 @@
+schema_version = 1
+
+[[gitleaks]]
+fingerprint = "d6ec9bd662fb93d2ad2d64ef61d626f96a1da4dc:tests/integration/test_workflow_run_replay_idempotency.py:generic-api-key:349"
+justification = "Historical fixture value is a non-secret workflow replay idempotency key."
+responsible_role = "Taskforge maintainers"
+introduced_on = "2026-08-29"
+expires_on = "2026-11-27"
+tracking = "Milestone 20 Task 5 baseline review"
+
+[[gitleaks]]
+fingerprint = "8b96c43534178ad5ec6dff791ffb11d74afcad97:tests/integration/test_workflow_run_routes.py:generic-api-key:144"
+justification = "Historical fixture value is a non-secret workflow run idempotency key."
+responsible_role = "Taskforge maintainers"
+introduced_on = "2026-08-29"
+expires_on = "2026-11-27"
+tracking = "Milestone 20 Task 5 baseline review"

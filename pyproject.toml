@@ -1,5 +1,8 @@
 [build-system]
-requires = ["hatchling>=1,<2"]
+requires = [
+    "hatchling==1.32.0",
+    "editables==0.5",
+]
 build-backend = "hatchling.build"
 
 [project]
@@ -23,11 +26,16 @@ dependencies = [
 [dependency-groups]
 dev = [
     "alembic>=1,<2",
+    "editables==0.5",
+    "hatchling==1.32.0",
     "httpx2>=2,<3",
     "mypy>=1,<2",
-    "pytest>=8,<9",
+    "pytest>=9.0.3,<10",
     "pytest-cov>=6,<8",
     "ruff>=0.12,<1",
+]
+security = [
+    "pip-audit==2.10.1",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -10,6 +11,8 @@ PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
 MAKEFILE = PROJECT_ROOT / "Makefile"
 REQUIRED_DEVELOPMENT_TOOLS = {
     "alembic",
+    "editables",
+    "hatchling",
     "httpx2",
     "mypy",
     "pytest",
@@ -18,6 +21,7 @@ REQUIRED_DEVELOPMENT_TOOLS = {
 }
 REQUIRED_MAKE_TARGETS = {
     "install",
+    "security",
     "format",
     "format-check",
     "lint",
@@ -56,12 +60,20 @@ def test_required_development_tools_are_declared() -> None:
     assert isinstance(development_dependencies, list)
 
     declared_tools = {
-        requirement.partition(">=")[0]
+        re.split(r"[<>=!~]", requirement, maxsplit=1)[0]
         for requirement in development_dependencies
         if isinstance(requirement, str)
     }
 
     assert declared_tools == REQUIRED_DEVELOPMENT_TOOLS
+    security_dependencies = dependency_groups["security"]
+    assert security_dependencies == ["pip-audit==2.10.1"]
+
+    build_system = pyproject["build-system"]
+    assert isinstance(build_system, dict)
+    assert build_system["requires"] == ["hatchling==1.32.0", "editables==0.5"]
+    assert "hatchling==1.32.0" in development_dependencies
+    assert "editables==0.5" in development_dependencies
 
 
 def test_sqlalchemy_is_a_runtime_persistence_dependency() -> None:
@@ -105,7 +117,15 @@ def test_makefile_exposes_consistent_developer_commands() -> None:
     }
 
     assert declared_targets == REQUIRED_MAKE_TARGETS
-    assert "uv sync --locked --dev" in makefile
+    assert "uv sync --locked --all-groups --no-install-project" in makefile
+    assert (
+        "uv sync --offline --locked --all-groups --no-build-isolation-package taskforge"
+    ) in makefile
+    assert "uv sync --locked --all-groups --no-build-isolation\n" not in makefile
+    assert (
+        "security: install\n\tuv run --no-sync python scripts/security_scan.py"
+        in makefile
+    )
     assert "ruff format --check src tests migrations" in makefile
     assert "ruff check src tests migrations" in makefile
     assert "TASKFORGE_RUN_BROKER_INTEGRATION=1 is required" in makefile
