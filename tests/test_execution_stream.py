@@ -19,7 +19,10 @@ from pydantic import SecretStr
 from starlette.types import Message, Scope
 
 from taskforge.api.application import create_app
-from taskforge.api.execution_stream import workflow_run_execution_stream
+from taskforge.api.execution_stream import (
+    _session_expiry_deadline,
+    workflow_run_execution_stream,
+)
 from taskforge.api.health import ReadinessCoordinator
 from taskforge.identity.authentication import APIAuthenticator, WorkerAuthenticator
 from taskforge.identity.authorization import AuthorizationService, OwnerFilter, Role
@@ -196,6 +199,8 @@ def make_app(
     revoked: bool = False,
     expired: bool = False,
     disabled: bool = False,
+    allowed_origins: tuple[str, ...] = (),
+    max_session_seconds: int = 900,
 ) -> tuple[FastAPI, Runtime, str, UUID, UUID]:
     principal_id, credential_id, run_id = uuid4(), uuid4(), uuid4()
     secret = secrets.token_bytes(32)
@@ -222,6 +227,8 @@ def make_app(
         settings=Settings(
             postgres_password=SecretStr("postgres-test-secret"),
             rabbitmq_password=SecretStr("rabbitmq-test-secret"),
+            execution_stream_allowed_origins=allowed_origins,
+            execution_stream_max_session_seconds=max_session_seconds,
         ),
         readiness=ReadinessCoordinator(AlwaysReady(), timeout_seconds=0.05),
         authentication=runtime,
@@ -245,12 +252,14 @@ async def websocket_exchange(
     send_failure: Exception | None = None,
     send_failure_after: int = 0,
     after_establishment: Callable[[], None] | None = None,
+    origin_headers: tuple[bytes, ...] = (),
 ) -> list[dict[str, Any]]:
     inbound = iter(({"type": "websocket.connect"}, *messages))
     outbound: list[dict[str, Any]] = []
     headers = (
         [(b"authorization", f"Bearer {credential}".encode())] if credential else []
     )
+    headers.extend((b"origin", value) for value in origin_headers)
     path = f"/api/v1/workflow-runs/{run_id}/stream"
     scope: Scope = {
         "type": "websocket",
@@ -340,6 +349,118 @@ def test_authenticated_owner_handshake_and_clean_disconnect() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "origin",
+    (
+        b"https://unlisted.example",
+        b"not an origin",
+        b"null",
+    ),
+)
+def test_browser_origin_policy_denies_before_rate_limit_authentication_and_lookup(
+    origin: bytes,
+) -> None:
+    class MustNotRunLimiter:
+        async def check(self, *args: object) -> RateLimitDecision:
+            raise AssertionError("origin denial must precede rate limiting")
+
+        async def consume(self, *args: object) -> RateLimitDecision:
+            raise AssertionError("origin denial must precede rate limiting")
+
+    app, runtime, credential, _, run_id = make_app()
+    runtime.rate_limiter = MustNotRunLimiter()
+    outbound = asyncio.run(
+        websocket_exchange(
+            app,
+            run_id,
+            credential,
+            origin_headers=(origin,),
+        )
+    )
+    assert outbound == [
+        {"type": "websocket.close", "code": 1008, "reason": "connection denied"}
+    ]
+    assert runtime.workflow_run_service.calls == []
+
+
+def test_duplicate_origin_is_denied_and_allowlisted_origin_is_canonical() -> None:
+    app, runtime, credential, principal_id, run_id = make_app(
+        allowed_origins=("https://Example.COM:443/",)
+    )
+    accepted = asyncio.run(
+        websocket_exchange(
+            app,
+            run_id,
+            credential,
+            {"type": "websocket.disconnect", "code": 1000},
+            origin_headers=(b"https://example.com",),
+        )
+    )
+    assert accepted == [
+        {"type": "websocket.accept", "subprotocol": None, "headers": []}
+    ]
+    assert runtime.workflow_run_service.calls == [
+        (run_id, OwnerFilter.only(principal_id))
+    ]
+
+    duplicate = asyncio.run(
+        websocket_exchange(
+            app,
+            run_id,
+            credential,
+            origin_headers=(b"https://example.com", b"https://example.com"),
+        )
+    )
+    assert duplicate == [
+        {"type": "websocket.close", "code": 1008, "reason": "connection denied"}
+    ]
+
+
+def test_session_deadline_uses_earliest_credential_or_maximum_lifetime() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+
+        async def deadlines() -> tuple[float, float, float]:
+            now = datetime.now(UTC)
+            started = asyncio.get_running_loop().time()
+            no_expiry = _session_expiry_deadline(
+                SimpleNamespace(
+                    credential_expires_at=None, credential_observed_at=None
+                ),
+                900,
+            )
+            credential_first = _session_expiry_deadline(
+                SimpleNamespace(
+                    credential_expires_at=now.replace(microsecond=0),
+                    credential_observed_at=now.replace(microsecond=0),
+                ),
+                900,
+            )
+            maximum_first = _session_expiry_deadline(
+                SimpleNamespace(
+                    credential_expires_at=datetime.max.replace(tzinfo=UTC),
+                    credential_observed_at=now,
+                ),
+                60,
+            )
+            return (
+                no_expiry - started,
+                credential_first - started,
+                maximum_first - started,
+            )
+
+        no_expiry, credential_first, maximum_first = loop.run_until_complete(
+            deadlines()
+        )
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+    assert no_expiry == pytest.approx(900, abs=0.01)
+    assert credential_first == pytest.approx(0, abs=0.01)
+    assert maximum_first == pytest.approx(60, abs=0.01)
+
+
 def test_connection_rate_limit_rejects_before_resource_authorization() -> None:
     class Limiter:
         async def check(self, *args: object) -> RateLimitDecision:
@@ -399,6 +520,12 @@ def test_revoked_credential_is_redacted_and_rejected_for_new_connection() -> Non
     assert credential not in rendered
     assert encoded_secret not in rendered
     assert verifier not in rendered
+
+
+def test_disabled_principal_cannot_establish_or_reconnect() -> None:
+    app, runtime, credential, _, run_id = make_app(disabled=True)
+    assert_denied(app, run_id, credential, code=1008, reason="connection denied")
+    assert runtime.workflow_run_service.calls == []
 
 
 def test_established_connection_may_continue_after_revocation_but_new_one_cannot() -> (
@@ -491,6 +618,12 @@ class ReceiveOnlyWebSocket:
     def __init__(self, runtime: Runtime, messages: Sequence[dict[str, Any]]) -> None:
         self.app = cast(Any, type("App", (), {"state": type("State", (), {})()})())
         self.app.state.authentication = runtime
+        self.app.state.settings = Settings(
+            postgres_password=SecretStr("postgres-test-secret"),
+            rabbitmq_password=SecretStr("rabbitmq-test-secret"),
+        )
+        self.scope = {"headers": []}
+        self.client = None
         self.headers = {"Authorization": "Bearer unused"}
         self._messages = iter(messages)
         self.accepted = False

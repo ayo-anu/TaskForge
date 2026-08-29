@@ -8,6 +8,11 @@ from typing import Literal
 from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from taskforge.api.websocket_origins import (
+    InvalidWebSocketOrigin,
+    canonical_websocket_origin,
+)
+
 Environment = Literal["development", "test", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 TracingExporter = Literal["none", "otlp_http"]
@@ -46,6 +51,9 @@ class Settings(BaseSettings):
     metrics_outbox_staleness_seconds: float = Field(default=120.0, ge=10, le=600)
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
+    api_max_request_body_bytes: int = Field(
+        default=10 * 1024 * 1024, ge=1, le=64 * 1024 * 1024
+    )
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
     authentication_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
     rate_limit_timeout_seconds: float = Field(default=0.25, gt=0, le=2)
@@ -63,6 +71,8 @@ class Settings(BaseSettings):
     websocket_connections_per_network_minute: int = Field(default=120, ge=1)
     websocket_connections_per_principal_minute: int = Field(default=30, ge=1)
     execution_stream_max_connections_per_principal: int = Field(default=5, ge=1, le=100)
+    execution_stream_allowed_origins: tuple[str, ...] = ()
+    execution_stream_max_session_seconds: int = Field(default=900, ge=60, le=3600)
     database_pool_size: int = Field(default=5, ge=1, le=20)
     database_pool_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
     execution_stream_max_connections: int = Field(default=500, ge=1, le=10_000)
@@ -186,6 +196,20 @@ class Settings(BaseSettings):
     def validate_worker_health_thresholds(self) -> Settings:
         if self.worker_offline_after_seconds <= self.worker_stale_after_seconds:
             raise ValueError("worker offline threshold must exceed stale threshold")
+        return self
+
+    @model_validator(mode="after")
+    def validate_execution_stream_origins(self) -> Settings:
+        try:
+            origins = tuple(
+                canonical_websocket_origin(value)
+                for value in self.execution_stream_allowed_origins
+            )
+        except InvalidWebSocketOrigin as error:
+            raise ValueError("execution stream allowed origins are invalid") from error
+        if len(origins) != len(set(origins)):
+            raise ValueError("execution stream allowed origins must be unique")
+        object.__setattr__(self, "execution_stream_allowed_origins", origins)
         return self
 
     @model_validator(mode="after")

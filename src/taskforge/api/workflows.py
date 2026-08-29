@@ -30,12 +30,17 @@ from taskforge.api.errors import (
 )
 from taskforge.identity.authorization import AuthorizationContext, Permission
 from taskforge.workflows.dag_validation import (
+    MAX_DAG_DEPENDENCIES,
+    MAX_DAG_STEPS,
     DAGEdge,
     DAGValidationIssue,
     DAGViolationCode,
     validate_dag,
 )
 from taskforge.workflows.domain import (
+    MAX_IDENTIFIER_LENGTH,
+    MAX_WORKFLOW_DESCRIPTION_LENGTH,
+    MAX_WORKFLOW_NAME_LENGTH,
     DraftDependency,
     DraftWorkflowStep,
     PublishedWorkflowVersion,
@@ -73,8 +78,8 @@ from taskforge.workflows.task_types import (
 class CreateWorkflowStepRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    identifier: str
-    task_type: str
+    identifier: Annotated[str, Field(max_length=MAX_IDENTIFIER_LENGTH)]
+    task_type: Annotated[str, Field(max_length=MAX_IDENTIFIER_LENGTH)]
     parameters: dict[str, JSONValue]
     execution_policy: dict[str, JSONValue] | None = None
 
@@ -82,18 +87,22 @@ class CreateWorkflowStepRequest(BaseModel):
 class CreateWorkflowDependencyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    predecessor: str
-    successor: str
+    predecessor: Annotated[str, Field(max_length=MAX_IDENTIFIER_LENGTH)]
+    successor: Annotated[str, Field(max_length=MAX_IDENTIFIER_LENGTH)]
 
 
 class CreateWorkflowRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str
-    description: str | None = None
+    name: Annotated[str, Field(max_length=MAX_WORKFLOW_NAME_LENGTH)]
+    description: Annotated[
+        str | None, Field(max_length=MAX_WORKFLOW_DESCRIPTION_LENGTH)
+    ] = None
     execution_policy: dict[str, JSONValue] | None = None
-    steps: list[CreateWorkflowStepRequest]
-    dependencies: list[CreateWorkflowDependencyRequest] = Field(default_factory=list)
+    steps: list[CreateWorkflowStepRequest] = Field(max_length=MAX_DAG_STEPS)
+    dependencies: list[CreateWorkflowDependencyRequest] = Field(
+        default_factory=list, max_length=MAX_DAG_DEPENDENCIES
+    )
 
 
 class WorkflowStepResponse(BaseModel):

@@ -88,7 +88,10 @@ def create_app(
             )
 
     app = FastAPI(title="Taskforge API", lifespan=lifespan)
-    install_error_handling(app)
+    app.state.settings = resolved_settings
+    install_error_handling(
+        app, max_request_body_bytes=resolved_settings.api_max_request_body_bytes
+    )
     app.include_router(principals_router)
     app.include_router(claims_router)
     app.include_router(workflows_router)

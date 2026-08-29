@@ -17,6 +17,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from taskforge.api.request_limits import (
+    RequestBodyLimitMiddleware,
+    RequestBodyTooLarge,
+)
 from taskforge.logging import bind_log_context, log_event
 from taskforge.metrics import (
     add as add_metric,
@@ -65,6 +69,7 @@ ERROR_CONTRACTS = {
     403: ("forbidden", "Access is forbidden."),
     404: ("resource_not_found", "The requested resource was not found."),
     409: ("resource_conflict", "The request conflicts with current state."),
+    413: ("request_too_large", "The request body exceeds the allowed size."),
     422: ("validation_failed", "The request is invalid."),
     429: ("rate_limit_exceeded", "The request rate limit was exceeded."),
     500: ("internal_error", "The service encountered an internal error."),
@@ -139,12 +144,27 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
                 return response
 
 
-def install_error_handling(app: FastAPI) -> None:
+def install_error_handling(app: FastAPI, *, max_request_body_bytes: int) -> None:
     """Install one envelope implementation for framework and security failures."""
+    # Starlette inserts the last registered middleware outermost. Request IDs must
+    # therefore be registered after the body limiter.
+    app.add_middleware(
+        RequestBodyLimitMiddleware, max_body_bytes=max_request_body_bytes
+    )
     app.add_middleware(RequestIDMiddleware)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(RequestBodyTooLarge, request_body_too_large_handler)
     app.add_exception_handler(Exception, unexpected_exception_handler)
+
+
+async def request_body_too_large_handler(
+    request: Request,
+    exception: Exception,
+) -> JSONResponse:
+    del exception
+    code, message = ERROR_CONTRACTS[413]
+    return error_response(request, status_code=413, code=code, message=message)
 
 
 async def http_exception_handler(

@@ -74,6 +74,7 @@ from taskforge.runs.service import (
     WorkflowVersionUnavailable,
 )
 from taskforge.worker.results import TaskExecutionFailureKind
+from taskforge.workflows.domain import MAX_IDENTIFIER_LENGTH
 from taskforge.workflows.task_types import JSONValue
 
 
@@ -88,7 +89,7 @@ class StartWorkflowRunRequest(BaseModel):
 class CancelWorkflowRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reason: str | None = None
+    reason: Annotated[str | None, Field(max_length=2000)] = None
 
 
 class FullWorkflowReplayRequest(BaseModel):
@@ -101,7 +102,10 @@ class FailedSubgraphWorkflowReplayRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: Literal[WorkflowReplayMode.FAILED_SUBGRAPH]
-    failed_step_identifiers: Annotated[list[str], Field(min_length=1, max_length=256)]
+    failed_step_identifiers: Annotated[
+        list[Annotated[str, Field(max_length=MAX_IDENTIFIER_LENGTH)]],
+        Field(min_length=1, max_length=256),
+    ]
 
 
 WorkflowReplayRequest = Annotated[

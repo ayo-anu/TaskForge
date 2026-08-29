@@ -60,9 +60,12 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.metrics_outbox_staleness_seconds == 120.0
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 8000
+    assert settings.api_max_request_body_bytes == 10 * 1024 * 1024
     assert settings.readiness_timeout_seconds == 2.0
     assert settings.authentication_timeout_seconds == 2.0
     assert settings.execution_stream_max_connections == 500
+    assert settings.execution_stream_allowed_origins == ()
+    assert settings.execution_stream_max_session_seconds == 900
     assert settings.execution_stream_queue_size == 100
     assert settings.execution_stream_listener_reconnect_max_seconds == 5.0
     assert settings.database_pool_size == 5
@@ -96,6 +99,50 @@ def test_settings_accept_prefixed_environment_overrides(
     assert settings.application_name == "taskforge-test"
     assert settings.environment == "test"
     assert settings.log_level == "DEBUG"
+
+
+@pytest.mark.parametrize("value", (59, 3601))
+def test_execution_stream_max_session_rejects_values_outside_finite_range(
+    value: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(execution_stream_max_session_seconds=value)
+
+
+@pytest.mark.parametrize("value", (60, 900, 3600))
+def test_execution_stream_max_session_accepts_boundaries(value: int) -> None:
+    assert (
+        Settings(
+            execution_stream_max_session_seconds=value
+        ).execution_stream_max_session_seconds
+        == value
+    )
+
+
+def test_execution_stream_origins_are_canonicalized_and_strict() -> None:
+    settings = Settings(
+        execution_stream_allowed_origins=(
+            "https://Example.COM:443/",
+            "http://[0:0:0:0:0:0:0:1]:80",
+        )
+    )
+    assert settings.execution_stream_allowed_origins == (
+        "https://example.com",
+        "http://[::1]",
+    )
+
+    for value in (
+        "null",
+        "*",
+        "https://*.example.com",
+        "https://user@example.com",
+        "https://example.com/path",
+        "https://example.com?query=1",
+        "https://example.com#fragment",
+        "ftp://example.com",
+    ):
+        with pytest.raises(ValidationError):
+            Settings(execution_stream_allowed_origins=(value,))
 
 
 def test_tracing_enablement_is_independent_from_export_selection(

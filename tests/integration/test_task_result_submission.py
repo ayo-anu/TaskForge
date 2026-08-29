@@ -22,6 +22,7 @@ from taskforge.persistence.task_results import SQLAlchemyTaskResultRepository
 from taskforge.rate_limits import AllowAllRateLimiter
 from taskforge.worker.result_submission import (
     TaskResultConflict,
+    TaskResultInvalidOutput,
     TaskResultServiceUnavailable,
     TaskResultStale,
     TaskResultSubmissionOutcome,
@@ -106,6 +107,35 @@ async def exercise_results(database_url: URL) -> None:
         rate_limiter=AllowAllRateLimiter(),
     )
     try:
+        (
+            oversized_worker,
+            oversized_dispatch,
+            oversized_claim,
+        ) = await claimed_running_task(setup, claim_service)
+        oversized_output = ["x" * 4096, "x" * 4096, "x" * 4096, "x" * 4084]
+        with pytest.raises(TaskResultInvalidOutput):
+            await result_service.submit_result(
+                oversized_worker.authenticated,
+                oversized_worker.session_id,
+                submission(
+                    oversized_dispatch,
+                    oversized_claim,
+                    TaskExecutionResult.success(oversized_output),
+                ),
+            )
+        oversized_state = await setup.fetchrow(
+            "SELECT tr.status::text, tac.terminated_at, "
+            "EXISTS (SELECT FROM task_attempt_results result WHERE "
+            "result.task_attempt_id = ta.id), "
+            "EXISTS (SELECT FROM task_result_events event WHERE "
+            "event.task_attempt_id = ta.id) FROM task_runs tr "
+            "JOIN task_attempts ta ON ta.task_run_id = tr.id "
+            "JOIN task_attempt_claims tac ON tac.task_attempt_id = ta.id "
+            "WHERE ta.id = $1",
+            oversized_dispatch.task_attempt_id,
+        )
+        assert tuple(oversized_state) == ("running", None, False, False)
+
         worker, dispatch, issued = await claimed_running_task(setup, claim_service)
         accepted_request = submission(
             dispatch, issued, TaskExecutionResult.success({"answer": 42})
@@ -436,6 +466,44 @@ async def exercise_results(database_url: URL) -> None:
             await setup.fetchval(
                 "SELECT count(*) FROM task_attempt_results WHERE task_attempt_id = $1",
                 race_dispatch.task_attempt_id,
+            )
+            == 1
+        )
+
+        replay_worker, replay_dispatch, replay_claim = await claimed_running_task(
+            setup, claim_service
+        )
+        replay_request = submission(
+            replay_dispatch, replay_claim, TaskExecutionResult.success("identical")
+        )
+        identical = await asyncio.gather(
+            *(
+                result_service.submit_result(
+                    replay_worker.authenticated,
+                    replay_worker.session_id,
+                    replay_request,
+                )
+                for _ in range(3)
+            )
+        )
+        assert (
+            sum(
+                item.outcome is TaskResultSubmissionOutcome.ACCEPTED
+                for item in identical
+            )
+            == 1
+        )
+        assert (
+            sum(
+                item.outcome is TaskResultSubmissionOutcome.REPLAYED_IDENTICAL
+                for item in identical
+            )
+            == 2
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_attempt_results WHERE task_attempt_id = $1",
+                replay_dispatch.task_attempt_id,
             )
             == 1
         )

@@ -21,6 +21,11 @@ from taskforge.api.execution_stream_runtime import (
     ExecutionStreamRuntime,
     ExecutionStreamUnavailable,
 )
+from taskforge.api.websocket_origins import (
+    InvalidWebSocketOrigin,
+    OpaqueWebSocketOrigin,
+    canonical_websocket_origin,
+)
 from taskforge.identity.authentication import (
     AuthenticationFailure,
     AuthenticationUnavailable,
@@ -53,6 +58,7 @@ from taskforge.runs.service import (
     WorkflowRunService,
     WorkflowRunServiceUnavailable,
 )
+from taskforge.settings import Settings
 from taskforge.workflows.task_types import JSONValue
 
 POLICY_REJECTION_REASON = "connection denied"
@@ -129,6 +135,17 @@ async def workflow_run_execution_stream(
     cursor: str | None = None,
 ) -> None:
     """Accept only API principals allowed to inspect the requested owned run."""
+    settings = cast(Settings, websocket.app.state.settings)
+    origin_rejection = _origin_rejection(
+        websocket, settings.execution_stream_allowed_origins
+    )
+    if origin_rejection is not None:
+        _record_connection_attempt("policy_rejected")
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason=POLICY_REJECTION_REASON,
+        )
+        return
     runtime = cast(ExecutionStreamRuntimeProtocol, websocket.app.state.authentication)
     limiter = rate_limiter_for(runtime)
     client = getattr(websocket, "client", None)
@@ -197,7 +214,9 @@ async def workflow_run_execution_stream(
         await _close_rate_limited(websocket)
         return
     try:
-        expiry_deadline = _credential_expiry_deadline(identity)
+        expiry_deadline = _session_expiry_deadline(
+            identity, settings.execution_stream_max_session_seconds
+        )
         context = await runtime.authorization_service.context_for(identity)
         context.require(Permission.VIEW)
         run_id = _parse_run_id(raw_run_id)
@@ -468,11 +487,13 @@ def serialize_execution_event(
     return _execution_event_message(event).model_dump(mode="json")
 
 
-def _credential_expiry_deadline(identity: object) -> float | None:
+def _session_expiry_deadline(identity: object, max_session_seconds: int) -> float:
+    started = asyncio.get_running_loop().time()
+    maximum = started + max_session_seconds
     expires_at = getattr(identity, "credential_expires_at", None)
     observed_at = getattr(identity, "credential_observed_at", None)
     if expires_at is None:
-        return None
+        return maximum
     if (
         not isinstance(expires_at, datetime)
         or not isinstance(observed_at, datetime)
@@ -481,7 +502,31 @@ def _credential_expiry_deadline(identity: object) -> float | None:
     ):
         raise AuthenticationUnavailable
     remaining = max(0.0, (expires_at - observed_at).total_seconds())
-    return asyncio.get_running_loop().time() + remaining
+    return min(maximum, started + remaining)
+
+
+def _origin_rejection(
+    websocket: WebSocket, allowed_origins: tuple[str, ...]
+) -> str | None:
+    values: list[bytes] = [
+        value
+        for name, value in websocket.scope.get("headers", ())
+        if name.lower() == b"origin"
+    ]
+    if not values:
+        return None
+    if len(values) != 1:
+        return "multiple"
+    try:
+        value = values[0].decode("ascii")
+        canonical = canonical_websocket_origin(value)
+    except OpaqueWebSocketOrigin:
+        return "opaque"
+    except (UnicodeDecodeError, InvalidWebSocketOrigin):
+        return "malformed"
+    if canonical not in allowed_origins:
+        return "unlisted"
+    return None
 
 
 async def _send_then_close(

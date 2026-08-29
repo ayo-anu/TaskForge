@@ -17,11 +17,14 @@ from taskforge.api.errors import (
     RequestIDMiddleware,
     install_error_handling,
 )
+from taskforge.api.request_limits import DEFAULT_API_MAX_REQUEST_BODY_BYTES
 
 
 def make_app() -> FastAPI:
     app = FastAPI()
-    install_error_handling(app)
+    install_error_handling(
+        app, max_request_body_bytes=DEFAULT_API_MAX_REQUEST_BODY_BYTES
+    )
 
     @app.get("/fail/{value}")
     async def fail(value: int) -> None:
