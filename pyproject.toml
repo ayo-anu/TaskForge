@@ -28,7 +28,7 @@ dev = [
     "alembic>=1,<2",
     "editables==0.5",
     "hatchling==1.32.0",
-    "httpx2>=2,<3",
+    "httpx2[ws]>=2,<3",
     "mypy>=1,<2",
     "pytest>=9.0.3,<10",
     "pytest-cov>=6,<8",
@@ -47,6 +47,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
     "integration: requires explicitly enabled external infrastructure",
+    "workload: opt-in bounded workload against real external infrastructure",
 ]
 
 [tool.ruff]

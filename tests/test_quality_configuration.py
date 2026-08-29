@@ -13,7 +13,7 @@ REQUIRED_DEVELOPMENT_TOOLS = {
     "alembic",
     "editables",
     "hatchling",
-    "httpx2",
+    "httpx2[ws]",
     "mypy",
     "pytest",
     "pytest-cov",
@@ -42,6 +42,7 @@ REQUIRED_MAKE_TARGETS = {
     "workflow-persistence-test",
     "workflow-route-test",
     "broker-dispatch-test",
+    "m21-workload",
     "check",
     "clean",
 }
