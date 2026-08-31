@@ -43,6 +43,7 @@ REQUIRED_MAKE_TARGETS = {
     "workflow-route-test",
     "broker-dispatch-test",
     "m21-workload",
+    "m21-measurement",
     "check",
     "clean",
 }

@@ -44,6 +44,7 @@ SAFE_DATABASE_NAME = re.compile(
     r"|taskforge_rate_limit_[0-9a-f]{32}\Z"
     r"|taskforge_cred_lifecycle_[0-9a-f]{32}\Z"
     r"|taskforge_m21_workload_[0-9a-f]{32}\Z"
+    r"|taskforge_m21_measurement_[0-9a-f]{32}\Z"
 )
 
 

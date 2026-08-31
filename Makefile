@@ -1,4 +1,4 @@
-.PHONY: install security format format-check lint typecheck test coverage privilege-bootstrap migrations-check migration-test claim-test renewal-test retry-test recovery-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test m21-workload check clean
+.PHONY: install security format format-check lint typecheck test coverage privilege-bootstrap migrations-check migration-test claim-test renewal-test retry-test recovery-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test m21-workload m21-measurement check clean
 
 install:
 	uv sync --locked --all-groups --no-install-project
@@ -98,6 +98,13 @@ m21-workload:
 	@test -n "$${TASKFORGE_M21_DATABASE_URL:-}" || (echo "TASKFORGE_M21_DATABASE_URL is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_M21_AMQP_URL:-}" || (echo "TASKFORGE_M21_AMQP_URL is required" >&2; exit 2)
 	uv run pytest -q -s tests/performance/test_m21_reproducible_workload.py
+
+m21-measurement:
+	@test "$${TASKFORGE_RUN_M21_MEASUREMENT:-}" = "1" || (echo "TASKFORGE_RUN_M21_MEASUREMENT=1 is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_M21_DATABASE_URL:-}" || (echo "TASKFORGE_M21_DATABASE_URL is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_M21_AMQP_URL:-}" || (echo "TASKFORGE_M21_AMQP_URL is required" >&2; exit 2)
+	@test -n "$${TASKFORGE_M21_MEASUREMENT_OUTPUT:-}" || (echo "TASKFORGE_M21_MEASUREMENT_OUTPUT is required" >&2; exit 2)
+	uv run pytest -q -s tests/performance/test_m21_performance_measurement.py
 
 check: format-check lint typecheck coverage migrations-check
 
