@@ -48,6 +48,7 @@ testpaths = ["tests"]
 markers = [
     "integration: requires explicitly enabled external infrastructure",
     "workload: opt-in bounded workload against real external infrastructure",
+    "contention: opt-in deterministic real-PostgreSQL contention scenario",
 ]
 
 [tool.ruff]
