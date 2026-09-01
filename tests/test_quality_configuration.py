@@ -45,6 +45,7 @@ REQUIRED_MAKE_TARGETS = {
     "m21-workload",
     "m21-measurement",
     "m21-contention",
+    "m21-profiling",
     "check",
     "clean",
 }
@@ -136,6 +137,8 @@ def test_makefile_exposes_consistent_developer_commands() -> None:
     assert "TASKFORGE_RUN_RECOVERY_INTEGRATION=1 is required" in makefile
     assert "TASKFORGE_RUN_M21_CONTENTION=1 is required" in makefile
     assert "TASKFORGE_M21_CONTENTION_DATABASE_URL is required" in makefile
+    assert "TASKFORGE_RUN_M21_PROFILING=1 is required" in makefile
+    assert "TASKFORGE_M21_PROFILE_OUTPUT is required" in makefile
     assert "tests/integration/test_dispatch_publisher_broker.py" in makefile
     assert "tests/integration/test_dispatch_topology_broker.py" in makefile
     assert "check: format-check lint typecheck coverage migrations-check" in makefile

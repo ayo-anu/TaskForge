@@ -18,8 +18,10 @@ import asyncpg
 import httpx2
 import uvicorn
 from sqlalchemy import insert
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from taskforge.api.application import create_app
+from taskforge.api.authentication import AuthenticationRuntime
 from taskforge.api.health import ReadinessCoordinator
 from taskforge.broker.consumer import RabbitMQDispatchConsumer
 from taskforge.broker.rabbitmq import RabbitMQDispatchPublisher
@@ -100,6 +102,14 @@ class OwnerFacts:
 
 
 class M21MeasurementObserver(Protocol):
+    def attach_engine(self, role: str, engine: AsyncEngine) -> None: ...
+
+    def phase_changed(self, phase: str) -> None: ...
+
+    def websocket_handshake_completed(self, duration_seconds: float) -> None: ...
+
+    def websocket_event_received(self) -> None: ...
+
     async def start(
         self,
         *,
@@ -272,6 +282,12 @@ async def run_m21_workload(
     current_task = asyncio.current_task()
     assert current_task is not None
 
+    def change_phase(phase: str) -> None:
+        nonlocal current_phase
+        current_phase = phase
+        if observer is not None:
+            observer.phase_changed(phase)
+
     def expire_overall() -> None:
         nonlocal overall_expired
         overall_expired = True
@@ -292,6 +308,8 @@ async def run_m21_workload(
             update={"database_pool_size": 20, "execution_stream_queue_size": 100}
         )
         engine = build_async_engine(settings)
+        if observer is not None:
+            observer.attach_engine("workload", engine)
         sessions = build_session_factory(engine)
         setup = await asyncpg.connect(asyncpg_dsn(database_url))
         broker = await aio_pika.connect(amqp_url)
@@ -330,11 +348,18 @@ async def run_m21_workload(
             uvicorn.Config(app, access_log=False, log_config=None, lifespan="on")
         )
         server_task = asyncio.create_task(server.serve(sockets=[listener]))
-        current_phase = "api_start"
+        change_phase("api_start")
         async with asyncio.timeout(configuration.phase_timeout_seconds):
             while not server.started:
                 await asyncio.sleep(0)
-        current_phase = "seed_and_create_runs"
+        if observer is not None:
+            authentication = app.state.authentication
+            if not isinstance(authentication, AuthenticationRuntime):
+                raise AssertionError(
+                    "M21 profiling requires the concrete authentication runtime"
+                )
+            observer.attach_engine("api", authentication.engine)
+        change_phase("seed_and_create_runs")
         owners = await _seed_workflows(sessions, configuration.owner_count)
         run_service = WorkflowRunService(SQLAlchemyWorkflowRunRepository(sessions))
         runs_with_owners = []
@@ -350,7 +375,7 @@ async def run_m21_workload(
                 runs_with_owners.append((run, owner))
         runs = [run for run, _ in runs_with_owners]
         run_ids = [run.id for run in runs]
-        current_phase = "runnable_checkpoint"
+        change_phase("runnable_checkpoint")
         runnable = await setup.fetch(
             "SELECT workflow_run_id, id, step_identifier, status::text "
             "FROM task_runs WHERE workflow_run_id = ANY($1::uuid[]) "
@@ -368,7 +393,7 @@ async def run_m21_workload(
             "runnable_tasks": 100,
         }
 
-        current_phase = "consumer_registration"
+        change_phase("consumer_registration")
         workers = [
             await add_worker(setup, capability="workload.execute")
             for _ in range(configuration.worker_count)
@@ -451,6 +476,7 @@ async def run_m21_workload(
             nonlocal subscriber_ready_count
             messages: list[dict[str, Any]] = []
             subscriber_messages[run_id] = messages
+            handshake_started = asyncio.get_running_loop().time()
             async with httpx2.AsyncClient(
                 timeout=configuration.phase_timeout_seconds
             ) as client:
@@ -459,6 +485,10 @@ async def run_m21_workload(
                     params={"cursor": "0"},
                     headers={"Authorization": f"Bearer {credential}"},
                 ) as websocket:
+                    if observer is not None:
+                        observer.websocket_handshake_completed(
+                            asyncio.get_running_loop().time() - handshake_started
+                        )
                     subscriber_ready_count += 1
                     if subscriber_ready_count == configuration.subscriber_count:
                         subscriber_ready.set()
@@ -471,6 +501,8 @@ async def run_m21_workload(
                         )
                         messages.append(message)
                         event = message.get("event")
+                        if isinstance(event, dict) and observer is not None:
+                            observer.websocket_event_received()
                         if (
                             isinstance(event, dict)
                             and event.get("event_type") == "workflow_run.status_changed"
@@ -478,7 +510,7 @@ async def run_m21_workload(
                         ):
                             return
 
-        current_phase = "websocket_handshakes"
+        change_phase("websocket_handshakes")
         subscriber_tasks = [
             asyncio.create_task(subscribe(run.id, owner.credential))
             for run, owner in runs_with_owners
@@ -505,7 +537,7 @@ async def run_m21_workload(
         }
 
         if observer is not None:
-            current_phase = "measurement_start"
+            change_phase("measurement_start")
             assert broker.transport is not None
             server_properties = broker.transport.connection.server_properties
             await observer.start(
@@ -520,7 +552,7 @@ async def run_m21_workload(
                 runtimes=runtimes,
             )
 
-        current_phase = "dispatch_creation"
+        change_phase("dispatch_creation")
         dispatch_service = TaskDispatchService(
             SQLAlchemyTaskDispatchRepository(sessions), task_types
         )
@@ -540,7 +572,7 @@ async def run_m21_workload(
                 selected_dispatches.add(item.dispatch_id)
         assert len(dispatched) == 100
         publication_counts["durable_dispatches"] = len(dispatched)
-        current_phase = "broker_publication"
+        change_phase("broker_publication")
         publisher = TaskDispatchPublisher(
             SQLAlchemyDispatchOutboxRepository(sessions),
             RabbitMQDispatchPublisher(topology.exchange, timeout_seconds=5),
@@ -559,7 +591,7 @@ async def run_m21_workload(
             "admitted_deliveries": sum(runtime.in_flight for runtime in runtimes),
             "handler_entries": sum(item.handler_invocations for item in distributions),
         }
-        current_phase = "worker_contention"
+        change_phase("worker_contention")
         async with asyncio.timeout(configuration.phase_timeout_seconds):
             await concurrent.wait()
         evidence.checkpoints["contention"] = {
@@ -568,7 +600,7 @@ async def run_m21_workload(
         }
         gate.set()
 
-        current_phase = "execution_completion"
+        change_phase("execution_completion")
         async with asyncio.timeout(configuration.phase_timeout_seconds):
             while True:
                 succeeded_tasks = await setup.fetchval(
@@ -579,7 +611,7 @@ async def run_m21_workload(
                 if succeeded_tasks == 100 and selected_dispatches <= requeued:
                     break
                 await asyncio.sleep(0.05)
-        current_phase = "run_reconciliation"
+        change_phase("run_reconciliation")
         for run in runs:
             reconciled = await run_service.reconcile_workflow_run(run.id)
             assert reconciled.final_status is not None
@@ -587,7 +619,7 @@ async def run_m21_workload(
         async with asyncio.timeout(configuration.phase_timeout_seconds):
             await asyncio.gather(*subscriber_tasks)
 
-        current_phase = "authoritative_invariants"
+        change_phase("authoritative_invariants")
         assert (
             await setup.fetchval(
                 "SELECT count(*) FROM task_runs WHERE workflow_run_id = ANY($1::uuid[]) "
@@ -634,7 +666,7 @@ async def run_m21_workload(
             assert events[-1]["cursor"] == persisted[-1]["cursor"]
             assert events[-1]["payload"]["status"] == "succeeded"
 
-        current_phase = "broker_drain"
+        change_phase("broker_drain")
         async with asyncio.timeout(configuration.phase_timeout_seconds):
             while True:
                 declaration = await queue.declare()
@@ -651,7 +683,7 @@ async def run_m21_workload(
         }
 
         if observer is not None:
-            current_phase = "measurement_finish"
+            change_phase("measurement_finish")
             await observer.finish(
                 setup=setup,
                 run_ids=run_ids,
@@ -659,7 +691,7 @@ async def run_m21_workload(
                 runtimes=runtimes,
             )
 
-        current_phase = "write_success_evidence"
+        change_phase("write_success_evidence")
         evidence.status = "passed"
         evidence.worker_distribution = distributions
         evidence.redelivery_dispatches = [

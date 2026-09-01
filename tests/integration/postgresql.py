@@ -45,6 +45,7 @@ SAFE_DATABASE_NAME = re.compile(
     r"|taskforge_cred_lifecycle_[0-9a-f]{32}\Z"
     r"|taskforge_m21_workload_[0-9a-f]{32}\Z"
     r"|taskforge_m21_measurement_[0-9a-f]{32}\Z"
+    r"|taskforge_m21_profiling_[0-9a-f]{32}\Z"
     r"|taskforge_m21_contention_(?:rc|dj|cl|rs|ca|ts)_[0-9a-f]{32}\Z"
 )
 

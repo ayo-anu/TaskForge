@@ -23,6 +23,7 @@ from uuid import UUID
 
 import asyncpg
 import httpx2
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from taskforge.worker.lifecycle import WorkerDispatchRuntime
 from tests.integration.postgresql import asyncpg_dsn
@@ -259,6 +260,19 @@ class M21MeasurementObserverImpl:
         self._database: Any = None
         self._api_client: httpx2.AsyncClient | None = None
         self._started_at = 0.0
+
+    def attach_engine(self, role: str, engine: AsyncEngine) -> None:
+        """Task 2 deliberately does not collect statement-level measurements."""
+        del role, engine
+
+    def phase_changed(self, phase: str) -> None:
+        del phase
+
+    def websocket_handshake_completed(self, duration_seconds: float) -> None:
+        del duration_seconds
+
+    def websocket_event_received(self) -> None:
+        pass
 
     async def start(
         self,
