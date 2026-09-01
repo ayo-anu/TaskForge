@@ -1,5 +1,11 @@
 # Taskforge
 
+## Performance and concurrency
+
+See [Performance and concurrency reference](PERFORMANCE.md) for the reproducible
+Milestone 21 workload, uninstrumented local baseline, profiling observations,
+contention scope, reproduction commands, and known limitations.
+
 ## Operational metric queries
 
 Taskforge emits OpenTelemetry metrics when metrics are enabled. This section is
