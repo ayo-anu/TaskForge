@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -76,7 +76,10 @@ def _points(reader: InMemoryMetricReader, name: str) -> tuple[Any, ...]:
     return tuple(_metrics(reader)[name].data.data_points)
 
 
-def test_instrument_names_types_and_units_are_exact() -> None:
+def test_instrument_names_types_and_units_are_exact(
+    metric_reader: InMemoryMetricReader,
+) -> None:
+    del metric_reader
     expected = {
         "taskforge.api.requests": ("Counter", "{request}"),
         "taskforge.api.request.duration": ("Histogram", "s"),
@@ -112,12 +115,19 @@ def test_instrument_names_types_and_units_are_exact() -> None:
         "taskforge.websocket.resume.outcomes": ("Counter", "{connection}"),
         "taskforge.dependency.state.transitions": ("Counter", "{transition}"),
         "taskforge.process.readiness.transitions": ("Counter", "{transition}"),
+        "taskforge.orchestrator.passes": ("Counter", "{pass}"),
+        "taskforge.orchestrator.pass.duration": ("Histogram", "s"),
+        "taskforge.orchestrator.candidates": ("Counter", "{candidate}"),
+        "taskforge.orchestrator.transitions": ("Counter", "{transition}"),
     }
     assert set(task_metrics._instruments) == set(expected)
     for name, (kind, unit) in expected.items():
         instrument = task_metrics._instruments[name]
         assert type(instrument).__name__.endswith(kind)
-        assert instrument._unit == unit
+        exposed_unit = getattr(instrument, "_unit", None)
+        if exposed_unit is None:
+            exposed_unit = cast(Any, instrument).unit
+        assert exposed_unit == unit
 
 
 @pytest.mark.parametrize(
@@ -131,6 +141,7 @@ def test_instrument_names_types_and_units_are_exact() -> None:
         ("taskforge.handler.duration", HANDLER_DURATION_BUCKETS),
         ("taskforge.recovery.duration", FAST_DURATION_BUCKETS),
         ("taskforge.websocket.connection.duration", WEBSOCKET_DURATION_BUCKETS),
+        ("taskforge.orchestrator.pass.duration", FAST_DURATION_BUCKETS),
     ),
 )
 def test_histograms_use_explicit_buckets(

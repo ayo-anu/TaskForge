@@ -334,6 +334,14 @@ _INSTRUMENT_ATTRIBUTE_KEYS: Final[dict[str, frozenset[str]]] = {
     "taskforge.process.readiness.transitions": frozenset(
         {"taskforge.readiness.status"}
     ),
+    "taskforge.orchestrator.passes": frozenset(
+        {"taskforge.workload", "taskforge.outcome"}
+    ),
+    "taskforge.orchestrator.pass.duration": frozenset(
+        {"taskforge.workload", "taskforge.outcome"}
+    ),
+    "taskforge.orchestrator.candidates": frozenset({"taskforge.workload"}),
+    "taskforge.orchestrator.transitions": frozenset({"taskforge.workload"}),
 }
 
 _ATTRIBUTE_VALUES_BY_INSTRUMENT_KEY: Final[dict[tuple[str, str], frozenset[str]]] = {}
@@ -578,6 +586,25 @@ _allow(
     "degraded",
     "not_ready",
 )
+for _orchestrator_name in (
+    "taskforge.orchestrator.passes",
+    "taskforge.orchestrator.pass.duration",
+    "taskforge.orchestrator.candidates",
+    "taskforge.orchestrator.transitions",
+):
+    _allow(
+        _orchestrator_name,
+        "taskforge.workload",
+        "progression_dispatch",
+        "retry",
+        "recovery",
+        "outbox",
+    )
+for _orchestrator_name in (
+    "taskforge.orchestrator.passes",
+    "taskforge.orchestrator.pass.duration",
+):
+    _allow(_orchestrator_name, "taskforge.outcome", "completed", "failed")
 
 
 def _counter(name: str, unit: str) -> metrics.Counter:
@@ -617,6 +644,9 @@ def _build_instruments() -> dict[str, object]:
         "taskforge.websocket.resume.outcomes": "{connection}",
         "taskforge.dependency.state.transitions": "{transition}",
         "taskforge.process.readiness.transitions": "{transition}",
+        "taskforge.orchestrator.passes": "{pass}",
+        "taskforge.orchestrator.candidates": "{candidate}",
+        "taskforge.orchestrator.transitions": "{transition}",
     }
     histograms = {
         "taskforge.api.request.duration": "s",
@@ -627,6 +657,7 @@ def _build_instruments() -> dict[str, object]:
         "taskforge.handler.duration": "s",
         "taskforge.recovery.duration": "s",
         "taskforge.websocket.connection.duration": "s",
+        "taskforge.orchestrator.pass.duration": "s",
     }
     up_down = {
         "taskforge.worker.running.deliveries": "{delivery}",
@@ -666,6 +697,7 @@ def _views() -> tuple[View, ...]:
         "taskforge.handler.duration": HANDLER_DURATION_BUCKETS,
         "taskforge.recovery.duration": FAST_DURATION_BUCKETS,
         "taskforge.websocket.connection.duration": WEBSOCKET_DURATION_BUCKETS,
+        "taskforge.orchestrator.pass.duration": FAST_DURATION_BUCKETS,
     }
     return tuple(
         View(

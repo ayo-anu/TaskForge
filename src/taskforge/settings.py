@@ -286,3 +286,11 @@ class WorkerSettings(Settings):
                 "worker control timeout must be below one-third claim lease"
             )
         return self
+
+
+class OrchestratorSettings(Settings):
+    """Production orchestrator settings for bounded continuous passes."""
+
+    orchestrator_batch_size: int = Field(default=100, ge=1, le=100)
+    orchestrator_poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+    orchestrator_publication_timeout_seconds: float = Field(default=5.0, gt=0, le=30)

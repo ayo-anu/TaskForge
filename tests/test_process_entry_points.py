@@ -12,6 +12,7 @@ import pytest
 
 from taskforge.api.__main__ import main as api_main
 from taskforge.logging import uvicorn_log_config
+from taskforge.orchestrator.__main__ import main as orchestrator_main
 from taskforge.worker.__main__ import main as worker_main
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +61,38 @@ def test_worker_process_returns_stable_runtime_status(
     monkeypatch.setattr("taskforge.worker.__main__.WorkerApplication", Application)
 
     assert worker_main() == expected
+
+
+@pytest.mark.parametrize(("error", "expected"), ((None, 0), (RuntimeError(), 1)))
+def test_orchestrator_process_returns_stable_runtime_status(
+    monkeypatch: pytest.MonkeyPatch, error: Exception | None, expected: int
+) -> None:
+    class Application:
+        def __init__(self, settings: object) -> None:
+            del settings
+
+        async def run(self) -> None:
+            if error is not None:
+                raise error
+
+    monkeypatch.setenv("POSTGRES_PASSWORD", "test-postgres-password")
+    monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "test-rabbitmq-password")
+    monkeypatch.setattr(
+        "taskforge.orchestrator.__main__.OrchestratorApplication", Application
+    )
+
+    assert orchestrator_main() == expected
+
+
+def test_orchestrator_process_fails_closed_without_dependency_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
+    monkeypatch.delenv("TASKFORGE_POSTGRES_PASSWORD", raising=False)
+    monkeypatch.delenv("RABBITMQ_DEFAULT_PASS", raising=False)
+    monkeypatch.delenv("TASKFORGE_RABBITMQ_PASSWORD", raising=False)
+
+    assert orchestrator_main() == 2
 
 
 def test_api_entry_point_uses_typed_runtime_settings(

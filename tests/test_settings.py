@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import os
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 
-from taskforge.settings import OwnerSettings, Settings, WorkerSettings
+from taskforge.settings import (
+    OrchestratorSettings,
+    OwnerSettings,
+    Settings,
+    WorkerSettings,
+)
 
 ENVIRONMENT_PREFIX = "TASKFORGE_"
 DEPENDENCY_ENVIRONMENT_VARIABLES = {
@@ -85,6 +91,32 @@ def test_settings_have_safe_local_defaults() -> None:
         "taskforge.dispatch.malformed.v1"
     )
     assert settings.rabbitmq_topology_timeout_seconds == 5.0
+
+
+def test_orchestrator_settings_have_bounded_defaults() -> None:
+    settings = OrchestratorSettings()
+
+    assert settings.orchestrator_batch_size == 100
+    assert settings.orchestrator_poll_interval_seconds == 1.0
+    assert settings.orchestrator_publication_timeout_seconds == 5.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("orchestrator_batch_size", 0),
+        ("orchestrator_batch_size", 101),
+        ("orchestrator_poll_interval_seconds", 0),
+        ("orchestrator_poll_interval_seconds", 61),
+        ("orchestrator_publication_timeout_seconds", 0),
+        ("orchestrator_publication_timeout_seconds", 31),
+    ),
+)
+def test_orchestrator_settings_reject_values_outside_bounds(
+    field: str, value: int
+) -> None:
+    with pytest.raises(ValidationError):
+        OrchestratorSettings(**cast(Any, {field: value}))
 
 
 def test_settings_accept_prefixed_environment_overrides(
