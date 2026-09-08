@@ -18,6 +18,8 @@ from taskforge.claims.domain import (
     TaskClaimRejected,
     TaskClaimRejectionReason,
     TaskClaimRenewalOutcome,
+    TaskClaimRenewalRejected,
+    TaskClaimRenewalRejectionReason,
     TaskClaimRenewalRequest,
     TaskClaimRenewalResult,
     TaskClaimResult,
@@ -31,6 +33,10 @@ from taskforge.claims.persistence_ports import (
     TaskClaimInvariantViolation,
     TaskClaimNotEligible,
     TaskClaimPersistenceUnavailable,
+    TaskClaimRenewalExpired,
+    TaskClaimRenewalRecovered,
+    TaskClaimRenewalStale,
+    TaskClaimRenewalTaskInactive,
     TaskClaimSessionInactive,
     TaskClaimSessionUnavailable,
     TaskClaimWorkerUnavailable,
@@ -53,10 +59,12 @@ class FakeRepository:
         result: TaskClaimResult,
         renewal_result: TaskClaimRenewalResult | None = None,
         acquisition_error: Exception | None = None,
+        renewal_error: Exception | None = None,
     ) -> None:
         self.result = result
         self.renewal_result = renewal_result
         self.acquisition_error = acquisition_error
+        self.renewal_error = renewal_error
         self.call: tuple[Any, ...] | None = None
 
     async def acquire_claim(self, *args: Any, **kwargs: Any) -> TaskClaimResult:
@@ -67,6 +75,8 @@ class FakeRepository:
 
     async def renew_claim(self, *args: Any, **kwargs: Any) -> TaskClaimRenewalResult:
         self.call = (*args, kwargs)
+        if self.renewal_error is not None:
+            raise self.renewal_error
         assert self.renewal_result is not None
         return self.renewal_result
 
@@ -171,6 +181,58 @@ def test_service_forwards_renewal_without_result_authority() -> None:
     )
     assert asyncio.run(service.renew_claim(worker, request)) is renewal
     assert repository.call == (worker, request, {"lease_seconds": 60})
+
+
+@pytest.mark.parametrize(
+    ("repository_error", "expected_reason"),
+    (
+        (TaskClaimRenewalExpired(), TaskClaimRenewalRejectionReason.EXPIRED),
+        (TaskClaimRenewalRecovered(), TaskClaimRenewalRejectionReason.RECOVERED),
+        (TaskClaimRenewalStale(), TaskClaimRenewalRejectionReason.STALE),
+        (
+            TaskClaimRenewalTaskInactive(),
+            TaskClaimRenewalRejectionReason.TASK_INACTIVE,
+        ),
+        (
+            TaskClaimAuthorityRejected(),
+            TaskClaimRenewalRejectionReason.WORKER_AUTHORITY_REJECTED,
+        ),
+        (
+            TaskClaimSessionUnavailable(),
+            TaskClaimRenewalRejectionReason.WORKER_SESSION_UNAVAILABLE,
+        ),
+        (
+            TaskClaimSessionInactive(),
+            TaskClaimRenewalRejectionReason.WORKER_SESSION_INACTIVE,
+        ),
+    ),
+)
+def test_service_preserves_claim_renewal_rejection_reason(
+    repository_error: Exception,
+    expected_reason: TaskClaimRenewalRejectionReason,
+) -> None:
+    acquired = datetime.now(UTC)
+    lease = TaskClaimLease(
+        uuid4(), 2, uuid4(), acquired, acquired + timedelta(seconds=60)
+    )
+    repository = FakeRepository(
+        TaskClaimResult(TaskClaimOutcome.ACQUIRED_ACTIVE, lease),
+        renewal_error=repository_error,
+    )
+    service = TaskClaimService(
+        repository, TaskClaimResultAuthorityIssuer(b"a" * 32), lease_seconds=60
+    )
+    request = TaskClaimRenewalRequest(
+        lease.task_attempt_id,
+        lease.generation,
+        lease.worker_session_id,
+        lease.lease_expires_at,
+    )
+
+    with pytest.raises(TaskClaimRenewalRejected) as raised:
+        asyncio.run(service.renew_claim(AuthenticatedWorker(uuid4(), uuid4()), request))
+
+    assert raised.value.reason is expected_reason
 
 
 @pytest.mark.parametrize(

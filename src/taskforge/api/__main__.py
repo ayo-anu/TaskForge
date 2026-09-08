@@ -42,7 +42,7 @@ def main() -> int:
     )
     try:
         uvicorn.run(
-            "taskforge.api.application:create_app",
+            "taskforge.api.application:create_production_app",
             factory=True,
             host=settings.api_host,
             port=settings.api_port,

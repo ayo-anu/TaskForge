@@ -254,3 +254,35 @@ class OwnerSettings(Settings):
     postgres_password: SecretStr = Field(
         validation_alias="POSTGRES_OWNER_PASSWORD",
     )
+
+
+class WorkerSettings(Settings):
+    """Production worker settings without configurable executable imports."""
+
+    worker_credential: SecretStr
+    worker_profile: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z][a-z0-9_.-]{0,127}$",
+    )
+    worker_heartbeat_interval_seconds: float = Field(default=10.0, gt=0, le=300)
+    worker_prefetch_count: int = Field(default=1, ge=1, le=128)
+    worker_control_operation_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+
+    @model_validator(mode="after")
+    def validate_worker_control_timing(self) -> WorkerSettings:
+        timeout = self.worker_control_operation_timeout_seconds
+        if timeout >= self.worker_heartbeat_interval_seconds:
+            raise ValueError("worker control timeout must be below heartbeat interval")
+        if (
+            self.worker_heartbeat_interval_seconds + timeout
+            >= self.worker_stale_after_seconds
+        ):
+            raise ValueError(
+                "worker heartbeat timing must remain below stale threshold"
+            )
+        if timeout * 3 >= self.task_claim_lease_seconds:
+            raise ValueError(
+                "worker control timeout must be below one-third claim lease"
+            )
+        return self

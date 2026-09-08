@@ -20,6 +20,9 @@ from taskforge.claims.domain import (
     TaskClaimOutcome,
     TaskClaimRejected,
     TaskClaimRejectionReason,
+    TaskClaimRenewalOutcome,
+    TaskClaimRenewalRequest,
+    TaskClaimRenewalResult,
 )
 from taskforge.dispatch.envelope import (
     TraceContext,
@@ -34,6 +37,7 @@ from taskforge.worker.cancellation import (
     TaskCancellationObservation,
     TaskCancellationObservationOutcome,
 )
+from taskforge.worker.claim_renewal import ClaimRenewalSupervisor
 from taskforge.worker.consumer_ports import (
     BrokerConsumerUnavailable,
     BrokerDispatchDelivery,
@@ -56,6 +60,7 @@ from taskforge.worker.result_submission import (
     TaskResultInvalidState,
     TaskResultInvariantError,
     TaskResultNotFound,
+    TaskResultRateLimited,
     TaskResultServiceUnavailable,
     TaskResultStale,
     TaskResultSubmissionOutcome,
@@ -69,6 +74,7 @@ from taskforge.worker.results import (
     TaskPermanentFailure,
     TaskRetryableFailure,
 )
+from taskforge.worker.runtime_errors import WorkerProcessFailure
 from taskforge.worker.start import (
     TaskStartInvariantError,
     TaskStartOutcome,
@@ -181,6 +187,41 @@ class CancellationObserver:
         index = min(self.calls, len(self.observations) - 1)
         self.calls += 1
         return self.observations[index]
+
+
+class RenewalService:
+    async def renew_claim(
+        self,
+        worker: AuthenticatedWorker,
+        request: TaskClaimRenewalRequest,
+    ) -> TaskClaimRenewalResult:
+        del worker
+        return TaskClaimRenewalResult(
+            TaskClaimRenewalOutcome.RENEWED,
+            TaskClaimLease(
+                request.task_attempt_id,
+                request.generation,
+                request.worker_session_id,
+                request.expected_lease_expires_at,
+                request.expected_lease_expires_at + timedelta(seconds=60),
+            ),
+        )
+
+
+def renewal_supervisor(
+    observer: Any,
+    worker: AuthenticatedWorker,
+    issued: IssuedTaskClaim,
+) -> ClaimRenewalSupervisor:
+    return ClaimRenewalSupervisor(
+        RenewalService(),
+        observer,
+        worker,
+        issued.claim.worker_session_id,
+        lease_seconds=60,
+        operation_timeout_seconds=0.1,
+        observation_poll_seconds=0.001,
+    )
 
 
 def fixture(
@@ -1042,7 +1083,7 @@ def test_initial_lost_authority_acks_without_handler_result_or_monitor(
     observer = CancellationObserver(
         [
             TaskCancellationObservation(
-                TaskCancellationObservationOutcome.NO_LONGER_AUTHORITATIVE
+                TaskCancellationObservationOutcome.CLAIM_RECOVERED
             )
         ]
     )
@@ -1112,6 +1153,7 @@ def test_running_handler_observes_monotonic_cancellation_token() -> None:
         worker,
         issued.claim.worker_session_id,
         observer,
+        renewal_supervisor(observer, worker, issued),
         cancellation_poll_seconds=0.001,
     )
 
@@ -1119,4 +1161,242 @@ def test_running_handler_observes_monotonic_cancellation_token() -> None:
 
     assert observer.calls >= 2
     assert results.requests[0].result.kind is TaskExecutionResultKind.CANCELLATION
+    assert control.actions == ["ack"]
+
+
+def test_running_handler_expiry_quiesces_without_result_or_early_ack() -> None:
+    class ExpiryThenRecoveryObserver:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.expired = asyncio.Event()
+            self.allow_recovery = asyncio.Event()
+
+        async def observe_cancellation(self, *args: Any) -> TaskCancellationObservation:
+            del args
+            self.calls += 1
+            if self.calls == 1:
+                return TaskCancellationObservation(
+                    TaskCancellationObservationOutcome.ACTIVE
+                )
+            self.expired.set()
+            if self.allow_recovery.is_set():
+                return TaskCancellationObservation(
+                    TaskCancellationObservationOutcome.CLAIM_RECOVERED
+                )
+            return TaskCancellationObservation(
+                TaskCancellationObservationOutcome.CLAIM_EXPIRED_AWAITING_RECOVERY
+            )
+
+    async def scenario() -> None:
+        _, control, issued, worker, _ = fixture()
+        observer = ExpiryThenRecoveryObserver()
+        handler_started = asyncio.Event()
+        handler_cancelled = asyncio.Event()
+
+        async def handler(context: TaskContext) -> object:
+            del context
+            handler_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                handler_cancelled.set()
+                raise
+            return None
+
+        results = ResultService()
+        consumer = WorkerExecutionConsumer(
+            ClaimService(issued),
+            StartService([]),
+            results,
+            registry(handler),
+            worker,
+            issued.claim.worker_session_id,
+            observer,
+            renewal_supervisor(observer, worker, issued),
+            cancellation_poll_seconds=0.001,
+        )
+        consuming = asyncio.create_task(consumer.consume(control))
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+        await asyncio.wait_for(observer.expired.wait(), timeout=1)
+        await asyncio.wait_for(handler_cancelled.wait(), timeout=1)
+
+        assert not consuming.done()
+        assert results.requests == []
+        assert control.actions == []
+
+        observer.allow_recovery.set()
+        await asyncio.wait_for(consuming, timeout=1)
+        assert results.requests == []
+        assert control.actions == ["ack"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    (
+        TaskCancellationObservationOutcome.CLAIM_RECOVERED,
+        TaskCancellationObservationOutcome.ATTEMPT_OR_GENERATION_OBSOLETE,
+        TaskCancellationObservationOutcome.TASK_INACTIVE,
+    ),
+)
+def test_running_handler_ack_safe_authority_loss_cancels_without_result_or_process_failure(
+    outcome: TaskCancellationObservationOutcome,
+) -> None:
+    async def scenario() -> None:
+        _, control, issued, worker, _ = fixture()
+        observer = CancellationObserver(
+            [
+                TaskCancellationObservation(TaskCancellationObservationOutcome.ACTIVE),
+                TaskCancellationObservation(outcome),
+            ]
+        )
+        handler_started = asyncio.Event()
+        handler_cancelled = asyncio.Event()
+
+        async def handler(context: TaskContext) -> object:
+            del context
+            handler_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                handler_cancelled.set()
+                raise
+            return None
+
+        results = ResultService()
+        consumer = WorkerExecutionConsumer(
+            ClaimService(issued),
+            StartService([]),
+            results,
+            registry(handler),
+            worker,
+            issued.claim.worker_session_id,
+            observer,
+            renewal_supervisor(observer, worker, issued),
+            cancellation_poll_seconds=0.001,
+        )
+
+        await asyncio.wait_for(consumer.consume(control), timeout=1)
+
+        assert handler_started.is_set()
+        assert handler_cancelled.is_set()
+        assert results.requests == []
+        assert control.actions == ["ack"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    (
+        TaskCancellationObservationOutcome.WORKER_AUTHORITY_REJECTED,
+        TaskCancellationObservationOutcome.WORKER_SESSION_INACTIVE,
+    ),
+)
+def test_process_authority_loss_from_monitor_stops_delivery_without_result_or_ack(
+    outcome: TaskCancellationObservationOutcome,
+) -> None:
+    _, control, issued, worker, _ = fixture()
+    observer = CancellationObserver(
+        [
+            TaskCancellationObservation(TaskCancellationObservationOutcome.ACTIVE),
+            TaskCancellationObservation(outcome),
+        ]
+    )
+    cancelled = False
+
+    async def handler(context: TaskContext) -> object:
+        nonlocal cancelled
+        del context
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        return None
+
+    results = ResultService()
+    consumer = WorkerExecutionConsumer(
+        ClaimService(issued),
+        StartService([]),
+        results,
+        registry(handler),
+        worker,
+        issued.claim.worker_session_id,
+        observer,
+        renewal_supervisor(observer, worker, issued),
+        cancellation_poll_seconds=0.001,
+    )
+
+    with pytest.raises(WorkerProcessFailure):
+        asyncio.run(consumer.consume(control))
+
+    assert cancelled
+    assert results.requests == []
+    assert control.actions == []
+
+
+def test_result_rate_limit_retries_same_request_under_claim_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, control, issued, worker, _ = fixture()
+
+    class Guard:
+        def __init__(self) -> None:
+            self.protected = 0
+
+        def start(self) -> None:
+            pass
+
+        async def protect(self, operation: Any) -> Any:
+            self.protected += 1
+            return await operation
+
+        async def quiesce(self) -> None:
+            raise AssertionError("active rate-limited claim must not quiesce")
+
+        async def close(self) -> None:
+            pass
+
+    guard = Guard()
+
+    class Renewal:
+        def guard(self, *args: Any) -> Guard:
+            return guard
+
+    class RateLimitedResultService(ResultService):
+        async def submit_result(self, *args: Any) -> TaskResultSubmissionReceipt:
+            request = args[-1]
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise TaskResultRateLimited(1)
+            return TaskResultSubmissionReceipt(
+                TaskResultSubmissionOutcome.ACCEPTED, request.task_attempt_id
+            )
+
+    async def immediate_sleep(delay: float) -> None:
+        del delay
+
+    async def handler(context: TaskContext) -> object:
+        del context
+        return {"ok": True}
+
+    monkeypatch.setattr("taskforge.worker.execution.asyncio.sleep", immediate_sleep)
+    results = RateLimitedResultService()
+    consumer = WorkerExecutionConsumer(
+        ClaimService(issued),
+        StartService([]),
+        results,
+        registry(handler),
+        worker,
+        issued.claim.worker_session_id,
+        claim_renewal=Renewal(),  # type: ignore[arg-type]
+    )
+
+    asyncio.run(consumer.consume(control))
+
+    assert len(results.requests) == 2
+    assert results.requests[0] == results.requests[1]
+    assert guard.protected >= 5
     assert control.actions == ["ack"]

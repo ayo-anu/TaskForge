@@ -6,7 +6,6 @@ import importlib
 import os
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -24,8 +23,6 @@ PACKAGE_NAMES = (
     "taskforge.orchestrator",
     "taskforge.worker",
 )
-PROCESS_MODULES = ("taskforge.worker",)
-PROCESS_ENTRY_POINTS = (worker_main,)
 
 
 @pytest.mark.parametrize("package_name", PACKAGE_NAMES)
@@ -35,9 +32,34 @@ def test_package_boundary_is_importable(package_name: str) -> None:
     assert module.__name__ == package_name
 
 
-@pytest.mark.parametrize("entry_point", PROCESS_ENTRY_POINTS)
-def test_process_entry_point_returns_success(entry_point: Callable[[], int]) -> None:
-    assert entry_point() == 0
+def test_worker_process_fails_closed_without_required_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TASKFORGE_WORKER_CREDENTIAL", raising=False)
+    monkeypatch.delenv("TASKFORGE_WORKER_PROFILE", raising=False)
+
+    assert worker_main() == 2
+
+
+@pytest.mark.parametrize(("error", "expected"), ((None, 0), (RuntimeError(), 1)))
+def test_worker_process_returns_stable_runtime_status(
+    monkeypatch: pytest.MonkeyPatch, error: Exception | None, expected: int
+) -> None:
+    class Application:
+        def __init__(self, settings: object) -> None:
+            del settings
+
+        async def run(self) -> None:
+            if error is not None:
+                raise error
+
+    monkeypatch.setenv("POSTGRES_PASSWORD", "test-postgres-password")
+    monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "test-rabbitmq-password")
+    monkeypatch.setenv("TASKFORGE_WORKER_CREDENTIAL", "configured-for-fake")
+    monkeypatch.setenv("TASKFORGE_WORKER_PROFILE", "test-profile")
+    monkeypatch.setattr("taskforge.worker.__main__.WorkerApplication", Application)
+
+    assert worker_main() == expected
 
 
 def test_api_entry_point_uses_typed_runtime_settings(
@@ -61,7 +83,7 @@ def test_api_entry_point_uses_typed_runtime_settings(
 
     assert api_main() == 0
     assert invocation == {
-        "app": "taskforge.api.application:create_app",
+        "app": "taskforge.api.application:create_production_app",
         "factory": True,
         "host": "127.0.0.2",
         "port": 8765,
@@ -71,13 +93,12 @@ def test_api_entry_point_uses_typed_runtime_settings(
     }
 
 
-@pytest.mark.parametrize("module_name", PROCESS_MODULES)
-def test_process_entry_point_exits_cleanly(module_name: str) -> None:
+def test_worker_process_module_fails_closed_without_required_settings() -> None:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(SOURCE_ROOT)
 
     result = subprocess.run(
-        [sys.executable, "-m", module_name],
+        [sys.executable, "-m", "taskforge.worker"],
         cwd=PROJECT_ROOT,
         env=environment,
         capture_output=True,
@@ -85,6 +106,6 @@ def test_process_entry_point_exits_cleanly(module_name: str) -> None:
         text=True,
     )
 
-    assert result.returncode == 0
+    assert result.returncode == 2
     assert result.stdout == ""
-    assert result.stderr == ""
+    assert result.stderr == "taskforge worker configuration is invalid\n"

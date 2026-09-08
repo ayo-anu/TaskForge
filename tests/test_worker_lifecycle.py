@@ -255,6 +255,39 @@ def test_broker_cancellation_failure_stays_stopping_and_can_retry() -> None:
     asyncio.run(scenario())
 
 
+def test_broker_cancellation_failure_still_drains_admitted_work() -> None:
+    async def scenario() -> None:
+        consumer = Consumer()
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+
+        async def handler(control: Any) -> None:
+            del control
+            handler_started.set()
+            await release_handler.wait()
+
+        runtime = await start_runtime(consumer, handler)
+        delivery = asyncio.create_task(consumer.handler(object()))
+        await handler_started.wait()
+        consumer.cancellation_errors.append(BrokerConsumerUnavailable())
+        shutdown = asyncio.create_task(runtime.shutdown())
+        await consumer.cancellation_started.wait()
+        await asyncio.sleep(0)
+        assert not shutdown.done()
+
+        release_handler.set()
+        await delivery
+        with pytest.raises(BrokerConsumerUnavailable):
+            await shutdown
+        assert runtime.in_flight == 0
+        assert runtime.state is WorkerDispatchRuntimeState.STOPPING
+
+        consumer.release_cancellation.set()
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_cancelling_one_shutdown_waiter_does_not_cancel_shared_drain() -> None:
     async def scenario() -> None:
         consumer = Consumer()
@@ -332,5 +365,78 @@ def test_callback_admitted_while_cancellation_is_unconfirmed_is_drained() -> Non
 
         with pytest.raises(WorkerDispatchRuntimeInvariantError):
             await consumer.handler(object())
+
+    asyncio.run(scenario())
+
+
+def test_paused_subscription_cannot_execute_before_explicit_activation() -> None:
+    async def scenario() -> None:
+        consumer = Consumer()
+        consumer.release_registration.set()
+        handled = asyncio.Event()
+
+        async def handler(control: Any) -> None:
+            del control
+            handled.set()
+
+        runtime = WorkerDispatchRuntime(consumer, handler)
+        await runtime.start(paused=True)
+        delivery = asyncio.create_task(consumer.handler(object()))
+        await asyncio.sleep(0)
+        assert not handled.is_set()
+        assert runtime.in_flight == 1
+
+        await runtime.activate()
+        await delivery
+        assert handled.is_set()
+        consumer.release_cancellation.set()
+        await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_before_activation_releases_delivery_without_handling() -> None:
+    async def scenario() -> None:
+        consumer = Consumer()
+        consumer.release_registration.set()
+        handled = False
+
+        async def handler(control: Any) -> None:
+            nonlocal handled
+            del control
+            handled = True
+
+        runtime = WorkerDispatchRuntime(consumer, handler)
+        await runtime.start(paused=True)
+        delivery = asyncio.create_task(consumer.handler(object()))
+        await asyncio.sleep(0)
+        shutdown = asyncio.create_task(runtime.shutdown())
+        await consumer.cancellation_started.wait()
+        consumer.release_cancellation.set()
+        await delivery
+        await shutdown
+
+        assert not handled
+        assert runtime.in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_callback_failure_is_visible_to_parent_runtime_supervision() -> None:
+    async def scenario() -> None:
+        consumer = Consumer()
+
+        async def handler(control: Any) -> None:
+            del control
+            raise RuntimeError("handler failed")
+
+        runtime = await start_runtime(consumer, handler)
+        delivery = asyncio.create_task(consumer.handler(object()))
+        with pytest.raises(RuntimeError, match="handler failed"):
+            await runtime.wait_failed()
+        with pytest.raises(RuntimeError, match="handler failed"):
+            await delivery
+        consumer.release_cancellation.set()
+        await runtime.shutdown()
 
     asyncio.run(scenario())

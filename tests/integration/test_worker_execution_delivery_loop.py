@@ -28,9 +28,11 @@ from taskforge.dispatch.envelope import (
 )
 from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
 from taskforge.persistence.database import build_session_factory
+from taskforge.persistence.task_cancellation import SQLAlchemyTaskCancellationObserver
 from taskforge.persistence.task_results import SQLAlchemyTaskResultRepository
 from taskforge.persistence.task_start import SQLAlchemyTaskStartRepository
 from taskforge.rate_limits import AllowAllRateLimiter
+from taskforge.worker.claim_renewal import ClaimRenewalSupervisor
 from taskforge.worker.consumer_ports import (
     BrokerConsumerUnavailable,
     BrokerDispatchDelivery,
@@ -138,14 +140,19 @@ def execution_consumer(
     sessions: Any,
     worker: WorkerFacts,
     handler: Any,
+    *,
+    lease_seconds: int = 60,
+    renew_claims: bool = False,
 ) -> WorkerExecutionConsumer:
     issuer = TaskClaimResultAuthorityIssuer(_AUTHORITY_SECRET)
+    claim_service = TaskClaimService(
+        SQLAlchemyTaskClaimRepository(sessions, worker_stale_after_seconds=30),
+        issuer,
+        lease_seconds=lease_seconds,
+    )
+    observer = SQLAlchemyTaskCancellationObserver(sessions)
     return WorkerExecutionConsumer(
-        TaskClaimService(
-            SQLAlchemyTaskClaimRepository(sessions, worker_stale_after_seconds=30),
-            issuer,
-            lease_seconds=60,
-        ),
+        claim_service,
         TaskStartService(SQLAlchemyTaskStartRepository(sessions)),
         TaskResultSubmissionService(
             SQLAlchemyTaskResultRepository(sessions),
@@ -155,6 +162,21 @@ def execution_consumer(
         registry(handler),
         worker.authenticated,
         worker.session_id,
+        observer if renew_claims else None,
+        claim_renewal=(
+            ClaimRenewalSupervisor(
+                claim_service,
+                observer,
+                worker.authenticated,
+                worker.session_id,
+                lease_seconds=lease_seconds,
+                operation_timeout_seconds=0.1,
+                observation_poll_seconds=0.05,
+            )
+            if renew_claims
+            else None
+        ),
+        cancellation_poll_seconds=0.05,
     )
 
 
@@ -228,6 +250,56 @@ async def exercise(database_url: URL, amqp_url: str) -> None:
         assert observed_success[0].ack_count == 1
         await broker_consumer.cancel(success_tag)
         assert await queue.get(fail=False, timeout=0.5) is None
+
+        long_running = await add_dispatched_task(setup)
+        await publish(exchange, long_running)
+        long_complete = asyncio.Event()
+        long_errors: list[BaseException] = []
+        observed_long: list[CommitObservingControl] = []
+
+        async def long_handler(context: TaskContext) -> object:
+            del context
+            await asyncio.sleep(2.2)
+            return {"ok": True}
+
+        renewing_coordinator = execution_consumer(
+            sessions,
+            worker,
+            long_handler,
+            lease_seconds=1,
+            renew_claims=True,
+        )
+
+        async def consume_long(control: DispatchDeliveryControl) -> None:
+            observed = CommitObservingControl(
+                control, database_url, long_running.task_attempt_id
+            )
+            observed_long.append(observed)
+            try:
+                await renewing_coordinator.consume(observed)
+            except BaseException as error:
+                long_errors.append(error)
+            finally:
+                long_complete.set()
+
+        long_tag = await broker_consumer.consume(consume_long)
+        try:
+            await asyncio.wait_for(long_complete.wait(), timeout=6)
+        except TimeoutError as error:
+            raise AssertionError(
+                f"long-running delivery did not complete; errors={long_errors!r}"
+            ) from error
+        assert long_errors == []
+        assert observed_long[0].ack_count == 1
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_claim_events WHERE task_attempt_id = $1 "
+                "AND event_type = 'lease_renewed'",
+                long_running.task_attempt_id,
+            )
+            >= 2
+        )
+        await broker_consumer.cancel(long_tag)
 
         crash = await add_dispatched_task(setup)
         await publish(exchange, crash)

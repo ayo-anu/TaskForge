@@ -15,7 +15,12 @@ from taskforge.identity.authentication import AuthenticatedWorker
 class TaskCancellationObservationOutcome(StrEnum):
     ACTIVE = "active"
     CANCELLATION_REQUESTED = "cancellation_requested"
-    NO_LONGER_AUTHORITATIVE = "no_longer_authoritative"
+    CLAIM_EXPIRED_AWAITING_RECOVERY = "claim_expired_awaiting_recovery"
+    CLAIM_RECOVERED = "claim_recovered"
+    ATTEMPT_OR_GENERATION_OBSOLETE = "attempt_or_generation_obsolete"
+    TASK_INACTIVE = "task_inactive"
+    WORKER_AUTHORITY_REJECTED = "worker_authority_rejected"
+    WORKER_SESSION_INACTIVE = "worker_session_inactive"
 
 
 @dataclass(frozen=True)

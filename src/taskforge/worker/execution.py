@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from time import perf_counter
-from typing import Protocol
+from typing import Protocol, TypeVar
 from uuid import UUID
 
 from opentelemetry.trace import SpanKind
@@ -38,9 +39,16 @@ from taskforge.tracing import (
     span,
 )
 from taskforge.worker.cancellation import (
+    TaskCancellationObservationInvariantError,
     TaskCancellationObservationOutcome,
+    TaskCancellationObservationUnavailable,
     TaskCancellationObserver,
     TaskCancellationToken,
+)
+from taskforge.worker.claim_renewal import (
+    ClaimRenewalGuard,
+    ClaimRenewalSupervisor,
+    DeliveryAuthorityObsolete,
 )
 from taskforge.worker.consumer_ports import (
     BrokerConsumerUnavailable,
@@ -74,10 +82,12 @@ from taskforge.worker.results import (
     TaskPermanentFailure,
     TaskRetryableFailure,
 )
+from taskforge.worker.runtime_errors import WorkerProcessFailure
 from taskforge.worker.start import (
     TaskStartInvariantError,
     TaskStartReceipt,
     TaskStartRejected,
+    TaskStartRejectionReason,
     TaskStartRequest,
     TaskStartServiceUnavailable,
 )
@@ -88,6 +98,35 @@ class WorkerConsumptionPaused(Exception):
 
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
+
+_ACKNOWLEDGED_AUTHORITY_OBSERVATIONS = frozenset(
+    {
+        TaskCancellationObservationOutcome.CLAIM_RECOVERED,
+        TaskCancellationObservationOutcome.ATTEMPT_OR_GENERATION_OBSOLETE,
+        TaskCancellationObservationOutcome.TASK_INACTIVE,
+    }
+)
+_PROCESS_AUTHORITY_OBSERVATIONS = frozenset(
+    {
+        TaskCancellationObservationOutcome.WORKER_AUTHORITY_REJECTED,
+        TaskCancellationObservationOutcome.WORKER_SESSION_INACTIVE,
+    }
+)
+_DELIVERY_AUTHORITY_LOSS_OBSERVATIONS = frozenset(
+    {
+        TaskCancellationObservationOutcome.CLAIM_EXPIRED_AWAITING_RECOVERY,
+        *_ACKNOWLEDGED_AUTHORITY_OBSERVATIONS,
+    }
+)
+
+
+class _DeliveryAuthorityLost(Exception):
+    """The running delivery must stop and enter reason-preserving quiescence."""
+
+    def __init__(self, outcome: TaskCancellationObservationOutcome) -> None:
+        self.outcome = outcome
+        super().__init__("delivery execution authority was lost")
 
 
 class TaskClaimAcquirer(Protocol):
@@ -145,6 +184,8 @@ class WorkerExecutionConsumer:
         authenticated_worker: AuthenticatedWorker,
         worker_session_id: UUID,
         cancellation_observer: TaskCancellationObserver | None = None,
+        claim_renewal: ClaimRenewalSupervisor | None = None,
+        process_failure_known: Callable[[], bool] = lambda: False,
         *,
         cancellation_poll_seconds: float = 1.0,
     ) -> None:
@@ -157,6 +198,8 @@ class WorkerExecutionConsumer:
         self._authenticated_worker = authenticated_worker
         self._worker_session_id = worker_session_id
         self._cancellation_observer = cancellation_observer
+        self._claim_renewal = claim_renewal
+        self._process_failure_known = process_failure_known
         self._cancellation_poll_seconds = cancellation_poll_seconds
 
     async def consume(self, control: DispatchDeliveryControl) -> None:
@@ -294,6 +337,48 @@ class WorkerExecutionConsumer:
         definition: TaskHandlerDefinition,
         issued: IssuedTaskClaim,
     ) -> None:
+        cancellation_token = TaskCancellationToken()
+        guard = (
+            self._claim_renewal.guard(envelope, issued.claim, cancellation_token)
+            if self._claim_renewal is not None
+            else None
+        )
+        if guard is not None:
+            guard.start()
+        try:
+            await self._consume_with_authority(
+                control,
+                envelope,
+                definition,
+                issued,
+                cancellation_token,
+                guard,
+            )
+        except DeliveryAuthorityObsolete as error:
+            if self._process_failure_known():
+                raise WorkerProcessFailure(
+                    "process authority failed before delivery acknowledgement"
+                ) from error
+            await self._acknowledge(control, envelope)
+            log_event(
+                logger,
+                logging.INFO,
+                "worker.delivery.acknowledged",
+                {"outcome": "delivery_authority_obsolete"},
+            )
+        finally:
+            if guard is not None:
+                await guard.close()
+
+    async def _consume_with_authority(
+        self,
+        control: DispatchDeliveryControl,
+        envelope: DispatchEnvelope,
+        definition: TaskHandlerDefinition,
+        issued: IssuedTaskClaim,
+        cancellation_token: TaskCancellationToken,
+        guard: ClaimRenewalGuard | None,
+    ) -> None:
         if issued.outcome is TaskClaimOutcome.REPLAYED_EXPIRED:
             log_event(
                 logger,
@@ -301,23 +386,37 @@ class WorkerExecutionConsumer:
                 "worker.claim.expired",
                 {"reason.code": "replayed_expired", "outcome": "paused"},
             )
-            raise WorkerConsumptionPaused("expired claim requires recovery")
+            if guard is None:
+                raise WorkerConsumptionPaused("expired claim requires recovery")
+            await guard.quiesce()
+            raise DeliveryAuthorityObsolete
         try:
-            start = await self._start_service.start_task(
-                self._authenticated_worker,
-                self._worker_session_id,
-                TaskStartRequest(
-                    envelope.task_run_id,
-                    envelope.task_attempt_id,
-                    issued.claim.generation,
-                    envelope.correlation_id,
+            start = await self._protect(
+                guard,
+                self._start_service.start_task(
+                    self._authenticated_worker,
+                    self._worker_session_id,
+                    TaskStartRequest(
+                        envelope.task_run_id,
+                        envelope.task_attempt_id,
+                        issued.claim.generation,
+                        envelope.correlation_id,
+                    ),
                 ),
             )
-        except (
-            TaskStartRejected,
-            TaskStartInvariantError,
-            TaskStartServiceUnavailable,
-        ) as error:
+        except TaskStartRejected as error:
+            if (
+                error.reason is TaskStartRejectionReason.STALE_CLAIM
+                and guard is not None
+            ):
+                await guard.quiesce()
+                raise DeliveryAuthorityObsolete from error
+            if guard is None:
+                raise WorkerConsumptionPaused(
+                    "worker cannot start claimed task"
+                ) from error
+            raise WorkerProcessFailure("worker cannot start claimed task") from error
+        except (TaskStartInvariantError, TaskStartServiceUnavailable) as error:
             log_event(
                 logger,
                 logging.ERROR,
@@ -325,30 +424,32 @@ class WorkerExecutionConsumer:
                 {"error.category": "task_start_failure", "outcome": "paused"},
                 error=error,
             )
-            raise WorkerConsumptionPaused("task start failed closed") from error
+            if guard is None:
+                raise WorkerConsumptionPaused("task start failed closed") from error
+            raise WorkerProcessFailure("task start failed closed") from error
         log_event(logger, logging.INFO, "worker.task.started")
 
-        cancellation_token = TaskCancellationToken()
         initial_observation = TaskCancellationObservationOutcome.ACTIVE
         if self._cancellation_observer is not None:
             initial_observation = await self._observe_cancellation_once(
                 envelope, issued, cancellation_token
             )
+        if initial_observation in _PROCESS_AUTHORITY_OBSERVATIONS:
+            raise WorkerProcessFailure("worker execution authority is invalid")
+        if initial_observation in _ACKNOWLEDGED_AUTHORITY_OBSERVATIONS:
+            if guard is not None:
+                await guard.quiesce()
+                raise DeliveryAuthorityObsolete
+            await self._acknowledge(control, envelope)
+            return
         if (
             initial_observation
-            is TaskCancellationObservationOutcome.NO_LONGER_AUTHORITATIVE
+            is TaskCancellationObservationOutcome.CLAIM_EXPIRED_AWAITING_RECOVERY
         ):
-            # The durable claim/session authority is already gone. As with an
-            # obsolete or already-authoritative claim delivery, there is no work
-            # left for this delivery to perform and no worker result to author.
-            await self._acknowledge(control, envelope)
-            log_event(
-                logger,
-                logging.INFO,
-                "worker.delivery.acknowledged",
-                {"outcome": "no_longer_authoritative"},
-            )
-            return
+            if guard is None:
+                raise WorkerConsumptionPaused("expired claim requires recovery")
+            await guard.quiesce()
+            raise DeliveryAuthorityObsolete
         context = create_task_context(
             dispatch_id=envelope.dispatch_id,
             workflow_run_id=envelope.workflow_run_id,
@@ -377,14 +478,30 @@ class WorkerExecutionConsumer:
                 self._monitor_cancellation(envelope, issued, cancellation_token),
                 name=f"taskforge-cancellation-{envelope.task_attempt_id}",
             )
+        monitor_authority_loss_handled = False
         try:
-            result = (
-                TaskExecutionResult.cancellation()
-                if cancellation_token.is_cancellation_requested
-                else await _execute_handler_logged(
-                    definition.handler, context, envelope.execution_timeout_seconds
+            try:
+                result = (
+                    TaskExecutionResult.cancellation()
+                    if cancellation_token.is_cancellation_requested
+                    else await self._protect(
+                        guard,
+                        self._execute_with_cancellation_monitor(
+                            definition.handler,
+                            context,
+                            envelope.execution_timeout_seconds,
+                            monitor,
+                        ),
+                    )
                 )
-            )
+            except _DeliveryAuthorityLost as error:
+                monitor_authority_loss_handled = True
+                if guard is None:
+                    raise WorkerConsumptionPaused(
+                        "delivery execution authority was lost"
+                    ) from error
+                await guard.quiesce()
+                raise DeliveryAuthorityObsolete from error
         finally:
             if monitor is not None:
                 monitor.cancel()
@@ -392,62 +509,75 @@ class WorkerExecutionConsumer:
                     await monitor
                 except asyncio.CancelledError:
                     pass
+                except _DeliveryAuthorityLost:
+                    if not monitor_authority_loss_handled:
+                        raise
         if issued.result_authority is None:
             raise WorkerConsumptionPaused("active claim lacks result authority")
-        try:
-            receipt = await self._result_service.submit_result(
-                self._authenticated_worker,
-                self._worker_session_id,
-                TaskResultSubmissionRequest(
-                    envelope.dispatch_id,
-                    envelope.task_run_id,
-                    envelope.task_attempt_id,
-                    issued.claim.generation,
-                    issued.result_authority,
-                    result,
-                    envelope.correlation_id,
-                ),
-            )
-        except TaskResultStale as error:
-            log_event(
-                logger,
-                logging.INFO,
-                "worker.result.stale",
-                {"reason.code": "stale_result", "outcome": "paused"},
-                error=error,
-            )
-            raise WorkerConsumptionPaused(
-                "task result persistence failed closed"
-            ) from error
-        except TaskResultRateLimited as error:
-            log_event(
-                logger,
-                logging.WARNING,
-                "worker.result.rate_limited",
-                {"outcome": "paused", "error.retryable": True},
-            )
-            raise WorkerConsumptionPaused(
-                "task result submission rate limited"
-            ) from error
-        except (
-            TaskResultAuthorityRejected,
-            TaskResultConflict,
-            TaskResultInvalidOutput,
-            TaskResultInvalidState,
-            TaskResultInvariantError,
-            TaskResultNotFound,
-            TaskResultServiceUnavailable,
-        ) as error:
-            log_event(
-                logger,
-                logging.ERROR,
-                "worker.result.failed",
-                {"error.category": "result_submission_failure", "outcome": "paused"},
-                error=error,
-            )
-            raise WorkerConsumptionPaused(
-                "task result persistence failed closed"
-            ) from error
+        request = TaskResultSubmissionRequest(
+            envelope.dispatch_id,
+            envelope.task_run_id,
+            envelope.task_attempt_id,
+            issued.claim.generation,
+            issued.result_authority,
+            result,
+            envelope.correlation_id,
+        )
+        while True:
+            try:
+                receipt = await self._protect(
+                    guard,
+                    self._result_service.submit_result(
+                        self._authenticated_worker,
+                        self._worker_session_id,
+                        request,
+                    ),
+                )
+                break
+            except TaskResultRateLimited as error:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "worker.result.rate_limited",
+                    {"outcome": "rate_limited", "error.retryable": True},
+                )
+                if guard is None:
+                    raise WorkerConsumptionPaused(
+                        "task result submission rate limited"
+                    ) from error
+                await self._protect(
+                    guard, asyncio.sleep(max(1, error.retry_after_seconds))
+                )
+            except TaskResultStale as error:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "worker.result.stale",
+                    {"reason.code": "stale_result", "outcome": "paused"},
+                    error=error,
+                )
+                if guard is not None:
+                    await guard.quiesce()
+                    raise DeliveryAuthorityObsolete from error
+                raise WorkerConsumptionPaused(
+                    "task result persistence failed closed"
+                ) from error
+            except (
+                TaskResultAuthorityRejected,
+                TaskResultConflict,
+                TaskResultInvalidOutput,
+                TaskResultInvalidState,
+                TaskResultInvariantError,
+                TaskResultNotFound,
+                TaskResultServiceUnavailable,
+            ) as error:
+                if guard is None:
+                    raise WorkerConsumptionPaused(
+                        "task result persistence failed closed"
+                    ) from error
+                raise WorkerProcessFailure(
+                    "task result persistence failed closed"
+                ) from error
         if (
             receipt.task_attempt_id != envelope.task_attempt_id
             or receipt.outcome
@@ -457,7 +587,7 @@ class WorkerExecutionConsumer:
             }
         ):
             raise WorkerConsumptionPaused("task result receipt failed closed")
-        await self._acknowledge(control, envelope)
+        await self._protect(guard, self._acknowledge(control, envelope))
 
         log_event(
             logger,
@@ -467,6 +597,39 @@ class WorkerExecutionConsumer:
                 "outcome": receipt.outcome.value,
             },
         )
+
+    async def _protect(
+        self, guard: ClaimRenewalGuard | None, operation: Awaitable[T]
+    ) -> T:
+        if guard is None:
+            return await operation
+        return await guard.protect(operation)
+
+    async def _execute_with_cancellation_monitor(
+        self,
+        handler: TaskHandler,
+        context: TaskContext,
+        execution_timeout_seconds: int | None,
+        monitor: asyncio.Task[None] | None,
+    ) -> TaskExecutionResult:
+        execution = asyncio.create_task(
+            _execute_handler_logged(handler, context, execution_timeout_seconds),
+            name=f"taskforge-handler-{context.task_attempt_id}",
+        )
+        try:
+            if monitor is None:
+                return await execution
+            done, _ = await asyncio.wait(
+                (execution, monitor), return_when=asyncio.FIRST_COMPLETED
+            )
+            if monitor in done:
+                error = monitor.exception()
+                if error is not None:
+                    await _cancel_task(execution)
+                    raise error
+            return await execution
+        finally:
+            await _cancel_task(execution)
 
     async def _acknowledge(
         self, control: DispatchDeliveryControl, envelope: DispatchEnvelope
@@ -536,10 +699,14 @@ class WorkerExecutionConsumer:
                 envelope.task_attempt_id,
                 issued.claim.generation,
             )
-        except Exception:
+        except TaskCancellationObservationUnavailable:
             # Observation is advisory but bounded: transient persistence failures
             # never fabricate cancellation and do not permanently stop polling.
             return TaskCancellationObservationOutcome.ACTIVE
+        except TaskCancellationObservationInvariantError as error:
+            raise WorkerProcessFailure(
+                "task authority observation invariant failed"
+            ) from error
         if (
             observation.outcome
             is TaskCancellationObservationOutcome.CANCELLATION_REQUESTED
@@ -557,7 +724,11 @@ class WorkerExecutionConsumer:
         while True:
             await asyncio.sleep(self._cancellation_poll_seconds)
             outcome = await self._observe_cancellation_once(envelope, issued, token)
-            if outcome is not TaskCancellationObservationOutcome.ACTIVE:
+            if outcome in _PROCESS_AUTHORITY_OBSERVATIONS:
+                raise WorkerProcessFailure("worker execution authority is invalid")
+            if outcome in _DELIVERY_AUTHORITY_LOSS_OBSERVATIONS:
+                raise _DeliveryAuthorityLost(outcome)
+            if outcome is TaskCancellationObservationOutcome.CANCELLATION_REQUESTED:
                 return
 
 
@@ -625,3 +796,12 @@ async def _execute_handler_logged(
             attributes,
         )
         return result
+
+
+async def _cancel_task(task: asyncio.Task[object]) -> None:
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

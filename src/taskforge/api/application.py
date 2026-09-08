@@ -34,6 +34,7 @@ from taskforge.api.runs import router as runs_router
 from taskforge.api.workers import router as workers_router
 from taskforge.api.workflows import router as workflows_router
 from taskforge.metrics import register_http_routes
+from taskforge.runtime_provider import load_installed_task_catalog
 from taskforge.settings import Settings
 from taskforge.workflows.task_types import TaskTypeRegistry
 
@@ -135,3 +136,8 @@ def create_app(
     )
 
     return app
+
+
+def create_production_app() -> FastAPI:
+    """Create the API from the installed metadata-only trusted task catalog."""
+    return create_app(task_types=load_installed_task_catalog())

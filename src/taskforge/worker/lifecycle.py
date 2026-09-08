@@ -47,7 +47,10 @@ class WorkerDispatchRuntime:
         self._consumer_tag: str | None = None
         self._in_flight = 0
         self._admission_closed = False
+        self._activated = asyncio.Event()
         self._stopping = asyncio.Event()
+        self._failure: asyncio.Future[BaseException] | None = None
+        self._started_paused: bool | None = None
 
     @property
     def state(self) -> WorkerDispatchRuntimeState:
@@ -57,14 +60,22 @@ class WorkerDispatchRuntime:
     def in_flight(self) -> int:
         return self._in_flight
 
-    async def start(self) -> str:
+    async def start(self, *, paused: bool = False) -> str:
         async with self._lock:
             if self._state is WorkerDispatchRuntimeState.NEW:
+                self._started_paused = paused
+                if paused:
+                    self._activated.clear()
+                else:
+                    self._activated.set()
+                self._failure = asyncio.get_running_loop().create_future()
                 self._state = WorkerDispatchRuntimeState.STARTING
                 self._start_operation = asyncio.create_task(
                     self._register(), name="taskforge-worker-dispatch-start"
                 )
             elif self._state is WorkerDispatchRuntimeState.RUNNING:
+                if paused != self._started_paused:
+                    raise WorkerDispatchRuntimeInvariantError
                 if self._consumer_tag is None:
                     raise WorkerDispatchRuntimeInvariantError
                 return self._consumer_tag
@@ -78,12 +89,29 @@ class WorkerDispatchRuntime:
                 raise WorkerDispatchRuntimeInvariantError
         return await asyncio.shield(operation)
 
+    async def activate(self) -> None:
+        """Open delivery admission after every process consumer is registered."""
+        async with self._lock:
+            if self._state is not WorkerDispatchRuntimeState.RUNNING:
+                raise WorkerDispatchRuntimeInvariantError
+            self._activated.set()
+
+    async def wait_failed(self) -> None:
+        """Wait until a delivery callback reports a process-fatal failure."""
+        async with self._lock:
+            failure = self._failure
+            if failure is None:
+                raise WorkerDispatchRuntimeInvariantError
+        error = await asyncio.shield(failure)
+        raise error
+
     async def shutdown(self) -> None:
         async with self._lock:
             if self._state is WorkerDispatchRuntimeState.STOPPED:
                 return
             if self._state is WorkerDispatchRuntimeState.NEW:
                 self._admission_closed = True
+                self._stopping.set()
                 self._state = WorkerDispatchRuntimeState.STOPPED
                 return
             if self._state in (
@@ -140,12 +168,19 @@ class WorkerDispatchRuntime:
                     pass
             async with self._lock:
                 consumer_tag = self._consumer_tag
+            cancellation_error: Exception | None = None
             if consumer_tag is not None:
-                await self._consumer.cancel(consumer_tag)
+                try:
+                    await self._consumer.cancel(consumer_tag)
+                except Exception as error:
+                    cancellation_error = error
             async with self._drained:
                 self._admission_closed = True
                 await self._drained.wait_for(lambda: self._in_flight == 0)
-                self._state = WorkerDispatchRuntimeState.STOPPED
+                if cancellation_error is None:
+                    self._state = WorkerDispatchRuntimeState.STOPPED
+            if cancellation_error is not None:
+                raise cancellation_error
         finally:
             async with self._lock:
                 if self._shutdown_operation is current:
@@ -166,7 +201,26 @@ class WorkerDispatchRuntime:
             self._in_flight += 1
             add_metric("taskforge.worker.running.deliveries", 1)
         try:
+            if not self._activated.is_set():
+                activated = asyncio.create_task(self._activated.wait())
+                stopping = asyncio.create_task(self._stopping.wait())
+                done, pending = await asyncio.wait(
+                    (activated, stopping), return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if stopping in done and self._stopping.is_set():
+                    return
             await self._handler(control)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            async with self._lock:
+                failure = self._failure
+                if failure is not None and not failure.done():
+                    failure.set_result(error)
+            raise
         finally:
             async with self._drained:
                 self._in_flight -= 1

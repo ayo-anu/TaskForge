@@ -34,8 +34,18 @@ class TaskStartOutcome(StrEnum):
     REPLAYED_RUNNING = "replayed_running"
 
 
+class TaskStartRejectionReason(StrEnum):
+    WORKER_AUTHORITY_REJECTED = "worker_authority_rejected"
+    WORKER_SESSION_REJECTED = "worker_session_rejected"
+    STALE_CLAIM = "stale_claim"
+
+
 class TaskStartRejected(Exception):
     """The worker no longer owns current start authority."""
+
+    def __init__(self, reason: TaskStartRejectionReason) -> None:
+        self.reason = reason
+        super().__init__("task start rejected")
 
 
 class TaskStartInvariantError(Exception):
@@ -72,6 +82,11 @@ _START_AUDIT_REASONS: dict[type[Exception], str] = {
     TaskStartClaimStale: "stale_claim",
 }
 _EXPECTED_START_REJECTIONS = tuple(_START_AUDIT_REASONS)
+_START_REJECTION_REASONS: dict[type[Exception], TaskStartRejectionReason] = {
+    TaskStartAuthorityRejected: TaskStartRejectionReason.WORKER_AUTHORITY_REJECTED,
+    TaskStartSessionRejected: TaskStartRejectionReason.WORKER_SESSION_REJECTED,
+    TaskStartClaimStale: TaskStartRejectionReason.STALE_CLAIM,
+}
 
 
 class TaskStartService:
@@ -145,7 +160,7 @@ class TaskStartService:
                     )
                 except AuditRejected as audit_error:
                     raise TaskStartServiceUnavailable from audit_error
-            raise TaskStartRejected from error
+            raise TaskStartRejected(_START_REJECTION_REASONS[type(error)]) from error
         except TaskStartInvariantViolation as error:
             raise TaskStartInvariantError from error
         except TaskStartPersistenceUnavailable as error:

@@ -7,7 +7,7 @@ import os
 import pytest
 from pydantic import ValidationError
 
-from taskforge.settings import OwnerSettings, Settings
+from taskforge.settings import OwnerSettings, Settings, WorkerSettings
 
 ENVIRONMENT_PREFIX = "TASKFORGE_"
 DEPENDENCY_ENVIRONMENT_VARIABLES = {
@@ -428,3 +428,51 @@ def test_non_production_plaintext_listener_behavior_is_unchanged(
     monkeypatch.setenv("TASKFORGE_API_HOST", "0.0.0.0")
 
     assert Settings().api_host == "0.0.0.0"
+
+
+def test_worker_settings_require_credential_and_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValidationError):
+        WorkerSettings()
+    monkeypatch.setenv("TASKFORGE_WORKER_CREDENTIAL", "not-logged")
+    monkeypatch.setenv("TASKFORGE_WORKER_PROFILE", "batch.small")
+
+    settings = WorkerSettings()
+
+    assert settings.worker_credential.get_secret_value() == "not-logged"
+    assert settings.worker_profile == "batch.small"
+    assert settings.worker_heartbeat_interval_seconds == 10.0
+    assert settings.worker_prefetch_count == 1
+    assert settings.worker_control_operation_timeout_seconds == 2.0
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("TASKFORGE_WORKER_PROFILE", "module:callable"),
+        ("TASKFORGE_WORKER_PROFILE", "../profile"),
+        ("TASKFORGE_WORKER_HEARTBEAT_INTERVAL_SECONDS", "0"),
+        ("TASKFORGE_WORKER_PREFETCH_COUNT", "0"),
+        ("TASKFORGE_WORKER_PREFETCH_COUNT", "129"),
+        ("TASKFORGE_WORKER_CONTROL_OPERATION_TIMEOUT_SECONDS", "0"),
+    ),
+)
+def test_worker_settings_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv("TASKFORGE_WORKER_CREDENTIAL", "not-logged")
+    monkeypatch.setenv("TASKFORGE_WORKER_PROFILE", "batch")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError):
+        WorkerSettings()
+
+
+def test_worker_settings_require_conservative_control_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TASKFORGE_WORKER_CREDENTIAL", "not-logged")
+    monkeypatch.setenv("TASKFORGE_WORKER_PROFILE", "batch")
+    monkeypatch.setenv("TASKFORGE_WORKER_CONTROL_OPERATION_TIMEOUT_SECONDS", "10")
+    with pytest.raises(ValidationError):
+        WorkerSettings()

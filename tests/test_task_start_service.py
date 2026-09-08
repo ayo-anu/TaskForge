@@ -12,6 +12,7 @@ from taskforge.worker.start import (
     TaskStartInvariantError,
     TaskStartOutcome,
     TaskStartRejected,
+    TaskStartRejectionReason,
     TaskStartRequest,
     TaskStartService,
     TaskStartServiceUnavailable,
@@ -117,3 +118,32 @@ def test_start_service_translates_typed_failures(
             )
         )
     assert raised.value.__cause__ is persistence_error
+
+
+@pytest.mark.parametrize(
+    ("persistence_error", "expected_reason"),
+    (
+        (
+            TaskStartAuthorityRejected(),
+            TaskStartRejectionReason.WORKER_AUTHORITY_REJECTED,
+        ),
+        (
+            TaskStartSessionRejected(),
+            TaskStartRejectionReason.WORKER_SESSION_REJECTED,
+        ),
+        (TaskStartClaimStale(), TaskStartRejectionReason.STALE_CLAIM),
+    ),
+)
+def test_start_service_preserves_authority_rejection_reason(
+    persistence_error: Exception, expected_reason: TaskStartRejectionReason
+) -> None:
+    with pytest.raises(TaskStartRejected) as raised:
+        asyncio.run(
+            TaskStartService(Repository(error=persistence_error)).start_task(
+                AuthenticatedWorker(uuid4(), uuid4()),
+                uuid4(),
+                TaskStartRequest(uuid4(), uuid4(), 1),
+            )
+        )
+
+    assert raised.value.reason is expected_reason

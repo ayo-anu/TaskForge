@@ -59,6 +59,24 @@ class TaskClaimRenewalOutcome(StrEnum):
     CANCELLATION_REQUESTED = "cancellation_requested"
 
 
+class TaskClaimRenewalRejectionReason(StrEnum):
+    EXPIRED = "claim_expired"
+    RECOVERED = "claim_recovered"
+    STALE = "stale_claim"
+    TASK_INACTIVE = "task_inactive"
+    WORKER_AUTHORITY_REJECTED = "worker_authority_rejected"
+    WORKER_SESSION_UNAVAILABLE = "worker_session_unavailable"
+    WORKER_SESSION_INACTIVE = "worker_session_inactive"
+
+
+class TaskClaimRenewalRejected(Exception):
+    """Reason-preserving expected renewal denial."""
+
+    def __init__(self, reason: TaskClaimRenewalRejectionReason) -> None:
+        self.reason = reason
+        super().__init__("task claim renewal rejected")
+
+
 @dataclass(frozen=True, repr=False)
 class TaskClaimResultAuthority:
     presented_value: str

@@ -8,7 +8,11 @@ from uuid import uuid4
 import pytest
 
 from taskforge.audit.domain import AuditRecord, AuditRejected
-from taskforge.claims.domain import TaskClaimRenewalRequest
+from taskforge.claims.domain import (
+    TaskClaimRenewalRejected,
+    TaskClaimRenewalRejectionReason,
+    TaskClaimRenewalRequest,
+)
 from taskforge.claims.persistence_ports import (
     TaskClaimNotEligible,
     TaskClaimRenewalStale,
@@ -136,9 +140,10 @@ def test_claim_renewal_rejection_is_recorded_after_repository_returns() -> None:
         "renew-correlation",
     )
 
-    with pytest.raises(TaskClaimRenewalStale):
+    with pytest.raises(TaskClaimRenewalRejected) as raised:
         asyncio.run(service.renew_claim(authenticated, request))
 
+    assert raised.value.reason is TaskClaimRenewalRejectionReason.STALE
     assert len(recorder.records) == 1
     assert recorder.records[0].reason_code == "stale_claim"
 

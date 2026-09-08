@@ -16,6 +16,8 @@ from taskforge.claims.domain import (
     TaskClaimOutcome,
     TaskClaimRejected,
     TaskClaimRejectionReason,
+    TaskClaimRenewalRejected,
+    TaskClaimRenewalRejectionReason,
     TaskClaimRenewalRequest,
     TaskClaimRenewalResult,
 )
@@ -66,7 +68,20 @@ _RENEWAL_AUDIT_REASONS: dict[type[Exception], str] = {
     TaskClaimRenewalStale: "stale_claim",
     TaskClaimRenewalTaskInactive: "task_inactive",
 }
-_EXPECTED_RENEWAL_REJECTIONS = tuple(_RENEWAL_AUDIT_REASONS)
+_RENEWAL_REJECTION_REASONS: dict[type[Exception], TaskClaimRenewalRejectionReason] = {
+    TaskClaimRenewalExpired: TaskClaimRenewalRejectionReason.EXPIRED,
+    TaskClaimRenewalRecovered: TaskClaimRenewalRejectionReason.RECOVERED,
+    TaskClaimRenewalStale: TaskClaimRenewalRejectionReason.STALE,
+    TaskClaimRenewalTaskInactive: TaskClaimRenewalRejectionReason.TASK_INACTIVE,
+    TaskClaimAuthorityRejected: (
+        TaskClaimRenewalRejectionReason.WORKER_AUTHORITY_REJECTED
+    ),
+    TaskClaimSessionUnavailable: (
+        TaskClaimRenewalRejectionReason.WORKER_SESSION_UNAVAILABLE
+    ),
+    TaskClaimSessionInactive: TaskClaimRenewalRejectionReason.WORKER_SESSION_INACTIVE,
+}
+_EXPECTED_SERVICE_RENEWAL_REJECTIONS = tuple(_RENEWAL_REJECTION_REASONS)
 
 
 class TaskClaimServiceInvariantError(Exception):
@@ -193,17 +208,24 @@ class TaskClaimService:
                 request,
                 lease_seconds=self._lease_seconds,
             )
-        except _EXPECTED_RENEWAL_REJECTIONS as error:
-            await self._audit_rejection(
-                authenticated_worker,
-                request.worker_session_id,
-                action="task_claim.renew",
-                reason_code=_RENEWAL_AUDIT_REASONS[type(error)],
-                task_attempt_id=request.task_attempt_id,
-                correlation_id=request.correlation_id,
-                provenance={"claim_generation": request.generation},
-            )
-            raise
+        except _EXPECTED_SERVICE_RENEWAL_REJECTIONS as error:
+            if type(error) in _RENEWAL_AUDIT_REASONS:
+                await self._audit_rejection(
+                    authenticated_worker,
+                    request.worker_session_id,
+                    action="task_claim.renew",
+                    reason_code=_RENEWAL_AUDIT_REASONS[type(error)],
+                    task_attempt_id=request.task_attempt_id,
+                    correlation_id=request.correlation_id,
+                    provenance={"claim_generation": request.generation},
+                )
+            raise TaskClaimRenewalRejected(
+                _RENEWAL_REJECTION_REASONS[type(error)]
+            ) from error
+        except TaskClaimInvariantViolation as error:
+            raise TaskClaimServiceInvariantError from error
+        except TaskClaimPersistenceUnavailable as error:
+            raise TaskClaimServiceUnavailable from error
 
     async def _audit_rejection(
         self,

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import suppress
-from datetime import timedelta
+from datetime import datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -31,8 +32,31 @@ from taskforge.claims.persistence_ports import (
     TaskClaimSessionUnavailable,
 )
 from taskforge.claims.service import TaskClaimService
+from taskforge.dispatch.envelope import serialize_dispatch_envelope
+from taskforge.dispatch.transport import DispatchTransportMetadata
 from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
 from taskforge.persistence.database import build_session_factory
+from taskforge.persistence.recovery import SQLAlchemyExpiredClaimRecoveryRepository
+from taskforge.persistence.task_cancellation import SQLAlchemyTaskCancellationObserver
+from taskforge.persistence.task_start import SQLAlchemyTaskStartRepository
+from taskforge.recovery.domain import ExpiredClaimCandidate
+from taskforge.recovery.service import ExpiredClaimRecoveryService
+from taskforge.worker.cancellation import TaskCancellationObservationOutcome
+from taskforge.worker.claim_renewal import ClaimRenewalSupervisor
+from taskforge.worker.consumer_ports import BrokerDispatchDelivery
+from taskforge.worker.execution import WorkerExecutionConsumer
+from taskforge.worker.handlers import (
+    TaskContext,
+    TaskHandlerDefinition,
+    TaskHandlerRegistry,
+)
+from taskforge.worker.start import TaskStartService
+from taskforge.workflows.task_types import (
+    JSONMapping,
+    TaskTypeDefinition,
+    TaskTypeRegistry,
+    WorkflowValidationIssue,
+)
 from tests.integration.postgresql import (
     asyncpg_dsn,
     migration_database_url,
@@ -52,6 +76,57 @@ pytestmark = [
         reason="set TASKFORGE_RUN_CLAIM_INTEGRATION=1 explicitly",
     ),
 ]
+
+
+class AcceptParameters:
+    def validate(self, parameters: JSONMapping) -> tuple[WorkflowValidationIssue, ...]:
+        del parameters
+        return ()
+
+
+class RecoveryControl:
+    def __init__(self, dispatch: Any) -> None:
+        self._delivery = BrokerDispatchDelivery(
+            serialize_dispatch_envelope(dispatch),
+            DispatchTransportMetadata(
+                str(dispatch.dispatch_id),
+                dispatch.route,
+                "application/json",
+                "utf-8",
+            ),
+            False,
+        )
+        self.actions: list[str] = []
+
+    @property
+    def delivery(self) -> BrokerDispatchDelivery:
+        return self._delivery
+
+    async def acknowledge(self) -> None:
+        self.actions.append("ack")
+
+    async def reject(self, *, requeue: bool) -> None:
+        self.actions.append(f"reject:{requeue}")
+
+
+class MustNotSubmitResult:
+    def __init__(self) -> None:
+        self.called = False
+
+    async def submit_result(self, *args: Any) -> Any:
+        del args
+        self.called = True
+        raise AssertionError("stale handler result must not be submitted")
+
+
+def execution_registry(handler: Any) -> TaskHandlerRegistry:
+    task_types = TaskTypeRegistry(
+        (TaskTypeDefinition("test.task", "test-capability", AcceptParameters()),)
+    )
+    return TaskHandlerRegistry(
+        (TaskHandlerDefinition("test.task", "test-capability", handler),),
+        task_types,
+    )
 
 
 async def add_current_claim(
@@ -186,9 +261,8 @@ async def exercise_renewal(database_url: URL) -> None:
             hide_password=False
         )
     )
-    repository = SQLAlchemyTaskClaimRepository(
-        build_session_factory(engine), worker_stale_after_seconds=30
-    )
+    sessions = build_session_factory(engine)
+    repository = SQLAlchemyTaskClaimRepository(sessions, worker_stale_after_seconds=30)
     try:
         worker = await add_worker(setup)
         request = await add_current_claim(
@@ -300,6 +374,8 @@ async def exercise_renewal(database_url: URL) -> None:
         await exercise_task_and_termination_races(setup, database_url, repository)
         await exercise_independent_renewal(setup, database_url, repository)
         await exercise_result_authority(setup, repository)
+        await exercise_reason_preserving_observation(setup, sessions)
+        await exercise_running_handler_recovery(setup, sessions)
     finally:
         await setup.close()
         await engine.dispose()
@@ -624,6 +700,181 @@ async def exercise_result_authority(
     )
     assert expired.outcome is TaskClaimOutcome.REPLAYED_EXPIRED
     assert expired.result_authority is None
+
+
+async def exercise_reason_preserving_observation(
+    setup: asyncpg.Connection[asyncpg.Record], sessions: Any
+) -> None:
+    observer = SQLAlchemyTaskCancellationObserver(sessions)
+    worker = await add_worker(setup)
+    request = await add_current_claim(
+        setup, worker, task_status="running", lease_interval=timedelta(seconds=30)
+    )
+    task = await setup.fetchrow(
+        "SELECT ta.task_run_id, tr.workflow_run_id FROM task_attempts ta "
+        "JOIN task_runs tr ON tr.id = ta.task_run_id WHERE ta.id = $1",
+        request.task_attempt_id,
+    )
+    assert task is not None
+
+    active = await observer.observe_cancellation(
+        worker.authenticated,
+        worker.session_id,
+        task["workflow_run_id"],
+        task["task_run_id"],
+        request.task_attempt_id,
+        request.generation,
+    )
+    assert active.outcome is TaskCancellationObservationOutcome.ACTIVE
+
+    lease_expires_at = await setup.fetchval(
+        "UPDATE task_attempt_claims SET lease_expires_at = statement_timestamp() "
+        "WHERE task_attempt_id = $1 AND generation = $2 RETURNING lease_expires_at",
+        request.task_attempt_id,
+        request.generation,
+    )
+    expired = await observer.observe_cancellation(
+        worker.authenticated,
+        worker.session_id,
+        task["workflow_run_id"],
+        task["task_run_id"],
+        request.task_attempt_id,
+        request.generation,
+    )
+    assert expired.outcome is (
+        TaskCancellationObservationOutcome.CLAIM_EXPIRED_AWAITING_RECOVERY
+    )
+
+    observed_at = await setup.fetchval("SELECT statement_timestamp()")
+    assert isinstance(lease_expires_at, datetime)
+    assert observed_at is not None
+    candidate = ExpiredClaimCandidate(
+        request.task_attempt_id,
+        task["task_run_id"],
+        task["workflow_run_id"],
+        1,
+        request.generation,
+        worker.session_id,
+        lease_expires_at,
+        observed_at,
+    )
+    await ExpiredClaimRecoveryService(
+        SQLAlchemyExpiredClaimRecoveryRepository(sessions)
+    ).recover_expired_claim(candidate)
+    recovered = await observer.observe_cancellation(
+        worker.authenticated,
+        worker.session_id,
+        task["workflow_run_id"],
+        task["task_run_id"],
+        request.task_attempt_id,
+        request.generation,
+    )
+    assert recovered.outcome is TaskCancellationObservationOutcome.CLAIM_RECOVERED
+
+    await setup.execute(
+        "UPDATE worker_credentials SET revoked_at = statement_timestamp() "
+        "WHERE id = $1",
+        worker.authenticated.credential_id,
+    )
+    rejected = await observer.observe_cancellation(
+        worker.authenticated,
+        worker.session_id,
+        task["workflow_run_id"],
+        task["task_run_id"],
+        request.task_attempt_id,
+        request.generation,
+    )
+    assert rejected.outcome is (
+        TaskCancellationObservationOutcome.WORKER_AUTHORITY_REJECTED
+    )
+
+
+async def exercise_running_handler_recovery(
+    setup: asyncpg.Connection[asyncpg.Record], sessions: Any
+) -> None:
+    worker = await add_worker(setup)
+    dispatch = await add_dispatched_task(setup)
+    observer = SQLAlchemyTaskCancellationObserver(sessions)
+    claim_service = TaskClaimService(
+        SQLAlchemyTaskClaimRepository(sessions, worker_stale_after_seconds=30),
+        TaskClaimResultAuthorityIssuer(b"running-handler-recovery-authority"),
+        lease_seconds=60,
+    )
+    results = MustNotSubmitResult()
+    control = RecoveryControl(dispatch)
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+
+    async def handler(context: TaskContext) -> object:
+        del context
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+        return None
+
+    consumer = WorkerExecutionConsumer(
+        claim_service,
+        TaskStartService(SQLAlchemyTaskStartRepository(sessions)),
+        results,
+        execution_registry(handler),
+        worker.authenticated,
+        worker.session_id,
+        observer,
+        ClaimRenewalSupervisor(
+            claim_service,
+            observer,
+            worker.authenticated,
+            worker.session_id,
+            lease_seconds=60,
+            operation_timeout_seconds=0.5,
+            observation_poll_seconds=0.01,
+        ),
+        cancellation_poll_seconds=0.01,
+    )
+    consuming = asyncio.create_task(consumer.consume(control))
+    try:
+        await asyncio.wait_for(handler_started.wait(), timeout=3)
+        claim = await setup.fetchrow(
+            "UPDATE task_attempt_claims SET lease_expires_at = "
+            "statement_timestamp() WHERE task_attempt_id = $1 "
+            "RETURNING generation, lease_expires_at",
+            dispatch.task_attempt_id,
+        )
+        assert claim is not None
+
+        await asyncio.wait_for(handler_cancelled.wait(), timeout=3)
+        assert not consuming.done()
+        assert not results.called
+        assert control.actions == []
+
+        observed_at = await setup.fetchval("SELECT statement_timestamp()")
+        assert isinstance(observed_at, datetime)
+        await ExpiredClaimRecoveryService(
+            SQLAlchemyExpiredClaimRecoveryRepository(sessions)
+        ).recover_expired_claim(
+            ExpiredClaimCandidate(
+                dispatch.task_attempt_id,
+                dispatch.task_run_id,
+                dispatch.workflow_run_id,
+                dispatch.attempt_number,
+                claim["generation"],
+                worker.session_id,
+                claim["lease_expires_at"],
+                observed_at,
+            )
+        )
+
+        await asyncio.wait_for(consuming, timeout=3)
+        assert not results.called
+        assert control.actions == ["ack"]
+    finally:
+        if not consuming.done():
+            consuming.cancel()
+            with suppress(asyncio.CancelledError):
+                await consuming
 
 
 def test_real_postgresql_claim_renewal_and_concurrency() -> None:
