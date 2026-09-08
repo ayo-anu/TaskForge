@@ -23,6 +23,15 @@ dependencies = [
     "uvicorn>=0.35,<1",
 ]
 
+[project.entry-points."taskforge.task_catalog"]
+taskforge = "taskforge.tasks.catalog:provide_task_catalog"
+
+[project.entry-points."taskforge.worker_profile"]
+pipeline = "taskforge.tasks.profiles:provide_pipeline_profile"
+ingestion = "taskforge.tasks.profiles:provide_ingestion_profile"
+processing = "taskforge.tasks.profiles:provide_processing_profile"
+notification = "taskforge.tasks.profiles:provide_notification_profile"
+
 [dependency-groups]
 dev = [
     "alembic>=1,<2",
