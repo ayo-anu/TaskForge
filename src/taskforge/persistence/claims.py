@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import case, exists, func, insert, or_, select, true, update
+from sqlalchemy import case, exists, func, insert, select, true, update
 from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -48,8 +48,8 @@ from taskforge.dispatch.envelope import (
 )
 from taskforge.identity.authentication import AuthenticatedWorker
 from taskforge.identity.authorization import OwnerFilter
-from taskforge.identity.schema import worker_credentials, worker_identities
 from taskforge.persistence.execution_events import append_status_changed_execution_event
+from taskforge.persistence.worker_authority import lock_valid_worker_authority
 from taskforge.runs.domain import TaskRunStatus, WorkflowRunStatus
 from taskforge.runs.persistence_ports import (
     WorkflowRunExecutionEventInvariantViolation,
@@ -708,35 +708,7 @@ class SQLAlchemyTaskClaimInspectionRepository:
 async def _lock_authority(
     session: AsyncSession, authenticated_worker: AuthenticatedWorker
 ) -> None:
-    identity = (
-        await session.execute(
-            select(worker_identities.c.id)
-            .where(
-                worker_identities.c.id == authenticated_worker.worker_identity_id,
-                worker_identities.c.disabled_at.is_(None),
-            )
-            .with_for_update(read=True)
-        )
-    ).one_or_none()
-    if identity is None:
-        raise TaskClaimAuthorityRejected
-    credential = (
-        await session.execute(
-            select(worker_credentials.c.id)
-            .where(
-                worker_credentials.c.id == authenticated_worker.credential_id,
-                worker_credentials.c.worker_identity_id
-                == authenticated_worker.worker_identity_id,
-                worker_credentials.c.revoked_at.is_(None),
-                or_(
-                    worker_credentials.c.expires_at.is_(None),
-                    worker_credentials.c.expires_at > func.statement_timestamp(),
-                ),
-            )
-            .with_for_update(read=True)
-        )
-    ).one_or_none()
-    if credential is None:
+    if not await lock_valid_worker_authority(session, authenticated_worker):
         raise TaskClaimAuthorityRejected
 
 

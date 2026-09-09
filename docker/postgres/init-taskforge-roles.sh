@@ -59,6 +59,7 @@ BEGIN
         WHERE namespace.nspname = 'public'
         AND object.proname IN (
             'allocate_workflow_run_execution_event_cursor',
+            'lock_valid_worker_authority',
             'publish_workflow_run_execution_event_wakeup',
             'reject_audit_record_mutation',
             'reject_dead_letter_history_mutation',

@@ -32,8 +32,9 @@ from taskforge.audit.domain import (
     bounded_string_set,
 )
 from taskforge.identity.authentication import AuthenticatedWorker
-from taskforge.identity.schema import worker_credentials, worker_identities
+from taskforge.identity.schema import worker_identities
 from taskforge.persistence.audit import append_audit_record
+from taskforge.persistence.worker_authority import lock_valid_worker_authority
 from taskforge.worker.domain import (
     InspectedWorkerHealth,
     InspectedWorkerHeartbeat,
@@ -95,38 +96,7 @@ class SQLAlchemyWorkerRegistrationRepository:
     ) -> RegisteredWorkerSession:
         try:
             async with self._sessions.begin() as session:
-                identity = (
-                    await session.execute(
-                        select(worker_identities.c.id, worker_identities.c.disabled_at)
-                        .where(
-                            worker_identities.c.id
-                            == authenticated_worker.worker_identity_id
-                        )
-                        .with_for_update(read=True)
-                    )
-                ).one_or_none()
-                if identity is None or identity.disabled_at is not None:
-                    raise WorkerRegistrationAuthorityRejected
-
-                credential = (
-                    await session.execute(
-                        select(worker_credentials.c.id)
-                        .where(
-                            worker_credentials.c.id
-                            == authenticated_worker.credential_id,
-                            worker_credentials.c.worker_identity_id
-                            == authenticated_worker.worker_identity_id,
-                            worker_credentials.c.revoked_at.is_(None),
-                            or_(
-                                worker_credentials.c.expires_at.is_(None),
-                                worker_credentials.c.expires_at
-                                > func.statement_timestamp(),
-                            ),
-                        )
-                        .with_for_update(read=True)
-                    )
-                ).one_or_none()
-                if credential is None:
+                if not await lock_valid_worker_authority(session, authenticated_worker):
                     raise WorkerRegistrationAuthorityRejected
 
                 session_row = (
@@ -303,33 +273,7 @@ async def _lock_heartbeat_authority(
     session: AsyncSession,
     authenticated_worker: AuthenticatedWorker,
 ) -> None:
-    identity = (
-        await session.execute(
-            select(worker_identities.c.id, worker_identities.c.disabled_at)
-            .where(worker_identities.c.id == authenticated_worker.worker_identity_id)
-            .with_for_update(read=True)
-        )
-    ).one_or_none()
-    if identity is None or identity.disabled_at is not None:
-        raise WorkerHeartbeatAuthorityRejected
-
-    credential = (
-        await session.execute(
-            select(worker_credentials.c.id)
-            .where(
-                worker_credentials.c.id == authenticated_worker.credential_id,
-                worker_credentials.c.worker_identity_id
-                == authenticated_worker.worker_identity_id,
-                worker_credentials.c.revoked_at.is_(None),
-                or_(
-                    worker_credentials.c.expires_at.is_(None),
-                    worker_credentials.c.expires_at > func.statement_timestamp(),
-                ),
-            )
-            .with_for_update(read=True)
-        )
-    ).one_or_none()
-    if credential is None:
+    if not await lock_valid_worker_authority(session, authenticated_worker):
         raise WorkerHeartbeatAuthorityRejected
 
 
@@ -470,33 +414,7 @@ async def _lock_capability_authority(
     session: AsyncSession,
     authenticated_worker: AuthenticatedWorker,
 ) -> None:
-    identity = (
-        await session.execute(
-            select(worker_identities.c.id, worker_identities.c.disabled_at)
-            .where(worker_identities.c.id == authenticated_worker.worker_identity_id)
-            .with_for_update(read=True)
-        )
-    ).one_or_none()
-    if identity is None or identity.disabled_at is not None:
-        raise WorkerCapabilityAuthorityRejected
-
-    credential = (
-        await session.execute(
-            select(worker_credentials.c.id)
-            .where(
-                worker_credentials.c.id == authenticated_worker.credential_id,
-                worker_credentials.c.worker_identity_id
-                == authenticated_worker.worker_identity_id,
-                worker_credentials.c.revoked_at.is_(None),
-                or_(
-                    worker_credentials.c.expires_at.is_(None),
-                    worker_credentials.c.expires_at > func.statement_timestamp(),
-                ),
-            )
-            .with_for_update(read=True)
-        )
-    ).one_or_none()
-    if credential is None:
+    if not await lock_valid_worker_authority(session, authenticated_worker):
         raise WorkerCapabilityAuthorityRejected
 
 

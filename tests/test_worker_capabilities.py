@@ -88,6 +88,9 @@ class Result:
     def one_or_none(self) -> object:
         return self.row
 
+    def scalar_one(self) -> object:
+        return self.row
+
     def scalars(self) -> tuple[str, ...]:
         return self.scalar_values
 
@@ -224,13 +227,11 @@ def test_postgresql_session_lock_compiles_as_for_no_key_update() -> None:
 def test_sqlalchemy_repository_maps_idempotent_and_differential_replacements() -> None:
     authenticated = AuthenticatedWorker(uuid4(), uuid4())
     session_id = uuid4()
-    authority_row = type("Authority", (), {"disabled_at": None})()
     session_row = type("WorkerSession", (), {"ended_at": None})()
 
     identical_session = Session(
         [
-            Result(row=authority_row),
-            Result(row=object()),
+            Result(row=True),
             Result(row=session_row),
             Result(scalars=("documents",)),
         ]
@@ -250,8 +251,7 @@ def test_sqlalchemy_repository_maps_idempotent_and_differential_replacements() -
 
     changed_session = Session(
         [
-            Result(row=authority_row),
-            Result(row=object()),
+            Result(row=True),
             Result(row=session_row),
             Result(scalars=("documents", "notifications.email")),
             Result(),

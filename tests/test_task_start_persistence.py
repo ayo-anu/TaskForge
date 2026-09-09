@@ -33,6 +33,9 @@ class FakeResult:
         assert self.row is not None
         return self.row
 
+    def scalar_one(self) -> Any:
+        return self.row
+
 
 class FakeSession:
     def __init__(self, rows: list[object], scalars: list[object]) -> None:
@@ -99,8 +102,7 @@ def test_repository_commits_guarded_claimed_to_running_transition() -> None:
     )
     session = FakeSession(
         [
-            SimpleNamespace(id=worker.worker_identity_id),
-            SimpleNamespace(id=worker.credential_id),
+            True,
             SimpleNamespace(ended_at=None),
             SimpleNamespace(id=uuid4(), status=task.workflow_run_status),
             task,
@@ -138,8 +140,7 @@ def test_repository_replays_running_without_mutation() -> None:
     )
     session = FakeSession(
         [
-            SimpleNamespace(id=worker.worker_identity_id),
-            SimpleNamespace(id=worker.credential_id),
+            True,
             SimpleNamespace(ended_at=None),
             SimpleNamespace(status=task.workflow_run_status),
             task,
@@ -165,8 +166,7 @@ def test_repository_rejects_new_start_when_workflow_is_cancelling() -> None:
     )
     session = FakeSession(
         [
-            SimpleNamespace(id=worker.worker_identity_id),
-            SimpleNamespace(id=worker.credential_id),
+            True,
             SimpleNamespace(ended_at=None),
             SimpleNamespace(status="cancelling"),
             task,
@@ -193,8 +193,7 @@ def test_repository_fails_closed_for_terminal_workflow_at_start_boundary(
     )
     session = FakeSession(
         [
-            SimpleNamespace(id=worker.worker_identity_id),
-            SimpleNamespace(id=worker.credential_id),
+            True,
             SimpleNamespace(ended_at=None),
             SimpleNamespace(status=task.workflow_run_status),
             task,
@@ -216,7 +215,7 @@ def test_repository_fails_closed_for_terminal_workflow_at_start_boundary(
     (
         ([None], TaskStartAuthorityRejected),
         (
-            [SimpleNamespace(id=uuid4()), SimpleNamespace(id=uuid4()), None],
+            [True, None],
             TaskStartSessionRejected,
         ),
     ),
@@ -257,8 +256,7 @@ def test_repository_fails_closed_for_stale_claim_or_invalid_state(
     )
     session = FakeSession(
         [
-            SimpleNamespace(id=worker.worker_identity_id),
-            SimpleNamespace(id=worker.credential_id),
+            True,
             SimpleNamespace(ended_at=None),
             SimpleNamespace(status=task.workflow_run_status),
             task,

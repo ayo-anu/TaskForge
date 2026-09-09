@@ -137,6 +137,9 @@ class FakeResult:
         assert self.row is not None
         return self.row
 
+    def scalar_one(self) -> Any:
+        return self.row
+
 
 class FakeSession:
     def __init__(self, rows: list[object], scalars: list[object]) -> None:
@@ -207,8 +210,7 @@ def test_repository_orchestrates_new_acquisition_in_one_context() -> None:
     )
     session = FakeSession(
         [
-            SimpleNamespace(id=worker.worker_identity_id),
-            SimpleNamespace(id=worker.credential_id),
+            True,
             SimpleNamespace(ended_at=None),
             SimpleNamespace(status="running"),
             SimpleNamespace(
@@ -280,8 +282,7 @@ def test_repository_replays_without_new_assignment_reads_or_mutations() -> None:
     )
     session = FakeSession(
         [
-            SimpleNamespace(id=worker.worker_identity_id),
-            SimpleNamespace(id=worker.credential_id),
+            True,
             SimpleNamespace(ended_at=None),
             SimpleNamespace(status="running"),
             SimpleNamespace(status="claimed"),
@@ -301,7 +302,7 @@ def test_repository_replays_without_new_assignment_reads_or_mutations() -> None:
 
     assert result.outcome is TaskClaimOutcome.REPLAYED_EXPIRED
     assert result.claim.generation == 4
-    assert len(session.statements) == 9
+    assert len(session.statements) == 8
     assert not any(
         isinstance(statement, Insert) and statement.table.name == "task_claim_events"
         for statement in session.statements
@@ -318,8 +319,7 @@ def test_repository_rejects_new_claim_when_workflow_is_cancelling() -> None:
     )
     session = FakeSession(
         [
-            SimpleNamespace(id=worker.worker_identity_id),
-            SimpleNamespace(id=worker.credential_id),
+            True,
             SimpleNamespace(ended_at=None),
             SimpleNamespace(status="cancelling"),
             SimpleNamespace(
@@ -371,8 +371,7 @@ def test_repository_rejects_ended_authenticated_session() -> None:
             FakeSessions(
                 FakeSession(
                     [
-                        SimpleNamespace(id=worker.worker_identity_id),
-                        SimpleNamespace(id=worker.credential_id),
+                        True,
                         SimpleNamespace(ended_at=datetime.now(UTC)),
                     ],
                     [],
@@ -405,8 +404,7 @@ def renewal_rows(
         terminated_at=None,
     )
     rows: list[object] = [
-        SimpleNamespace(id=worker.worker_identity_id),
-        SimpleNamespace(id=worker.credential_id),
+        True,
         SimpleNamespace(ended_at=None),
         SimpleNamespace(id=uuid4(), status="running"),
         SimpleNamespace(id=uuid4(), status="claimed", attempt_number=1),
@@ -532,7 +530,7 @@ def test_repository_denies_renewal_after_workflow_cancellation_wins() -> None:
         candidate_expiry=current_expiry + timedelta(seconds=60),
         renewed_expiry=None,
     )
-    rows[3].status = "cancelling"
+    cast(Any, rows[2]).status = "cancelling"
     session = FakeSession(rows, [1, requested_at])
     repository = SQLAlchemyTaskClaimRepository(
         cast(async_sessionmaker[AsyncSession], FakeSessions(session)),
@@ -556,8 +554,7 @@ def test_repository_rejects_exact_recovered_generation_without_result_row_lock()
     request = TaskClaimRenewalRequest(attempt_id, 2, session_id, expiry)
     session = FakeSession(
         [
-            SimpleNamespace(id=worker.worker_identity_id),
-            SimpleNamespace(id=worker.credential_id),
+            True,
             SimpleNamespace(ended_at=None),
             SimpleNamespace(id=uuid4(), status="running"),
             SimpleNamespace(id=uuid4(), status="retry_scheduled", attempt_number=1),
