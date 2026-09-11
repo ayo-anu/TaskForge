@@ -113,61 +113,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    rabbitmq_host: str = Field(
-        default="127.0.0.1",
-        validation_alias=AliasChoices("RABBITMQ_HOST", "TASKFORGE_RABBITMQ_HOST"),
-    )
-    rabbitmq_port: int = Field(
-        default=5672,
-        ge=1,
-        le=65535,
-        validation_alias=AliasChoices(
-            "RABBITMQ_AMQP_PORT",
-            "TASKFORGE_RABBITMQ_PORT",
-        ),
-    )
-    rabbitmq_user: str = Field(
-        default="taskforge",
-        validation_alias=AliasChoices(
-            "RABBITMQ_DEFAULT_USER",
-            "TASKFORGE_RABBITMQ_USER",
-        ),
-    )
-    rabbitmq_password: SecretStr = Field(
-        validation_alias=AliasChoices(
-            "RABBITMQ_DEFAULT_PASS",
-            "TASKFORGE_RABBITMQ_PASSWORD",
-        ),
-    )
-    rabbitmq_vhost: str = Field(
-        default="taskforge",
-        validation_alias=AliasChoices(
-            "RABBITMQ_DEFAULT_VHOST",
-            "TASKFORGE_RABBITMQ_VHOST",
-        ),
-    )
-    rabbitmq_dispatch_exchange_name: str = Field(
-        default="taskforge.dispatch.v1",
-        pattern=r"^[a-z][a-z0-9._-]{0,254}$",
-    )
-    rabbitmq_malformed_exchange_name: str = Field(
-        default="taskforge.dispatch.malformed.v1",
-        pattern=r"^[a-z][a-z0-9._-]{0,254}$",
-    )
-    rabbitmq_topology_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
-
-    @model_validator(mode="after")
-    def validate_rabbitmq_topology_names(self) -> Settings:
-        names = (
-            self.rabbitmq_dispatch_exchange_name,
-            self.rabbitmq_malformed_exchange_name,
-        )
-        if any(name.startswith("amq.") for name in names):
-            raise ValueError("RabbitMQ topology names cannot use the reserved prefix")
-        if names[0] == names[1]:
-            raise ValueError("RabbitMQ topology exchange names must be distinct")
-        return self
-
     @model_validator(mode="after")
     def validate_tracing_configuration(self) -> Settings:
         if not self.tracing_enabled and self.tracing_exporter != "none":
@@ -226,7 +171,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_plaintext_listener(self) -> Settings:
-        """Keep the built-in plaintext listener local in production."""
+        """Restrict production listeners to local or container-wildcard binds."""
         if self.environment != "production":
             return self
         if self.api_host == "localhost":
@@ -235,11 +180,13 @@ class Settings(BaseSettings):
             address = ip_address(self.api_host)
         except ValueError as error:
             raise ValueError(
-                "production plaintext API listener must use a loopback host"
+                "production plaintext API listener must use a loopback or "
+                "unspecified host"
             ) from error
-        if not address.is_loopback:
+        if not (address.is_loopback or address.is_unspecified):
             raise ValueError(
-                "production plaintext API listener must use a loopback host"
+                "production plaintext API listener must use a loopback or "
+                "unspecified host"
             )
         return self
 
@@ -256,10 +203,69 @@ class OwnerSettings(Settings):
     )
 
 
-class WorkerSettings(Settings):
+class BrokerSettings(Settings):
+    """Settings shared only by processes that require RabbitMQ."""
+
+    rabbitmq_host: str = Field(
+        default="127.0.0.1",
+        validation_alias=AliasChoices("RABBITMQ_HOST", "TASKFORGE_RABBITMQ_HOST"),
+    )
+    rabbitmq_port: int = Field(
+        default=5672,
+        ge=1,
+        le=65535,
+        validation_alias=AliasChoices(
+            "RABBITMQ_AMQP_PORT",
+            "TASKFORGE_RABBITMQ_PORT",
+        ),
+    )
+    rabbitmq_user: str = Field(
+        default="taskforge",
+        validation_alias=AliasChoices(
+            "RABBITMQ_DEFAULT_USER",
+            "TASKFORGE_RABBITMQ_USER",
+        ),
+    )
+    rabbitmq_password: SecretStr = Field(
+        validation_alias=AliasChoices(
+            "RABBITMQ_DEFAULT_PASS",
+            "TASKFORGE_RABBITMQ_PASSWORD",
+        ),
+    )
+    rabbitmq_vhost: str = Field(
+        default="taskforge",
+        validation_alias=AliasChoices(
+            "RABBITMQ_DEFAULT_VHOST",
+            "TASKFORGE_RABBITMQ_VHOST",
+        ),
+    )
+    rabbitmq_dispatch_exchange_name: str = Field(
+        default="taskforge.dispatch.v1",
+        pattern=r"^[a-z][a-z0-9._-]{0,254}$",
+    )
+    rabbitmq_malformed_exchange_name: str = Field(
+        default="taskforge.dispatch.malformed.v1",
+        pattern=r"^[a-z][a-z0-9._-]{0,254}$",
+    )
+    rabbitmq_topology_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+
+    @model_validator(mode="after")
+    def validate_rabbitmq_topology_names(self) -> BrokerSettings:
+        names = (
+            self.rabbitmq_dispatch_exchange_name,
+            self.rabbitmq_malformed_exchange_name,
+        )
+        if any(name.startswith("amq.") for name in names):
+            raise ValueError("RabbitMQ topology names cannot use the reserved prefix")
+        if names[0] == names[1]:
+            raise ValueError("RabbitMQ topology exchange names must be distinct")
+        return self
+
+
+class WorkerSettings(BrokerSettings):
     """Production worker settings without configurable executable imports."""
 
-    worker_credential: SecretStr
+    worker_credential: SecretStr = Field(min_length=1)
     worker_profile: str = Field(
         min_length=1,
         max_length=128,
@@ -288,7 +294,7 @@ class WorkerSettings(Settings):
         return self
 
 
-class OrchestratorSettings(Settings):
+class OrchestratorSettings(BrokerSettings):
     """Production orchestrator settings for bounded continuous passes."""
 
     orchestrator_batch_size: int = Field(default=100, ge=1, le=100)

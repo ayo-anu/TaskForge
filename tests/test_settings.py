@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from taskforge.settings import (
+    BrokerSettings,
     OrchestratorSettings,
     OwnerSettings,
     Settings,
@@ -84,13 +85,7 @@ def test_settings_have_safe_local_defaults() -> None:
     )
     assert settings.postgres_host == "127.0.0.1"
     assert settings.postgres_port == 5432
-    assert settings.rabbitmq_host == "127.0.0.1"
-    assert settings.rabbitmq_port == 5672
-    assert settings.rabbitmq_dispatch_exchange_name == "taskforge.dispatch.v1"
-    assert settings.rabbitmq_malformed_exchange_name == (
-        "taskforge.dispatch.malformed.v1"
-    )
-    assert settings.rabbitmq_topology_timeout_seconds == 5.0
+    assert not any(name.startswith("rabbitmq_") for name in Settings.model_fields)
 
 
 def test_orchestrator_settings_have_bounded_defaults() -> None:
@@ -126,7 +121,7 @@ def test_settings_accept_prefixed_environment_overrides(
     monkeypatch.setenv("TASKFORGE_ENVIRONMENT", "test")
     monkeypatch.setenv("TASKFORGE_LOG_LEVEL", "DEBUG")
 
-    settings = Settings()
+    settings = BrokerSettings()
 
     assert settings.application_name == "taskforge-test"
     assert settings.environment == "test"
@@ -297,7 +292,7 @@ def test_settings_accept_compose_compatible_dependency_variables(
     monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "rabbitmq-test-secret")
     monkeypatch.setenv("RABBITMQ_DEFAULT_VHOST", "taskforge_test")
 
-    settings = Settings()
+    settings = BrokerSettings()
 
     assert settings.postgres_host == "postgres.internal"
     assert settings.postgres_port == 55432
@@ -309,6 +304,19 @@ def test_settings_accept_compose_compatible_dependency_variables(
     assert settings.rabbitmq_user == "rabbitmq-test-user"
     assert settings.rabbitmq_password.get_secret_value() == "rabbitmq-test-secret"
     assert settings.rabbitmq_vhost == "taskforge_test"
+
+
+def test_api_settings_do_not_require_or_expose_rabbitmq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RABBITMQ_DEFAULT_PASS")
+
+    settings = Settings()
+
+    assert not any(name.startswith("rabbitmq_") for name in type(settings).model_fields)
+    with pytest.raises(ValidationError) as error:
+        BrokerSettings()
+    assert ("RABBITMQ_DEFAULT_PASS",) in {item["loc"] for item in error.value.errors()}
 
 
 def test_runtime_settings_ignore_owner_credentials(
@@ -339,12 +347,19 @@ def test_dependency_passwords_are_required(
         Settings()
 
     locations = {item["loc"] for item in error.value.errors()}
-    assert ("POSTGRES_PASSWORD",) in locations
-    assert ("RABBITMQ_DEFAULT_PASS",) in locations
+    assert locations == {("POSTGRES_PASSWORD",)}
+
+    with pytest.raises(ValidationError) as broker_error:
+        BrokerSettings()
+    broker_locations = {item["loc"] for item in broker_error.value.errors()}
+    assert broker_locations == {
+        ("POSTGRES_PASSWORD",),
+        ("RABBITMQ_DEFAULT_PASS",),
+    }
 
 
 def test_dependency_passwords_are_redacted() -> None:
-    settings = Settings()
+    settings = BrokerSettings()
 
     rendered = repr(settings)
 
@@ -379,8 +394,9 @@ def test_settings_reject_invalid_runtime_values(
 ) -> None:
     monkeypatch.setenv(variable_name, invalid_value)
 
+    settings_type = BrokerSettings if "RABBITMQ" in variable_name else Settings
     with pytest.raises(ValidationError):
-        Settings()
+        settings_type()
 
 
 def test_settings_require_distinct_topology_exchange_names(
@@ -390,7 +406,7 @@ def test_settings_require_distinct_topology_exchange_names(
     monkeypatch.setenv("TASKFORGE_RABBITMQ_MALFORMED_EXCHANGE_NAME", "same.exchange")
 
     with pytest.raises(ValidationError):
-        Settings()
+        BrokerSettings()
 
 
 def test_settings_require_ordered_worker_health_thresholds(
@@ -415,9 +431,9 @@ def test_production_requires_explicit_claim_result_authority_secret(
 
 @pytest.mark.parametrize(
     "host",
-    ("127.0.0.1", "127.12.34.56", "::1", "localhost"),
+    ("127.0.0.1", "127.12.34.56", "::1", "localhost", "0.0.0.0", "::"),
 )
-def test_production_plaintext_listener_accepts_only_canonical_loopback_hosts(
+def test_production_plaintext_listener_accepts_loopback_or_unspecified_hosts(
     monkeypatch: pytest.MonkeyPatch,
     host: str,
 ) -> None:
@@ -430,8 +446,6 @@ def test_production_plaintext_listener_accepts_only_canonical_loopback_hosts(
 @pytest.mark.parametrize(
     "host",
     (
-        "0.0.0.0",
-        "::",
         "10.0.0.8",
         "192.168.1.8",
         "203.0.113.8",
@@ -477,6 +491,21 @@ def test_worker_settings_require_credential_and_profile(
     assert settings.worker_heartbeat_interval_seconds == 10.0
     assert settings.worker_prefetch_count == 1
     assert settings.worker_control_operation_timeout_seconds == 2.0
+
+
+@pytest.mark.parametrize("credential", (None, ""))
+def test_worker_settings_reject_missing_or_empty_credentials(
+    monkeypatch: pytest.MonkeyPatch, credential: str | None
+) -> None:
+    monkeypatch.delenv("TASKFORGE_WORKER_CREDENTIAL", raising=False)
+    monkeypatch.setenv("TASKFORGE_WORKER_PROFILE", "pipeline")
+    if credential is not None:
+        monkeypatch.setenv("TASKFORGE_WORKER_CREDENTIAL", credential)
+
+    with pytest.raises(ValidationError) as error:
+        WorkerSettings()
+
+    assert ("worker_credential",) in {item["loc"] for item in error.value.errors()}
 
 
 @pytest.mark.parametrize(

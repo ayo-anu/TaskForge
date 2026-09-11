@@ -105,7 +105,8 @@ def test_api_entry_point_uses_typed_runtime_settings(
         invocation.update(kwargs)
 
     monkeypatch.setenv("POSTGRES_PASSWORD", "test-postgres-password")
-    monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "test-rabbitmq-password")
+    monkeypatch.delenv("RABBITMQ_DEFAULT_PASS", raising=False)
+    monkeypatch.delenv("TASKFORGE_RABBITMQ_PASSWORD", raising=False)
     monkeypatch.setenv("TASKFORGE_API_HOST", "127.0.0.2")
     monkeypatch.setenv("TASKFORGE_API_PORT", "8765")
     monkeypatch.setenv("TASKFORGE_LOG_LEVEL", "WARNING")
@@ -124,6 +125,17 @@ def test_api_entry_point_uses_typed_runtime_settings(
         "log_config": uvicorn_log_config("WARNING"),
         "access_log": False,
     }
+
+
+def test_worker_process_rejects_blank_credential_as_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POSTGRES_PASSWORD", "test-postgres-password")
+    monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "test-rabbitmq-password")
+    monkeypatch.setenv("TASKFORGE_WORKER_CREDENTIAL", "")
+    monkeypatch.setenv("TASKFORGE_WORKER_PROFILE", "pipeline")
+
+    assert worker_main() == 2
 
 
 def test_worker_process_module_fails_closed_without_required_settings() -> None:
