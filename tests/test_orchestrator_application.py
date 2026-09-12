@@ -381,6 +381,49 @@ def test_partial_startup_failure_uses_reverse_exact_once_cleanup(
     asyncio.run(scenario())
 
 
+def test_incompatible_schema_fails_before_broker_and_workloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        application = OrchestratorApplication(settings())
+        engine = Engine(events)
+
+        async def reject_schema(value: object) -> None:
+            assert value is engine
+            events.append("schema:rejected")
+            raise RuntimeError("incompatible schema")
+
+        monkeypatch.setattr(application, "_configure_telemetry", lambda: None)
+        monkeypatch.setattr(
+            application_module,
+            "load_installed_task_catalog",
+            lambda: TaskTypeRegistry(()),
+        )
+        monkeypatch.setattr(
+            application_module, "build_async_engine", lambda value: engine
+        )
+        monkeypatch.setattr(
+            application_module, "build_session_factory", lambda value: object()
+        )
+        monkeypatch.setattr(
+            application_module, "require_compatible_schema", reject_schema
+        )
+        monkeypatch.setattr(
+            application,
+            "_connect_broker",
+            lambda *args: pytest.fail("broker must not connect"),
+        )
+
+        with pytest.raises(RuntimeError, match="incompatible schema"):
+            await application.start()
+
+        assert events == ["schema:rejected", "close:engine"]
+        assert application.state is OrchestratorApplicationState.STOPPED
+
+    asyncio.run(scenario())
+
+
 def test_owned_resources_close_in_reverse_order_exactly_once() -> None:
     async def scenario() -> None:
         events: list[str] = []

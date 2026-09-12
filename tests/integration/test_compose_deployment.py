@@ -20,8 +20,6 @@ from uuid import UUID, uuid4
 import aio_pika
 import asyncpg
 import pytest
-from alembic import command
-from alembic.config import Config
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -30,7 +28,7 @@ from taskforge.identity.provisioning import (
     IdentityProvisioningService,
 )
 from taskforge.persistence.provisioning import SQLAlchemyProvisioningRepository
-from tests.integration.postgresql import asyncpg_dsn, migration_database_url
+from tests.integration.postgresql import asyncpg_dsn
 
 pytestmark = [
     pytest.mark.integration,
@@ -81,6 +79,10 @@ class ComposeProject:
     @property
     def worker_image(self) -> str:
         return f"taskforge-worker:{self.values['TASKFORGE_IMAGE_TAG']}"
+
+    @property
+    def migration_image(self) -> str:
+        return f"taskforge-migration:{self.values['TASKFORGE_IMAGE_TAG']}"
 
     def write_environment(self) -> None:
         self.env_file.write_text(
@@ -229,6 +231,30 @@ def _wait_for_api(port: int) -> dict[str, object]:
     pytest.fail(f"published API did not become ready: {latest}")
 
 
+def _assert_api_schema_incompatible(port: int) -> None:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/health", timeout=2
+            ) as response:
+                if response.status != 200:
+                    time.sleep(0.1)
+                    continue
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/ready", timeout=2)
+            except urllib.error.HTTPError as error:
+                payload = cast(dict[str, object], json.load(error))
+                assert error.code == 503
+                assert payload == {"ready": False, "status": "not_ready"}
+                assert "revision" not in json.dumps(payload).lower()
+                return
+        except (OSError, urllib.error.URLError):
+            pass
+        time.sleep(0.1)
+    pytest.fail("API did not remain live and not-ready for an incompatible schema")
+
+
 def _wait_for_log(project: ComposeProject, service: str, event: str) -> None:
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -355,14 +381,19 @@ async def _assert_worker_identity_persisted(database_url: URL, worker_id: UUID) 
 
 
 def _assert_private_dependency_topology(project: ComposeProject) -> None:
-    expected_networks = {
-        "postgres": {f"{project.name}_database"},
-        "rabbitmq": {f"{project.name}_broker"},
+    for service in ("postgres", "rabbitmq"):
+        _assert_private_dependency_topology_for_service(project, service)
+
+
+def _assert_private_dependency_topology_for_service(
+    project: ComposeProject, service: str
+) -> None:
+    network = "database" if service == "postgres" else "broker"
+    inspection = _inspect(project.service_container(service))
+    assert set(inspection["NetworkSettings"]["Networks"]) == {
+        f"{project.name}_{network}"
     }
-    for service, networks in expected_networks.items():
-        inspection = _inspect(project.service_container(service))
-        assert set(inspection["NetworkSettings"]["Networks"]) == networks
-        assert inspection["HostConfig"]["PortBindings"] == {}
+    assert inspection["HostConfig"]["PortBindings"] == {}
 
 
 def _assert_private_persistence_markers(
@@ -449,11 +480,10 @@ def _assert_single_pid_one(container: str, expected: tuple[str, ...]) -> None:
     assert inspection["Path"] == expected[0]
     assert inspection["Args"] == list(expected[1:])
     top = _docker(("top", container, "-eo", "pid,ppid,args"))
-    rows = top.stdout.splitlines()[1:]
-    assert len(rows) == 1
-    pid, _parent_pid, arguments = rows[0].split(maxsplit=2)
-    assert int(pid) == state["Pid"]
-    assert arguments.endswith(" ".join(expected))
+    processes = [row.split(maxsplit=2) for row in top.stdout.splitlines()[1:]]
+    pid_one = [process for process in processes if int(process[0]) == state["Pid"]]
+    assert len(pid_one) == 1
+    assert pid_one[0][2].endswith(" ".join(expected))
 
 
 def _probe_from_service(project: ComposeProject, service: str, script: str) -> None:
@@ -496,7 +526,7 @@ def _assert_no_project_resources(project: ComposeProject) -> None:
         assert result.stdout.strip() == "", (
             f"leaked {resource}: {result.stdout.strip()}"
         )
-    for image in (project.api_image, project.worker_image):
+    for image in (project.api_image, project.worker_image, project.migration_image):
         assert _docker(("image", "inspect", image), check=False).returncode != 0
 
 
@@ -555,6 +585,38 @@ def test_real_compose_operator_lifecycle(tmp_path: Path) -> None:
         )
         _assert_loopback_bindings(project)
 
+        # Starting application roles before migration is unsupported and
+        # independently fail-closed. API remains live but not ready; the two
+        # work-producing roles exit before broker/authentication startup.
+        project.compose(("build", "api", "worker"), timeout=600)
+        project.compose(("up", "--detach", "api"), timeout=600)
+        _assert_api_schema_incompatible(int(values["TASKFORGE_API_PUBLISHED_PORT"]))
+        pre_migration_orchestrator = project.compose(
+            ("run", "--rm", "--no-deps", "orchestrator"),
+            check=False,
+            timeout=30,
+        )
+        assert pre_migration_orchestrator.returncode == 1
+        _assert_last_diagnostic(
+            pre_migration_orchestrator, "taskforge orchestrator runtime failed"
+        )
+        values["TASKFORGE_WORKER_CREDENTIAL"] = _synthetic_secret()
+        project.write_environment()
+        pre_migration_worker = project.compose(
+            ("run", "--rm", "--no-deps", "worker"),
+            check=False,
+            timeout=30,
+        )
+        assert pre_migration_worker.returncode == 1
+        _assert_last_diagnostic(pre_migration_worker, "taskforge worker runtime failed")
+        assert values["TASKFORGE_WORKER_CREDENTIAL"] not in (
+            pre_migration_worker.stdout + pre_migration_worker.stderr
+        )
+        del values["TASKFORGE_WORKER_CREDENTIAL"]
+        project.write_environment()
+        project.compose(("stop", "api"))
+        project.compose(("rm", "--force", "api"))
+
         owner_url = URL.create(
             "postgresql+asyncpg",
             username=values["POSTGRES_OWNER_USER"],
@@ -566,10 +628,11 @@ def test_real_compose_operator_lifecycle(tmp_path: Path) -> None:
         runtime_url = owner_url.set(
             username=RUNTIME_USER, password=values["POSTGRES_PASSWORD"]
         )
-        rendered_owner_url = owner_url.render_as_string(hide_password=False)
         try:
-            with migration_database_url(rendered_owner_url):
-                command.upgrade(Config(str(PROJECT_ROOT / "alembic.ini")), "head")
+            migration = project.compose(
+                ("run", "--rm", "migrate"), admin=True, timeout=600
+            )
+            assert "TaskForge migration completed action=upgrade" in migration.stdout
             worker_id, worker_credential = asyncio.run(_provision_worker(owner_url))
             asyncio.run(_assert_runtime_boundary(runtime_url))
         except Exception as error:
@@ -616,7 +679,6 @@ def test_real_compose_operator_lifecycle(tmp_path: Path) -> None:
 
         # Both an absent and an explicitly blank credential are configuration errors
         # when the worker is invoked from the private main topology.
-        project.compose(("build", "api", "worker"), timeout=600)
         missing = project.compose(
             ("run", "--rm", "--no-deps", "worker"), check=False, timeout=30
         )
@@ -784,10 +846,70 @@ def test_real_compose_operator_lifecycle(tmp_path: Path) -> None:
         )
         if down.returncode != 0:
             cleanup_errors.append(project.redact(down.stdout + down.stderr))
-        for image in (project.api_image, project.worker_image):
+        for image in (
+            project.api_image,
+            project.worker_image,
+            project.migration_image,
+        ):
             removal = _docker(("image", "rm", "--force", image), check=False)
             if removal.returncode != 0 and "No such image" not in removal.stderr:
                 cleanup_errors.append(removal.stderr)
+        try:
+            _assert_no_project_resources(project)
+        except AssertionError as error:
+            cleanup_errors.append(str(error))
+        if cleanup_errors:
+            pytest.fail("Compose cleanup failed:\n" + "\n".join(cleanup_errors))
+
+
+def test_migration_command_needs_no_local_admin_override(tmp_path: Path) -> None:
+    availability = _docker(("info", "--format", "{{.ServerVersion}}"), check=False)
+    if availability.returncode != 0:
+        pytest.skip(
+            "Docker daemon unavailable; real-Compose M22 checks NOT RUN: "
+            f"{availability.stderr.strip()}"
+        )
+
+    suffix = uuid4().hex
+    project = ComposeProject(
+        f"taskforge-m22-task3-{suffix}",
+        tmp_path / "migration.env",
+        {
+            "POSTGRES_DB": "taskforge",
+            "POSTGRES_OWNER_USER": "taskforge_owner",
+            "POSTGRES_OWNER_PASSWORD": _synthetic_secret(),
+            "POSTGRES_USER": RUNTIME_USER,
+            "POSTGRES_PASSWORD": _synthetic_secret(),
+            "RABBITMQ_DEFAULT_PASS": _synthetic_secret(),
+            "TASKFORGE_TASK_CLAIM_RESULT_AUTHORITY_SECRET": _synthetic_secret(),
+            "TASKFORGE_IMAGE_TAG": f"m22-task3-{suffix}",
+        },
+    )
+    project.write_environment()
+    cleanup_errors: list[str] = []
+    try:
+        project.compose(("up", "--detach", "postgres"), timeout=600)
+        _wait_for_health(project, "postgres")
+        _assert_private_dependency_topology_for_service(project, "postgres")
+
+        first = project.compose(("run", "--rm", "migrate"), timeout=600)
+        assert "TaskForge migration completed action=upgrade" in first.stdout
+        second = project.compose(("run", "--rm", "migrate"), timeout=600)
+        assert "TaskForge migration completed action=verify" in second.stdout
+        _assert_private_dependency_topology_for_service(project, "postgres")
+    finally:
+        down = project.compose(
+            ("down", "--volumes", "--remove-orphans", "--timeout", "10"),
+            check=False,
+            timeout=120,
+        )
+        if down.returncode != 0:
+            cleanup_errors.append(project.redact(down.stdout + down.stderr))
+        removal = _docker(
+            ("image", "rm", "--force", project.migration_image), check=False
+        )
+        if removal.returncode != 0 and "No such image" not in removal.stderr:
+            cleanup_errors.append(removal.stderr)
         try:
             _assert_no_project_resources(project)
         except AssertionError as error:

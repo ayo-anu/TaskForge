@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from taskforge.settings import (
     BrokerSettings,
+    MigrationSettings,
     OrchestratorSettings,
     OwnerSettings,
     Settings,
@@ -537,3 +538,37 @@ def test_worker_settings_require_conservative_control_timing(
     monkeypatch.setenv("TASKFORGE_WORKER_CONTROL_OPERATION_TIMEOUT_SECONDS", "10")
     with pytest.raises(ValidationError):
         WorkerSettings()
+
+
+def test_migration_settings_accept_only_narrow_owner_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POSTGRES_HOST", "database.internal")
+    monkeypatch.setenv("POSTGRES_PORT", "5544")
+    monkeypatch.setenv("POSTGRES_DB", "taskforge_deployment")
+    monkeypatch.setenv("POSTGRES_OWNER_USER", "taskforge_owner")
+    monkeypatch.setenv("POSTGRES_OWNER_PASSWORD", "owner-secret")
+    monkeypatch.setenv("TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS", "42")
+    monkeypatch.setenv("RABBITMQ_DEFAULT_PASS", "must-be-ignored")
+
+    settings = MigrationSettings()
+
+    assert settings.postgres_host == "database.internal"
+    assert settings.postgres_port == 5544
+    assert settings.postgres_database == "taskforge_deployment"
+    assert settings.postgres_owner_user == "taskforge_owner"
+    assert settings.postgres_owner_password.get_secret_value() == "owner-secret"
+    assert settings.migration_lock_timeout_seconds == 42
+    assert "rabbitmq_password" not in type(settings).model_fields
+    assert "postgres_password" not in type(settings).model_fields
+
+
+@pytest.mark.parametrize("timeout", ("0", "3601", "not-a-number"))
+def test_migration_settings_reject_invalid_lock_timeout(
+    monkeypatch: pytest.MonkeyPatch, timeout: str
+) -> None:
+    monkeypatch.setenv("POSTGRES_OWNER_PASSWORD", "owner-secret")
+    monkeypatch.setenv("TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS", timeout)
+
+    with pytest.raises(ValidationError):
+        MigrationSettings()

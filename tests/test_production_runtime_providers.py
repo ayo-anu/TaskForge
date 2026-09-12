@@ -221,9 +221,15 @@ def test_worker_application_loads_real_pipeline_profile_for_registration(
             assert execution is not None
             assert profile is resolved_profiles[0]
 
+        async def accept_schema(engine_to_check: object) -> None:
+            assert engine_to_check is engine
+
         monkeypatch.setattr(application, "_configure_telemetry", lambda: None)
         monkeypatch.setattr(application, "_connect_broker", connect_broker)
         monkeypatch.setattr(application, "_start_consumers", start_consumers)
+        monkeypatch.setattr(
+            "taskforge.worker.application.require_compatible_schema", accept_schema
+        )
         monkeypatch.setattr(
             "taskforge.worker.application.build_async_engine", lambda value: engine
         )

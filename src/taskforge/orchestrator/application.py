@@ -10,7 +10,6 @@ from enum import StrEnum
 
 import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractExchange
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from taskforge.broker.rabbitmq import RabbitMQDispatchPublisher
@@ -46,6 +45,7 @@ from taskforge.persistence.recovery import (
 )
 from taskforge.persistence.retries import SQLAlchemyRetryTransitionRepository
 from taskforge.persistence.runs import SQLAlchemyWorkflowRunRepository
+from taskforge.persistence.schema_compatibility import require_compatible_schema
 from taskforge.recovery.progression import ExpiredClaimRecoveryProgressionService
 from taskforge.recovery.scanner import RecoveryCandidateScanner
 from taskforge.recovery.service import (
@@ -204,8 +204,7 @@ class OrchestratorApplication:
     async def _probe_database(self) -> None:
         if self._engine is None:
             raise OrchestratorProcessFailure("orchestrator database is incomplete")
-        async with self._engine.connect() as connection:
-            await connection.execute(text("SELECT 1"))
+        await require_compatible_schema(self._engine)
 
     async def _connect_broker(self, catalog: TaskTypeRegistry) -> None:
         settings = self.settings

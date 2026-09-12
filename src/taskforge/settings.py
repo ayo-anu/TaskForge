@@ -203,6 +203,30 @@ class OwnerSettings(Settings):
     )
 
 
+class MigrationSettings(BaseSettings):
+    """Narrow owner configuration accepted by the one-shot migration process."""
+
+    model_config = SettingsConfigDict(env_file=None, extra="ignore", frozen=True)
+
+    postgres_host: str = Field(default="postgres", validation_alias="POSTGRES_HOST")
+    postgres_port: int = Field(
+        default=5432, ge=1, le=65535, validation_alias="POSTGRES_PORT"
+    )
+    postgres_database: str = Field(default="taskforge", validation_alias="POSTGRES_DB")
+    postgres_owner_user: str = Field(
+        default="taskforge_owner", validation_alias="POSTGRES_OWNER_USER"
+    )
+    postgres_owner_password: SecretStr = Field(
+        min_length=1, validation_alias="POSTGRES_OWNER_PASSWORD"
+    )
+    migration_lock_timeout_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=3600,
+        validation_alias="TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS",
+    )
+
+
 class BrokerSettings(Settings):
     """Settings shared only by processes that require RabbitMQ."""
 

@@ -33,6 +33,14 @@ processing = "taskforge.tasks.profiles:provide_processing_profile"
 notification = "taskforge.tasks.profiles:provide_notification_profile"
 
 [dependency-groups]
+migration = [
+    "alembic>=1,<2",
+    "asyncpg>=0.30,<1",
+    "opentelemetry-api>=1,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1,<2",
+    "opentelemetry-sdk>=1,<2",
+    "pydantic-settings>=2,<3",
+]
 dev = [
     "alembic>=1,<2",
     "editables==0.5",

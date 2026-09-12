@@ -25,7 +25,25 @@ RUN rm /opt/taskforge/.venv/.lock \
     && chmod -R go-w /opt/taskforge/.venv
 
 
-FROM python:3.12.14-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS runtime
+FROM python:3.12.14-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS migration-builder
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/taskforge/.venv
+
+COPY --from=uv /uv /usr/local/bin/uv
+
+WORKDIR /build
+COPY pyproject.toml uv.lock ./
+RUN uv lock --check
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --only-group migration --no-install-project
+RUN rm /opt/taskforge/.venv/.lock \
+    && chmod -R go-w /opt/taskforge/.venv
+
+
+FROM python:3.12.14-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS runtime-base
 
 ENV PATH=/opt/taskforge/.venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -37,6 +55,10 @@ RUN groupadd --gid 10001 taskforge \
         --home-dir /nonexistent --shell /usr/sbin/nologin taskforge
 
 WORKDIR /opt/taskforge
+
+
+FROM runtime-base AS runtime
+
 COPY --from=builder /opt/taskforge/.venv /opt/taskforge/.venv
 
 USER 10001:10001
@@ -51,3 +73,18 @@ CMD ["python", "-m", "taskforge.api"]
 FROM runtime AS worker
 
 CMD ["python", "-m", "taskforge.worker"]
+
+
+FROM runtime-base AS migration
+
+ENV PYTHONPATH=/opt/taskforge/src
+
+COPY --from=migration-builder /opt/taskforge/.venv /opt/taskforge/.venv
+COPY alembic.ini /opt/taskforge/alembic.ini
+COPY migrations /opt/taskforge/migrations
+COPY src /opt/taskforge/src
+
+USER 10001:10001
+STOPSIGNAL SIGTERM
+
+CMD ["python", "-m", "taskforge.database_migrations"]

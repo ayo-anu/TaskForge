@@ -27,12 +27,13 @@ def test_build_inputs_are_immutable_and_python_downloads_are_disabled() -> None:
 
     assert f"FROM {PINNED_UV_IMAGE} AS uv" in dockerfile
     assert re.findall(
-        rf"^FROM {re.escape(PINNED_PYTHON_IMAGE)} AS (\w+)$",
+        rf"^FROM {re.escape(PINNED_PYTHON_IMAGE)} AS ([\w-]+)$",
         dockerfile,
         re.MULTILINE,
     ) == [
         "builder",
-        "runtime",
+        "migration-builder",
+        "runtime-base",
     ]
     assert "ARG PYTHON_IMAGE" not in dockerfile
     assert "ARG UV_IMAGE" not in dockerfile
@@ -41,7 +42,10 @@ def test_build_inputs_are_immutable_and_python_downloads_are_disabled() -> None:
 
 def test_locked_production_install_is_isolated_to_the_builder() -> None:
     dockerfile = _dockerfile()
-    builder, runtime = dockerfile.split(f"FROM {PINNED_PYTHON_IMAGE} AS runtime", 1)
+    builder, _migration_builder = dockerfile.split(
+        f"FROM {PINNED_PYTHON_IMAGE} AS migration-builder", 1
+    )
+    runtime = dockerfile.split(f"FROM {PINNED_PYTHON_IMAGE} AS runtime-base", 1)[1]
 
     assert "COPY --from=uv /uv /usr/local/bin/uv" in builder
     assert "pip install" not in builder
@@ -67,7 +71,9 @@ def test_taskforge_adds_no_operating_system_packages() -> None:
 
 def test_runtime_copies_only_the_production_environment() -> None:
     dockerfile = _dockerfile()
-    _builder, runtime = dockerfile.split(f"FROM {PINNED_PYTHON_IMAGE} AS runtime", 1)
+    _builder, runtime = dockerfile.split(
+        f"FROM {PINNED_PYTHON_IMAGE} AS runtime-base", 1
+    )
     normalized_runtime = runtime.replace("\\\n", " ")
 
     runtime_filesystem, _api = runtime.split("FROM runtime AS api", 1)
@@ -83,7 +89,9 @@ def test_runtime_copies_only_the_production_environment() -> None:
 
 def test_distinct_non_root_targets_use_direct_role_commands() -> None:
     dockerfile = _dockerfile()
-    _builder, runtime = dockerfile.split(f"FROM {PINNED_PYTHON_IMAGE} AS runtime", 1)
+    _builder, runtime = dockerfile.split(
+        f"FROM {PINNED_PYTHON_IMAGE} AS runtime-base", 1
+    )
 
     assert "USER 10001:10001" in runtime
     assert "STOPSIGNAL SIGTERM" in runtime
@@ -107,6 +115,32 @@ def test_build_context_is_an_explicit_production_allowlist() -> None:
         "!.dockerignore",
         "!pyproject.toml",
         "!uv.lock",
+        "!alembic.ini",
+        "!migrations/",
+        "!migrations/**",
         "!src/",
         "!src/**",
     )
+
+
+def test_migration_target_is_separate_locked_and_non_root() -> None:
+    dockerfile = _dockerfile()
+    migration_builder = dockerfile.split(
+        f"FROM {PINNED_PYTHON_IMAGE} AS migration-builder", 1
+    )[1].split(f"FROM {PINNED_PYTHON_IMAGE} AS runtime-base", 1)[0]
+    migration = dockerfile.split("FROM runtime-base AS migration", 1)[1]
+
+    assert "uv lock --check" in migration_builder
+    assert "--frozen --only-group migration --no-install-project" in migration_builder
+    assert "UV_PYTHON_DOWNLOADS=never" in migration_builder
+    assert "COPY alembic.ini /opt/taskforge/alembic.ini" in migration
+    assert "COPY migrations /opt/taskforge/migrations" in migration
+    assert "COPY src /opt/taskforge/src" in migration
+    assert "ENV PYTHONPATH=/opt/taskforge/src" in migration
+    assert "USER 10001:10001" in migration
+    assert 'CMD ["python", "-m", "taskforge.database_migrations"]' in migration
+    assert "ENTRYPOINT" not in migration
+
+    production = dockerfile.split("FROM runtime AS api", 1)[0]
+    assert "COPY alembic.ini" not in production
+    assert "COPY migrations" not in production

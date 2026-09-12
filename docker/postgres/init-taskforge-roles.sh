@@ -5,10 +5,74 @@ set -eu
 : "${POSTGRES_USER:?POSTGRES_USER must be set}"
 : "${TASKFORGE_RUNTIME_USER:?TASKFORGE_RUNTIME_USER must be set}"
 : "${TASKFORGE_RUNTIME_PASSWORD:?TASKFORGE_RUNTIME_PASSWORD must be set}"
+: "${TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS:=300}"
 
-psql --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+case "$TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS" in
+  *[!0-9]*|'')
+    echo "TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS must be a whole number from 1 to 3600" >&2
+    exit 2
+    ;;
+esac
+if [ "$TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS" -lt 1 ] || \
+   [ "$TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS" -gt 3600 ]; then
+  echo "TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS must be from 1 to 3600" >&2
+  exit 2
+fi
+
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
   --set runtime_user="$TASKFORGE_RUNTIME_USER" \
-  --set runtime_password="$TASKFORGE_RUNTIME_PASSWORD" <<'SQL'
+  --set runtime_password="$TASKFORGE_RUNTIME_PASSWORD" \
+  --set lock_timeout_seconds="$TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS" <<'SQL'
+SELECT pg_catalog.set_config(
+    'taskforge.migration_lock_timeout_seconds',
+    :'lock_timeout_seconds',
+    false
+);
+SELECT pg_catalog.set_config(
+    'taskforge.bootstrap_backend_pid',
+    pg_catalog.pg_backend_pid()::pg_catalog.text,
+    false
+);
+
+DO $block$
+DECLARE
+    lock_key bigint;
+    lock_deadline timestamp with time zone;
+BEGIN
+    IF pg_catalog.current_setting('taskforge.bootstrap_backend_pid')::integer
+       <> pg_catalog.pg_backend_pid() THEN
+        RAISE EXCEPTION 'TaskForge bootstrap changed PostgreSQL sessions';
+    END IF;
+    SELECT
+        (CAST(1413893447 AS bigint) << 32) | database.oid::bigint
+    INTO lock_key
+    FROM pg_catalog.pg_database AS database
+    WHERE database.datname = pg_catalog.current_database();
+    lock_deadline := pg_catalog.clock_timestamp() + pg_catalog.make_interval(
+        secs => pg_catalog.current_setting(
+            'taskforge.migration_lock_timeout_seconds'
+        )::double precision
+    );
+    LOOP
+        EXIT WHEN pg_catalog.pg_try_advisory_lock(lock_key);
+        IF pg_catalog.clock_timestamp() >= lock_deadline THEN
+            RAISE EXCEPTION 'TaskForge migration lock acquisition timed out';
+        END IF;
+        PERFORM pg_catalog.pg_sleep(
+            LEAST(
+                0.1,
+                GREATEST(
+                    0.0,
+                    EXTRACT(
+                        EPOCH FROM lock_deadline - pg_catalog.clock_timestamp()
+                    )
+                )
+            )
+        );
+    END LOOP;
+END
+$block$;
+
 DO $block$
 DECLARE
     database_owner oid;
@@ -114,4 +178,77 @@ SELECT format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', current_da
 SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), :'runtime_user') \gexec
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 SELECT format('GRANT USAGE ON SCHEMA public TO %I', :'runtime_user') \gexec
+
+SELECT format($statement$
+DO $block$
+DECLARE
+    runtime_oid oid;
+BEGIN
+    SELECT oid INTO runtime_oid
+    FROM pg_catalog.pg_roles
+    WHERE rolname = %L;
+    IF runtime_oid IS NULL THEN
+        RAISE EXCEPTION 'TaskForge runtime role was not created';
+    END IF;
+    IF EXISTS (
+        SELECT FROM pg_catalog.pg_roles
+        WHERE oid = runtime_oid
+          AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit
+               OR rolreplication OR rolbypassrls)
+    ) THEN
+        RAISE EXCEPTION 'TaskForge runtime role has forbidden attributes';
+    END IF;
+    IF EXISTS (
+        WITH RECURSIVE memberships(roleid) AS (
+            SELECT roleid FROM pg_catalog.pg_auth_members
+            WHERE member = runtime_oid
+            UNION
+            SELECT membership.roleid
+            FROM pg_catalog.pg_auth_members AS membership
+            JOIN memberships AS parent ON membership.member = parent.roleid
+        )
+        SELECT FROM memberships
+    ) THEN
+        RAISE EXCEPTION 'TaskForge runtime role has memberships';
+    END IF;
+    IF EXISTS (
+        SELECT FROM pg_catalog.pg_class WHERE relowner = runtime_oid
+    ) OR EXISTS (
+        SELECT FROM pg_catalog.pg_namespace WHERE nspowner = runtime_oid
+    ) OR EXISTS (
+        SELECT FROM pg_catalog.pg_proc WHERE proowner = runtime_oid
+    ) THEN
+        RAISE EXCEPTION 'TaskForge runtime role owns schema objects';
+    END IF;
+    IF NOT pg_catalog.has_database_privilege(
+        %L, pg_catalog.current_database(), 'CONNECT'
+    ) THEN
+        RAISE EXCEPTION 'TaskForge runtime role lacks database CONNECT';
+    END IF;
+    IF NOT pg_catalog.has_schema_privilege(%L, 'public', 'USAGE')
+       OR pg_catalog.has_schema_privilege(%L, 'public', 'CREATE') THEN
+        RAISE EXCEPTION 'TaskForge runtime schema privileges are unsafe';
+    END IF;
+END
+$block$
+$statement$, :'runtime_user', :'runtime_user', :'runtime_user', :'runtime_user') \gexec
+
+DO $block$
+DECLARE
+    lock_key bigint;
+BEGIN
+    IF pg_catalog.current_setting('taskforge.bootstrap_backend_pid')::integer
+       <> pg_catalog.pg_backend_pid() THEN
+        RAISE EXCEPTION 'TaskForge bootstrap changed PostgreSQL sessions';
+    END IF;
+    SELECT
+        (CAST(1413893447 AS bigint) << 32) | database.oid::bigint
+    INTO lock_key
+    FROM pg_catalog.pg_database AS database
+    WHERE database.datname = pg_catalog.current_database();
+    IF NOT pg_catalog.pg_advisory_unlock(lock_key) THEN
+        RAISE EXCEPTION 'TaskForge migration lock was not held by bootstrap session';
+    END IF;
+END
+$block$;
 SQL

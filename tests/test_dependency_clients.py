@@ -19,9 +19,9 @@ class FakeConnection:
     def __init__(self) -> None:
         self.statements: list[str] = []
 
-    async def scalar(self, statement: object) -> int:
+    async def scalar(self, statement: object) -> list[str]:
         self.statements.append(str(statement))
-        return 1
+        return ["0032_schema_revision_contract"]
 
 
 class FakeConnectionContext:
@@ -57,7 +57,9 @@ def test_probe_uses_supplied_authoritative_engine_without_mutation() -> None:
     probe = SQLAlchemyPostgreSQLReadinessProbe(cast(AsyncEngine, engine))
 
     assert asyncio.run(probe.is_ready()) is True
-    assert engine.connection.statements == ["SELECT 1"]
+    assert engine.connection.statements == [
+        "SELECT public.taskforge_schema_revisions()"
+    ]
     assert len(engine.contexts) == 1
     assert engine.contexts[0].exited is True
 

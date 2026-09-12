@@ -4,6 +4,12 @@ x-taskforge-api-image: &taskforge-api-image
     context: .
     target: api
 
+x-taskforge-migration-image: &taskforge-migration-image
+  image: taskforge-migration:${TASKFORGE_IMAGE_TAG:-local}
+  build:
+    context: .
+    target: migration
+
 x-taskforge-runtime-environment: &taskforge-runtime-environment
   TASKFORGE_ENVIRONMENT: production
   TASKFORGE_LOG_LEVEL: ${TASKFORGE_LOG_LEVEL:-INFO}
@@ -40,6 +46,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}
       TASKFORGE_RUNTIME_USER: ${POSTGRES_USER:-taskforge_runtime}
       TASKFORGE_RUNTIME_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS: ${TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS:-300}
     volumes:
       - postgres-data:/var/lib/postgresql
       - ./docker/postgres/init-taskforge-roles.sh:/docker-entrypoint-initdb.d/10-taskforge-roles.sh:ro
@@ -54,6 +61,32 @@ services:
       retries: 12
       start_period: 10s
     restart: unless-stopped
+
+  migrate:
+    <<: *taskforge-migration-image
+    profiles:
+      - operations
+    command: ["python", "-m", "taskforge.database_migrations"]
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_signal: SIGTERM
+    restart: "no"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-taskforge}
+      POSTGRES_OWNER_USER: ${POSTGRES_OWNER_USER:-taskforge_owner}
+      POSTGRES_OWNER_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}
+      TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS: ${TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS:-300}
+    networks:
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   rabbitmq:
     image: rabbitmq:4.3.3-management@sha256:d8b3d416236ae5ba3f6a9f4e4651fdacda01780181a7d83a71b640248d8f0a69

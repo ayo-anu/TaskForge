@@ -212,6 +212,14 @@ def test_valid_start_uses_paused_admission_then_heartbeat_then_activation(
         monkeypatch.setattr(
             "taskforge.worker.application.build_session_factory", lambda value: object()
         )
+
+        async def accept_schema(value: object) -> None:
+            assert value is engine
+            events.append("schema")
+
+        monkeypatch.setattr(
+            "taskforge.worker.application.require_compatible_schema", accept_schema
+        )
         monkeypatch.setattr(
             "taskforge.worker.application.WorkerAuthenticator",
             lambda *args, **kwargs: Authenticator(),
@@ -228,8 +236,9 @@ def test_valid_start_uses_paused_admission_then_heartbeat_then_activation(
         await application.start()
 
         assert application.state is WorkerApplicationState.RUNNING
-        assert events[:7] == [
+        assert events[:8] == [
             "telemetry",
+            "schema",
             "authenticate",
             "broker",
             "register",
@@ -237,7 +246,7 @@ def test_valid_start_uses_paused_admission_then_heartbeat_then_activation(
             "heartbeat:1",
             "heartbeat:start",
         ]
-        assert events[7] == "activate:runtime"
+        assert events[8] == "activate:runtime"
         await application.close()
 
     asyncio.run(scenario())
@@ -266,6 +275,56 @@ def test_partial_startup_failure_uses_the_same_reverse_cleanup_path(
         assert events == ["close:metrics", "close:tracing"]
         await application.close()
         assert events == ["close:metrics", "close:tracing"]
+
+    asyncio.run(scenario())
+
+
+def test_incompatible_schema_fails_before_worker_authority_or_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        catalog, profile = provider()
+        application = WorkerApplication(settings())
+        engine = Engine(events)
+
+        async def reject_schema(value: object) -> None:
+            assert value is engine
+            events.append("schema:rejected")
+            raise RuntimeError("incompatible schema")
+
+        monkeypatch.setattr(application, "_configure_telemetry", lambda: None)
+        monkeypatch.setattr(
+            "taskforge.worker.application.load_installed_task_catalog", lambda: catalog
+        )
+        monkeypatch.setattr(
+            "taskforge.worker.application.load_installed_worker_profile",
+            lambda name, resolved: profile,
+        )
+        monkeypatch.setattr(
+            "taskforge.worker.application.build_async_engine", lambda value: engine
+        )
+        monkeypatch.setattr(
+            "taskforge.worker.application.build_session_factory", lambda value: object()
+        )
+        monkeypatch.setattr(
+            "taskforge.worker.application.require_compatible_schema", reject_schema
+        )
+        monkeypatch.setattr(
+            "taskforge.worker.application.WorkerAuthenticator",
+            lambda *args, **kwargs: pytest.fail("authentication must not start"),
+        )
+        monkeypatch.setattr(
+            application,
+            "_connect_broker",
+            lambda *args: pytest.fail("broker must not connect"),
+        )
+
+        with pytest.raises(RuntimeError, match="incompatible schema"):
+            await application.start()
+
+        assert events == ["schema:rejected", "close:engine"]
+        assert application.state is WorkerApplicationState.STOPPED
 
     asyncio.run(scenario())
 
@@ -304,6 +363,10 @@ def test_identity_or_database_authentication_failure_rolls_back_engine(
         )
         monkeypatch.setattr(
             "taskforge.worker.application.build_session_factory", lambda value: object()
+        )
+        monkeypatch.setattr(
+            "taskforge.worker.application.require_compatible_schema",
+            lambda value: asyncio.sleep(0),
         )
         monkeypatch.setattr(
             "taskforge.worker.application.WorkerAuthenticator",
@@ -358,6 +421,10 @@ def test_broker_startup_failure_closes_partial_broker_and_database_ownership(
         )
         monkeypatch.setattr(
             "taskforge.worker.application.build_session_factory", lambda value: object()
+        )
+        monkeypatch.setattr(
+            "taskforge.worker.application.require_compatible_schema",
+            lambda value: asyncio.sleep(0),
         )
         monkeypatch.setattr(
             "taskforge.worker.application.WorkerAuthenticator",

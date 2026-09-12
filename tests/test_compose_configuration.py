@@ -15,6 +15,7 @@ COMPOSE_FILE = PROJECT_ROOT / "compose.yaml"
 LOCAL_ADMIN_FILE = PROJECT_ROOT / "compose.local-admin.yaml"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 SERVICES = {"postgres", "rabbitmq", "api", "orchestrator", "worker"}
+OPERATIONS_SERVICES = SERVICES | {"migrate"}
 APPLICATION_SERVICES = {"api", "orchestrator", "worker"}
 REQUIRED_SECRETS = {
     "POSTGRES_OWNER_PASSWORD": (
@@ -61,6 +62,7 @@ def _compose_config(
     *,
     files: tuple[Path, ...] = (COMPOSE_FILE,),
     environment: dict[str, str] | None = None,
+    profiles: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     clean_environment = {
         name: value
@@ -70,6 +72,8 @@ def _compose_config(
     if environment is not None:
         clean_environment.update(environment)
     arguments = ["docker", "compose", "--env-file", str(env_file)]
+    for profile in profiles:
+        arguments.extend(("--profile", profile))
     for compose_file in files:
         arguments.extend(("--file", str(compose_file)))
     arguments.extend(("config", "--format", "json"))
@@ -363,6 +367,41 @@ def test_compose_introduces_no_migration_or_drain_behavior() -> None:
     ).lower()
 
     assert "alembic" not in rendered
-    assert "migration" not in rendered
     assert "\n    entrypoint:" not in rendered
     assert "drain" not in rendered
+
+
+def test_migration_service_is_explicit_one_shot_and_owner_scoped(
+    synthetic_env_file: Path,
+) -> None:
+    result = _compose_config(synthetic_env_file, profiles=("operations",))
+    assert result.returncode == 0, result.stderr
+    services = json.loads(result.stdout)["services"]
+    assert set(services) == OPERATIONS_SERVICES
+    migrate = services["migrate"]
+
+    assert migrate["profiles"] == ["operations"]
+    assert migrate["build"]["target"] == "migration"
+    assert migrate["command"] == ["python", "-m", "taskforge.database_migrations"]
+    assert migrate["user"] == "10001:10001"
+    assert migrate["read_only"] is True
+    assert migrate["restart"] == "no"
+    assert migrate["networks"] == {"database": None}
+    assert migrate["depends_on"] == {
+        "postgres": {"condition": "service_healthy", "required": True}
+    }
+    assert "healthcheck" not in migrate
+    assert "ports" not in migrate
+    assert "volumes" not in migrate
+    assert "tmpfs" not in migrate
+    assert migrate.get("entrypoint") is None
+    assert set(migrate["environment"]) == {
+        "POSTGRES_HOST",
+        "POSTGRES_PORT",
+        "POSTGRES_DB",
+        "POSTGRES_OWNER_USER",
+        "POSTGRES_OWNER_PASSWORD",
+        "TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS",
+    }
+    for application in APPLICATION_SERVICES:
+        assert "migrate" not in services[application].get("depends_on", {})

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from taskforge.api.health import ReadinessCoordinator
+from taskforge.persistence.schema_compatibility import schema_is_compatible
 from taskforge.settings import Settings
 
 
@@ -17,8 +17,7 @@ class SQLAlchemyPostgreSQLReadinessProbe:
 
     async def is_ready(self) -> bool:
         async with self._engine.connect() as connection:
-            result: object = await connection.scalar(text("SELECT 1"))
-            return result == 1
+            return await schema_is_compatible(connection)
 
 
 def build_readiness_coordinator(

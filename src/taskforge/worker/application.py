@@ -28,6 +28,7 @@ from taskforge.persistence.authentication import SQLAlchemyWorkerCredentialRepos
 from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
 from taskforge.persistence.database import build_async_engine, build_session_factory
 from taskforge.persistence.rate_limits import SQLAlchemyRateLimitRepository
+from taskforge.persistence.schema_compatibility import require_compatible_schema
 from taskforge.persistence.task_cancellation import SQLAlchemyTaskCancellationObserver
 from taskforge.persistence.task_results import SQLAlchemyTaskResultRepository
 from taskforge.persistence.task_start import SQLAlchemyTaskStartRepository
@@ -127,6 +128,7 @@ class WorkerApplication:
             )
             self._engine = build_async_engine(self.settings)
             sessions = build_session_factory(self._engine)
+            await require_compatible_schema(self._engine)
             presented = parse_presented_credential(
                 self.settings.worker_credential.get_secret_value()
             )

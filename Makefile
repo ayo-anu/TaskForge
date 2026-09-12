@@ -25,9 +25,11 @@ test:
 coverage:
 	uv run pytest --cov=taskforge --cov-report=term-missing
 
-# Run before Alembic 0027 when upgrading an existing initialized Compose volume.
+# Run before every supported migration attempt to reconcile runtime-role privileges.
 privilege-bootstrap:
-	docker compose exec postgres sh /docker-entrypoint-initdb.d/10-taskforge-roles.sh
+	docker compose exec \
+		-e TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS="$${TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS:-300}" \
+		postgres sh /docker-entrypoint-initdb.d/10-taskforge-roles.sh
 
 migrations-check:
 	uv run alembic heads --verbose
@@ -35,7 +37,7 @@ migrations-check:
 migration-test:
 	@test "$${TASKFORGE_RUN_MIGRATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_MIGRATION_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_MIGRATION_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_MIGRATION_TEST_DATABASE_URL is required" >&2; exit 2)
-	uv run pytest tests/integration/test_identity_migrations.py tests/integration/test_workflow_definition_migrations.py tests/integration/test_workflow_run_migrations.py tests/integration/test_task_dispatch_migrations.py tests/integration/test_task_claim_migrations.py tests/integration/test_task_claim_event_migrations.py tests/integration/test_retry_persistence_migrations.py tests/integration/test_retry_event_migrations.py tests/integration/test_recovery_migrations.py tests/integration/test_recovery_event_migrations.py tests/integration/test_dead_letter_migrations.py tests/integration/test_workflow_cancellation_migrations.py tests/integration/test_execution_event_migrations.py tests/integration/test_workflow_replay_migrations.py tests/integration/test_history_privileges.py tests/integration/test_authorized_history_migration.py tests/integration/test_authorized_history_retrieval.py tests/integration/test_worker_authority_privileges.py
+	uv run pytest tests/integration/test_identity_migrations.py tests/integration/test_workflow_definition_migrations.py tests/integration/test_workflow_run_migrations.py tests/integration/test_task_dispatch_migrations.py tests/integration/test_task_claim_migrations.py tests/integration/test_task_claim_event_migrations.py tests/integration/test_retry_persistence_migrations.py tests/integration/test_retry_event_migrations.py tests/integration/test_recovery_migrations.py tests/integration/test_recovery_event_migrations.py tests/integration/test_dead_letter_migrations.py tests/integration/test_workflow_cancellation_migrations.py tests/integration/test_execution_event_migrations.py tests/integration/test_workflow_replay_migrations.py tests/integration/test_history_privileges.py tests/integration/test_authorized_history_migration.py tests/integration/test_authorized_history_retrieval.py tests/integration/test_worker_authority_privileges.py tests/integration/test_migration_deployment.py
 
 claim-test:
 	@test "$${TASKFORGE_RUN_CLAIM_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_CLAIM_INTEGRATION=1 is required" >&2; exit 2)

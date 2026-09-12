@@ -1588,6 +1588,14 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
+migration = [
+    { name = "alembic" },
+    { name = "asyncpg" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
+    { name = "pydantic-settings" },
+]
 security = [
     { name = "pip-audit" },
 ]
@@ -1616,6 +1624,14 @@ dev = [
     { name = "pytest", specifier = ">=9.0.3,<10" },
     { name = "pytest-cov", specifier = ">=6,<8" },
     { name = "ruff", specifier = ">=0.12,<1" },
+]
+migration = [
+    { name = "alembic", specifier = ">=1,<2" },
+    { name = "asyncpg", specifier = ">=0.30,<1" },
+    { name = "opentelemetry-api", specifier = ">=1,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1,<2" },
+    { name = "opentelemetry-sdk", specifier = ">=1,<2" },
+    { name = "pydantic-settings", specifier = ">=2,<3" },
 ]
 security = [{ name = "pip-audit", specifier = "==2.10.1" }]
 
