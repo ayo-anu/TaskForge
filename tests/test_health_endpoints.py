@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
 
+import taskforge.api.application as application_module
 import taskforge.api.health as health_module
 from taskforge.api.application import create_app
 from taskforge.api.health import ReadinessCoordinator
@@ -188,6 +189,138 @@ def test_readiness_is_withdrawn_before_authentication_close() -> None:
 
     asyncio.run(exercise())
     assert authentication.closed is True
+
+
+def test_execution_stream_closes_before_waiting_for_active_http_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    stream_closed = asyncio.Event()
+
+    class Authentication(FakeAuthentication):
+        workflow_run_execution_event_repository = object()
+
+        async def close(self) -> None:
+            events.append("authentication:close")
+            await super().close()
+
+    class Stream:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def start(self) -> None:
+            events.append("stream:start")
+
+        async def close(self) -> None:
+            events.append("stream:close")
+            stream_closed.set()
+
+    monkeypatch.setattr(application_module, "AuthenticationRuntime", Authentication)
+    monkeypatch.setattr(application_module, "ExecutionStreamRuntime", Stream)
+    authentication = Authentication()
+    app = create_app(
+        settings=make_settings(),
+        readiness=ReadinessCoordinator(FakePostgreSQLProbe(), timeout_seconds=0.05),
+        authentication=authentication,  # type: ignore[arg-type]
+    )
+
+    async def exercise() -> None:
+        context = app.router.lifespan_context(app)
+        await context.__aenter__()
+        tracker = app.state.active_http_requests
+        await tracker.enter()
+        shutdown = asyncio.create_task(context.__aexit__(None, None, None))
+        await stream_closed.wait()
+        assert events == ["stream:start", "stream:close"]
+        assert not authentication.closed
+        assert not shutdown.done()
+        await tracker.leave()
+        await shutdown
+        assert events[-1] == "authentication:close"
+
+    asyncio.run(exercise())
+
+
+def test_http_cancellation_overrun_does_not_age_shared_resource_cleanup_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    deadlines: list[object] = []
+    entered = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release = asyncio.Event()
+    stream_closed = asyncio.Event()
+
+    class Deadline:
+        def __init__(self, timeout_seconds: float) -> None:
+            self.expires_at = clock[0] + timeout_seconds
+            deadlines.append(self)
+
+        async def wait(self, operation: object) -> object:
+            assert clock[0] < self.expires_at
+            return await operation  # type: ignore[misc]
+
+    class Authentication(FakeAuthentication):
+        workflow_run_execution_event_repository = object()
+
+        async def close(self) -> None:
+            assert len(deadlines) == 2
+            assert clock[0] < deadlines[-1].expires_at  # type: ignore[attr-defined]
+            await super().close()
+
+    class Stream:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def start(self) -> None:
+            return
+
+        async def close(self) -> None:
+            stream_closed.set()
+
+    monkeypatch.setattr(application_module, "AuthenticationRuntime", Authentication)
+    monkeypatch.setattr(application_module, "ExecutionStreamRuntime", Stream)
+    monkeypatch.setattr(application_module, "CooperativeShutdownDeadline", Deadline)
+    authentication = Authentication()
+    app = create_app(
+        settings=make_settings(),
+        readiness=ReadinessCoordinator(FakePostgreSQLProbe(), timeout_seconds=0.05),
+        authentication=authentication,  # type: ignore[arg-type]
+    )
+
+    @app.get("/hold")
+    async def hold() -> dict[str, bool]:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+        return {"completed": True}
+
+    async def exercise() -> None:
+        context = app.router.lifespan_context(app)
+        await context.__aenter__()
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            request_task = asyncio.create_task(client.get("/hold"))
+            await entered.wait()
+            request_task.cancel()
+            await cancellation_seen.wait()
+            shutdown = asyncio.create_task(context.__aexit__(None, None, None))
+            await stream_closed.wait()
+            assert len(deadlines) == 1
+            assert not authentication.closed
+            assert not shutdown.done()
+            clock[0] += 100.0
+            release.set()
+            await asyncio.gather(request_task, return_exceptions=True)
+            await shutdown
+        assert authentication.closed
+        assert len(deadlines) == 2
+
+    asyncio.run(exercise())
 
 
 def test_operational_endpoints_are_unversioned() -> None:

@@ -227,3 +227,47 @@ def test_supervised_loop_is_bounded_and_stop_aware_without_hot_polling() -> None
         assert workload.calls == 2
 
     asyncio.run(scenario())
+
+
+def test_progression_stop_barrier_prevents_next_candidate() -> None:
+    async def scenario() -> None:
+        repository = CandidateRepository()
+        run_ids = (uuid4(), uuid4())
+        repository.active_pages = [
+            DiscoveryPage(
+                tuple(ActiveWorkflowRunCandidate(item, NOW) for item in run_ids), None
+            )
+        ]
+        repository.runnable_pages = [DiscoveryPage((), None)]
+        stopped = False
+        calls: list[UUID] = []
+
+        class Runs:
+            async def reconcile_workflow_run(self, run_id: UUID) -> SimpleNamespace:
+                nonlocal stopped
+                calls.append(run_id)
+                stopped = True
+                return SimpleNamespace(
+                    runnable_transition_count=0,
+                    skipped_transition_count=0,
+                    workflow_transition_count=1,
+                    cancelled_transition_count=0,
+                )
+
+        class Dispatch:
+            async def dispatch_task(self, run_id: UUID, task_id: UUID) -> None:
+                raise AssertionError((run_id, task_id))
+
+        result = await ProgressionDispatchWorkload(
+            repository,
+            Runs(),
+            Dispatch(),
+            batch_size=2,
+            should_stop=lambda: stopped,
+        ).run_once()
+
+        assert calls == [run_ids[0]]
+        assert result.candidates == 1
+        assert result.transitions == 1
+
+    asyncio.run(scenario())

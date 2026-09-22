@@ -49,12 +49,18 @@ class RetryTransitioner(Protocol):
 
 
 class DueRetryDispatcher(Protocol):
-    async def scan_due_retries(self, *, batch_size: int) -> Any: ...
+    async def scan_due_retries(
+        self, *, batch_size: int, should_stop: Callable[[], bool] | None = None
+    ) -> Any: ...
 
 
 class OutboxPublisher(Protocol):
     async def reconcile_unpublished(
-        self, *, page_size: int, pass_limit: int
+        self,
+        *,
+        page_size: int,
+        pass_limit: int,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Any: ...
 
 
@@ -97,10 +103,12 @@ class ProgressionDispatchWorkload:
         dispatch: RunnableTaskDispatcher,
         *,
         batch_size: int,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self._runs = runs
         self._dispatch = dispatch
         self._batch_size = batch_size
+        self._should_stop = should_stop or (lambda: False)
         self._active = _KeysetSweep(
             candidates.capture_active_run_high_water,
             lambda high, cursor, limit: candidates.list_active_workflow_runs(
@@ -117,8 +125,11 @@ class ProgressionDispatchWorkload:
     async def run_once(self) -> WorkloadPassResult:
         active = await self._active.next_page(self._batch_size)
         runnable = await self._runnable.next_page(self._batch_size)
-        transitions = 0
+        transitions = examined = 0
         for active_candidate in active.items:
+            if self._should_stop():
+                break
+            examined += 1
             result = await self._runs.reconcile_workflow_run(
                 active_candidate.workflow_run_id
             )
@@ -129,6 +140,9 @@ class ProgressionDispatchWorkload:
                 + result.cancelled_transition_count
             )
         for runnable_candidate in runnable.items:
+            if self._should_stop():
+                break
+            examined += 1
             try:
                 await self._dispatch.dispatch_task(
                     runnable_candidate.workflow_run_id,
@@ -138,7 +152,7 @@ class ProgressionDispatchWorkload:
                 continue
             transitions += 1
         return WorkloadPassResult(
-            len(active.items) + len(runnable.items),
+            examined,
             transitions,
             active.next_cursor is not None or runnable.next_cursor is not None,
         )
@@ -154,10 +168,13 @@ class RetryWorkload:
         due: DueRetryDispatcher,
         *,
         batch_size: int,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self._transitions = transitions
         self._due = due
         self._batch_size = batch_size
+        self._should_stop = should_stop or (lambda: False)
+        self._stop_aware = should_stop is not None
         self._pending = _KeysetSweep(
             candidates.capture_retry_pending_high_water,
             lambda high, cursor, limit: candidates.list_retry_pending_tasks(
@@ -167,15 +184,24 @@ class RetryWorkload:
 
     async def run_once(self) -> WorkloadPassResult:
         pending = await self._pending.next_page(self._batch_size)
-        changed = 0
+        changed = examined = 0
         for candidate in pending.items:
+            if self._should_stop():
+                break
+            examined += 1
             receipt = await self._transitions.transition_retry(candidate.task_run_id)
             changed += int(
                 receipt.outcome.value not in {"not_eligible", "already_scheduled"}
             )
-        due = await self._due.scan_due_retries(batch_size=self._batch_size)
+        due = (
+            await self._due.scan_due_retries(
+                batch_size=self._batch_size, should_stop=self._should_stop
+            )
+            if self._stop_aware
+            else await self._due.scan_due_retries(batch_size=self._batch_size)
+        )
         return WorkloadPassResult(
-            len(pending.items) + due.examined,
+            examined + due.examined,
             changed + due.dispatched,
             pending.next_cursor is not None or due.examined == self._batch_size,
         )
@@ -192,12 +218,14 @@ class RecoveryWorkload:
         *,
         batch_size: int,
         stale_after_seconds: int,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self._candidates = candidates
         self._expired = expired
         self._stale = stale
         self._batch_size = batch_size
         self._stale_after_seconds = stale_after_seconds
+        self._should_stop = should_stop or (lambda: False)
         self._expired_cursor: ExpiredClaimScanCursor | None = None
         self._stale_cursor: StaleWorkerSessionScanCursor | None = None
 
@@ -210,33 +238,55 @@ class RecoveryWorkload:
         )
         self._expired_cursor = expired.next_cursor
         self._stale_cursor = stale.next_cursor
-        changed = 0
+        changed = examined = 0
         for expired_candidate in expired.items:
+            if self._should_stop():
+                break
+            examined += 1
             expired_receipt = await self._expired.recover_and_progress(
                 expired_candidate
             )
             changed += int(expired_receipt.recovery.recovered_at is not None)
         for stale_candidate in stale.items:
+            if self._should_stop():
+                break
+            examined += 1
             stale_receipt = await self._stale.end_stale_session(
                 stale_candidate, stale_after_seconds=self._stale_after_seconds
             )
             changed += int(stale_receipt.ended_at is not None)
         return WorkloadPassResult(
-            len(expired.items) + len(stale.items),
+            examined,
             changed,
             self._expired_cursor is not None or self._stale_cursor is not None,
         )
 
 
 class OutboxPublicationWorkload:
-    def __init__(self, publisher: OutboxPublisher, *, batch_size: int) -> None:
+    def __init__(
+        self,
+        publisher: OutboxPublisher,
+        *,
+        batch_size: int,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
         self._publisher = publisher
         self._batch_size = batch_size
+        self._should_stop = should_stop or (lambda: False)
+        self._stop_aware = should_stop is not None
 
     async def run_once(self) -> WorkloadPassResult:
-        result = await self._publisher.reconcile_unpublished(
-            page_size=self._batch_size,
-            pass_limit=self._batch_size,
+        result = (
+            await self._publisher.reconcile_unpublished(
+                page_size=self._batch_size,
+                pass_limit=self._batch_size,
+                should_stop=self._should_stop,
+            )
+            if self._stop_aware
+            else await self._publisher.reconcile_unpublished(
+                page_size=self._batch_size,
+                pass_limit=self._batch_size,
+            )
         )
         if result.durable_invalid:
             raise OrchestratorWorkloadInvariantError(

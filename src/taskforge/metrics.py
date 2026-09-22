@@ -111,7 +111,7 @@ class MetricsRuntime:
     def enabled(self) -> bool:
         return self.provider is not None
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, timeout_seconds: float | None = None) -> None:
         if self.provider is None:
             return
         provider, self.provider = self.provider, None
@@ -125,7 +125,11 @@ class MetricsRuntime:
         thread = Thread(target=close, name="taskforge-metrics-shutdown", daemon=True)
         try:
             thread.start()
-            thread.join(self.shutdown_timeout_seconds)
+            thread.join(
+                self.shutdown_timeout_seconds
+                if timeout_seconds is None
+                else min(self.shutdown_timeout_seconds, timeout_seconds)
+            )
         except Exception:
             pass
 
@@ -213,8 +217,12 @@ _ALLOWED_ATTRIBUTE_VALUES: Final[dict[str, frozenset[str]]] = {
             "degraded_allowed",
             "degraded_limited",
             "rate_limited",
+            "drain_timeout",
+            "cancellation_overrun",
+            "cleanup_failed",
         }
     ),
+    "taskforge.process.role": frozenset({"api", "orchestrator", "worker"}),
     "taskforge.result.kind": frozenset(
         {"success", "retryable_failure", "permanent_failure", "cancellation"}
     ),
@@ -342,6 +350,15 @@ _INSTRUMENT_ATTRIBUTE_KEYS: Final[dict[str, frozenset[str]]] = {
     ),
     "taskforge.orchestrator.candidates": frozenset({"taskforge.workload"}),
     "taskforge.orchestrator.transitions": frozenset({"taskforge.workload"}),
+    "taskforge.process.shutdown.operations": frozenset(
+        {"taskforge.process.role", "taskforge.outcome"}
+    ),
+    "taskforge.process.shutdown.duration": frozenset(
+        {"taskforge.process.role", "taskforge.outcome"}
+    ),
+    "taskforge.worker.drain.timeouts": frozenset(),
+    "taskforge.worker.drain.overruns": frozenset({"taskforge.outcome"}),
+    "taskforge.worker.drain.overrun.duration": frozenset(),
 }
 
 _ATTRIBUTE_VALUES_BY_INSTRUMENT_KEY: Final[dict[tuple[str, str], frozenset[str]]] = {}
@@ -606,6 +623,28 @@ for _orchestrator_name in (
 ):
     _allow(_orchestrator_name, "taskforge.outcome", "completed", "failed")
 
+for _shutdown_name in (
+    "taskforge.process.shutdown.operations",
+    "taskforge.process.shutdown.duration",
+):
+    _ATTRIBUTE_VALUES_BY_INSTRUMENT_KEY[(_shutdown_name, "taskforge.process.role")] = (
+        _ALLOWED_ATTRIBUTE_VALUES["taskforge.process.role"]
+    )
+    _allow(
+        _shutdown_name,
+        "taskforge.outcome",
+        "completed",
+        "drain_timeout",
+        "cancellation_overrun",
+        "cleanup_failed",
+    )
+_allow(
+    "taskforge.worker.drain.overruns",
+    "taskforge.outcome",
+    "cancellation_overrun",
+    "completed",
+)
+
 
 def _counter(name: str, unit: str) -> metrics.Counter:
     return _meter.create_counter(name, unit=unit)
@@ -647,6 +686,9 @@ def _build_instruments() -> dict[str, object]:
         "taskforge.orchestrator.passes": "{pass}",
         "taskforge.orchestrator.candidates": "{candidate}",
         "taskforge.orchestrator.transitions": "{transition}",
+        "taskforge.process.shutdown.operations": "{shutdown}",
+        "taskforge.worker.drain.timeouts": "{timeout}",
+        "taskforge.worker.drain.overruns": "{overrun}",
     }
     histograms = {
         "taskforge.api.request.duration": "s",
@@ -658,6 +700,8 @@ def _build_instruments() -> dict[str, object]:
         "taskforge.recovery.duration": "s",
         "taskforge.websocket.connection.duration": "s",
         "taskforge.orchestrator.pass.duration": "s",
+        "taskforge.process.shutdown.duration": "s",
+        "taskforge.worker.drain.overrun.duration": "s",
     }
     up_down = {
         "taskforge.worker.running.deliveries": "{delivery}",
@@ -698,6 +742,8 @@ def _views() -> tuple[View, ...]:
         "taskforge.recovery.duration": FAST_DURATION_BUCKETS,
         "taskforge.websocket.connection.duration": WEBSOCKET_DURATION_BUCKETS,
         "taskforge.orchestrator.pass.duration": FAST_DURATION_BUCKETS,
+        "taskforge.process.shutdown.duration": HANDLER_DURATION_BUCKETS,
+        "taskforge.worker.drain.overrun.duration": HANDLER_DURATION_BUCKETS,
     }
     return tuple(
         View(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import perf_counter
@@ -74,6 +75,7 @@ class TaskDispatchPublisher:
         *,
         page_size: int,
         pass_limit: int,
+        should_stop: Callable[[], bool] | None = None,
     ) -> PublicationPassResult:
         """Run one independent bounded keyset reconciliation pass."""
         _validate_bounds(page_size, pass_limit)
@@ -82,13 +84,19 @@ class TaskDispatchPublisher:
             try:
                 with span("taskforge.dispatch.publish_pass", root=True):
                     return await self._reconcile_unpublished_bound(
-                        page_size=page_size, pass_limit=pass_limit
+                        page_size=page_size,
+                        pass_limit=pass_limit,
+                        should_stop=should_stop or (lambda: False),
                     )
             finally:
                 await self._observe_backlog()
 
     async def _reconcile_unpublished_bound(
-        self, *, page_size: int, pass_limit: int
+        self,
+        *,
+        page_size: int,
+        pass_limit: int,
+        should_stop: Callable[[], bool],
     ) -> PublicationPassResult:
         examined = acknowledged = already_acknowledged = durable_invalid = 0
         after: UnpublishedDispatchCursor | None = None
@@ -104,6 +112,8 @@ class TaskDispatchPublisher:
                 break
 
             for stored in page:
+                if should_stop():
+                    break
                 examined += 1
                 validated = _validated_publication(stored)
                 if validated is None:
@@ -232,6 +242,8 @@ class TaskDispatchPublisher:
                     )
                 after = stored.cursor
 
+            if should_stop():
+                break
             if len(page) < query_limit:
                 reached_end = True
                 break

@@ -119,6 +119,11 @@ def test_instrument_names_types_and_units_are_exact(
         "taskforge.orchestrator.pass.duration": ("Histogram", "s"),
         "taskforge.orchestrator.candidates": ("Counter", "{candidate}"),
         "taskforge.orchestrator.transitions": ("Counter", "{transition}"),
+        "taskforge.process.shutdown.operations": ("Counter", "{shutdown}"),
+        "taskforge.process.shutdown.duration": ("Histogram", "s"),
+        "taskforge.worker.drain.timeouts": ("Counter", "{timeout}"),
+        "taskforge.worker.drain.overruns": ("Counter", "{overrun}"),
+        "taskforge.worker.drain.overrun.duration": ("Histogram", "s"),
     }
     assert set(task_metrics._instruments) == set(expected)
     for name, (kind, unit) in expected.items():

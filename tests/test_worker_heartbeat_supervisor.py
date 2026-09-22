@@ -43,7 +43,9 @@ class Service:
         if isinstance(outcome, Exception):
             raise outcome
         now = datetime.now(UTC)
-        return WorkerHealthProjection(worker_session_id, sequence, now, True, now)
+        return WorkerHealthProjection(
+            worker_session_id, sequence, now, accepting_work, now
+        )
 
 
 def test_initial_unknown_outcome_retries_exact_sequence_and_payload() -> None:
@@ -89,5 +91,30 @@ def test_periodic_authority_failure_reaches_parent_supervision() -> None:
         with pytest.raises(WorkerProcessFailure):
             await supervisor.wait_failed()
         await supervisor.close()
+
+    asyncio.run(scenario())
+
+
+def test_draining_heartbeat_is_confirmed_and_remains_non_accepting() -> None:
+    async def scenario() -> None:
+        worker = AuthenticatedWorker(uuid4(), uuid4())
+        service = Service([object(), object(), object()])
+        supervisor = WorkerHeartbeatSupervisor(
+            service,
+            worker,
+            uuid4(),
+            interval_seconds=0.01,
+            operation_timeout_seconds=0.001,
+            stale_after_seconds=1,
+        )
+        await supervisor.send_initial()
+        supervisor.start()
+        await supervisor.begin_draining()
+        await supervisor._send_next()
+        await supervisor.close()
+
+        assert service.calls[0][2] == {"sequence": 1, "accepting_work": True}
+        assert service.calls[1][2] == {"sequence": 2, "accepting_work": False}
+        assert all(not call[2]["accepting_work"] for call in service.calls[1:])
 
     asyncio.run(scenario())

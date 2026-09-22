@@ -7,6 +7,7 @@ import logging
 import signal
 from contextlib import suppress
 from enum import StrEnum
+from time import perf_counter
 
 import aio_pika
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractExchange
@@ -21,6 +22,8 @@ from taskforge.dispatch.publisher import TaskDispatchPublisher
 from taskforge.dispatch.service import TaskDispatchService
 from taskforge.logging import configure_logging, log_event
 from taskforge.metrics import MetricsRuntime, configure_metrics
+from taskforge.metrics import add as add_metric
+from taskforge.metrics import record as record_metric
 from taskforge.orchestrator.domain import LoopExit, OrchestratorProcessFailure
 from taskforge.orchestrator.workloads import (
     BoundedWorkload,
@@ -57,6 +60,7 @@ from taskforge.retries.service import RetryTransitionService
 from taskforge.runs.service import WorkflowRunService
 from taskforge.runtime_provider import load_installed_task_catalog
 from taskforge.settings import OrchestratorSettings
+from taskforge.shutdown import CooperativeShutdownDeadline
 from taskforge.tracing import TracingRuntime, configure_tracing
 from taskforge.workflows.task_types import TaskTypeRegistry
 
@@ -94,6 +98,8 @@ class OrchestratorApplication:
         self._stop_waiter: asyncio.Task[bool] | None = None
         self._tracing: TracingRuntime | None = None
         self._metrics: MetricsRuntime | None = None
+        self._shutdown_started_at: float | None = None
+        self._shutdown_cancellation_requested = False
 
     @property
     def process_failed(self) -> bool:
@@ -105,6 +111,9 @@ class OrchestratorApplication:
 
     def request_stop(self) -> None:
         """Request ordinary cessation without creating durable drain state."""
+        if not self._ordinary_stop_requested.is_set():
+            self._shutdown_started_at = perf_counter()
+            log_event(logger, logging.INFO, "orchestrator.shutdown.started")
         self._ordinary_stop_requested.set()
         self._stop_scheduling.set()
 
@@ -256,12 +265,14 @@ class OrchestratorApplication:
                     catalog,
                 ),
                 batch_size=batch_size,
+                should_stop=self._stop_scheduling.is_set,
             ),
             "retry": RetryWorkload(
                 candidates,
                 RetryTransitionService(retry_repository),
                 DueRetryScanner(retry_repository, catalog),
                 batch_size=batch_size,
+                should_stop=self._stop_scheduling.is_set,
             ),
             "recovery": RecoveryWorkload(
                 recovery_candidates,
@@ -276,6 +287,7 @@ class OrchestratorApplication:
                 ),
                 batch_size=batch_size,
                 stale_after_seconds=self.settings.worker_stale_after_seconds,
+                should_stop=self._stop_scheduling.is_set,
             ),
             "outbox": OutboxPublicationWorkload(
                 TaskDispatchPublisher(
@@ -288,6 +300,7 @@ class OrchestratorApplication:
                     ),
                 ),
                 batch_size=batch_size,
+                should_stop=self._stop_scheduling.is_set,
             ),
         }
 
@@ -356,13 +369,35 @@ class OrchestratorApplication:
     async def _join_ordinary_shutdown(self) -> None:
         self._stop_scheduling.set()
         pending = {task for task in self._loop_tasks.values() if not task.done()}
-        while pending and not self.process_failed:
-            await asyncio.wait(
-                (*pending, *self._resource_watchers.values()),
-                return_when=asyncio.FIRST_COMPLETED,
+        try:
+            async with asyncio.timeout(
+                self.settings.orchestrator_shutdown_timeout_seconds
+            ):
+                while pending and not self.process_failed:
+                    await asyncio.wait(
+                        (*pending, *self._resource_watchers.values()),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    self._inspect_critical_tasks()
+                    pending = {task for task in pending if not task.done()}
+        except TimeoutError:
+            self._shutdown_cancellation_requested = True
+            log_event(
+                logger,
+                logging.WARNING,
+                "orchestrator.shutdown.cancellation_requested",
+                {
+                    "reason.code": "drain_timeout",
+                    "drain.timeout_seconds": (
+                        self.settings.orchestrator_shutdown_timeout_seconds
+                    ),
+                },
             )
-            self._inspect_critical_tasks()
-            pending = {task for task in pending if not task.done()}
+            for task in pending:
+                task.cancel()
+            # Resources stay live until every loop has physically exited. A loop
+            # suppressing cancellation is ultimately bounded by deployment SIGKILL.
+            await asyncio.gather(*pending, return_exceptions=True)
         if self.process_failed:
             await self._abort_supervision()
             return
@@ -381,7 +416,10 @@ class OrchestratorApplication:
             if not task.done():
                 continue
             if task.cancelled():
-                if not self.process_failed:
+                if (
+                    not self.process_failed
+                    and not self._shutdown_cancellation_requested
+                ):
                     self._record_failure(
                         OrchestratorProcessFailure(
                             f"required orchestrator loop {name} was cancelled"
@@ -476,7 +514,12 @@ class OrchestratorApplication:
         self._inspect_critical_tasks()
 
     async def _close_owned(self) -> None:
+        started = self._shutdown_started_at or perf_counter()
+        if self._shutdown_started_at is None:
+            self._shutdown_started_at = started
+            log_event(logger, logging.INFO, "orchestrator.shutdown.started")
         errors: list[Exception] = []
+        deadline: CooperativeShutdownDeadline | None = None
         self._stop_scheduling.set()
         try:
             await self._cancel_and_join(
@@ -489,35 +532,68 @@ class OrchestratorApplication:
             self._loop_tasks.clear()
             self._resource_watchers.clear()
             self._stop_waiter = None
+            deadline = CooperativeShutdownDeadline(
+                self.settings.resource_shutdown_timeout_seconds
+            )
             if (
                 self._publisher_channel is not None
                 and not self._publisher_channel.is_closed
             ):
                 try:
-                    await self._publisher_channel.close()
+                    await deadline.wait(self._publisher_channel.close())
                 except Exception as error:
                     errors.append(error)
             if self._connection is not None and not self._connection.is_closed:
                 try:
-                    await self._connection.close()
+                    await deadline.wait(self._connection.close())
                 except Exception as error:
                     errors.append(error)
             if self._engine is not None:
                 try:
-                    await self._engine.dispose()
+                    await deadline.wait(self._engine.dispose())
                 except Exception as error:
                     errors.append(error)
+        finally:
+            outcome = (
+                "cleanup_failed"
+                if errors
+                else "drain_timeout"
+                if self._shutdown_cancellation_requested
+                else "completed"
+            )
+            attributes = {
+                "taskforge.process.role": "orchestrator",
+                "taskforge.outcome": outcome,
+            }
+            add_metric("taskforge.process.shutdown.operations", attributes=attributes)
+            record_metric(
+                "taskforge.process.shutdown.duration",
+                perf_counter() - started,
+                attributes,
+            )
+            log_event(
+                logger,
+                logging.INFO if not errors else logging.ERROR,
+                "orchestrator.shutdown.completed",
+                {
+                    "outcome": outcome,
+                    "duration_ms": (perf_counter() - started) * 1000,
+                },
+            )
+            if deadline is None:
+                deadline = CooperativeShutdownDeadline(
+                    self.settings.resource_shutdown_timeout_seconds
+                )
             if self._metrics is not None:
                 try:
-                    self._metrics.shutdown()
+                    self._metrics.shutdown(timeout_seconds=deadline.remaining_seconds)
                 except Exception as error:
                     errors.append(error)
             if self._tracing is not None:
                 try:
-                    self._tracing.shutdown()
+                    self._tracing.shutdown(timeout_seconds=deadline.remaining_seconds)
                 except Exception as error:
                     errors.append(error)
-        finally:
             self.state = OrchestratorApplicationState.STOPPED
         if errors:
             cleanup = ExceptionGroup("orchestrator resource cleanup failed", errors)

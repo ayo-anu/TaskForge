@@ -8,7 +8,6 @@ import pytest
 from taskforge.worker.consumer_ports import BrokerConsumerUnavailable
 from taskforge.worker.lifecycle import (
     WorkerDispatchRuntime,
-    WorkerDispatchRuntimeInvariantError,
     WorkerDispatchRuntimeState,
     WorkerDispatchRuntimeStopping,
 )
@@ -339,32 +338,29 @@ def test_callback_failure_still_releases_drain_accounting() -> None:
     asyncio.run(scenario())
 
 
-def test_callback_admitted_while_cancellation_is_unconfirmed_is_drained() -> None:
+def test_callback_after_local_cutoff_is_left_unacknowledged_without_handling() -> None:
     async def scenario() -> None:
         consumer = Consumer()
-        admitted = asyncio.Event()
-        release_handler = asyncio.Event()
+        handled = False
 
         async def handler(control: Any) -> None:
+            nonlocal handled
             del control
-            admitted.set()
-            await release_handler.wait()
+            handled = True
 
         runtime = await start_runtime(consumer, handler)
         shutdown = asyncio.create_task(runtime.shutdown())
         await consumer.cancellation_started.wait()
         delivery = asyncio.create_task(consumer.handler(object()))
-        await admitted.wait()
-        assert runtime.in_flight == 1
+        await delivery
+        assert not handled
+        assert runtime.in_flight == 0
 
         consumer.release_cancellation.set()
-        assert not shutdown.done()
-        release_handler.set()
-        await delivery
         await shutdown
 
-        with pytest.raises(WorkerDispatchRuntimeInvariantError):
-            await consumer.handler(object())
+        await consumer.handler(object())
+        assert not handled
 
     asyncio.run(scenario())
 

@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from taskforge.api.__main__ import main as api_main
-from taskforge.logging import uvicorn_log_config
 from taskforge.orchestrator.__main__ import main as orchestrator_main
 from taskforge.worker.__main__ import main as worker_main
 
@@ -100,8 +99,8 @@ def test_api_entry_point_uses_typed_runtime_settings(
 ) -> None:
     invocation: dict[str, object] = {}
 
-    def record_uvicorn_invocation(app: str, **kwargs: object) -> None:
-        invocation["app"] = app
+    def record_uvicorn_invocation(settings: object, **kwargs: object) -> None:
+        invocation["settings"] = settings
         invocation.update(kwargs)
 
     monkeypatch.setenv("POSTGRES_PASSWORD", "test-postgres-password")
@@ -111,20 +110,18 @@ def test_api_entry_point_uses_typed_runtime_settings(
     monkeypatch.setenv("TASKFORGE_API_PORT", "8765")
     monkeypatch.setenv("TASKFORGE_LOG_LEVEL", "WARNING")
     monkeypatch.setattr(
-        "taskforge.api.__main__.uvicorn.run",
+        "taskforge.api.__main__.run_api_server",
         record_uvicorn_invocation,
     )
 
     assert api_main() == 0
-    assert invocation == {
-        "app": "taskforge.api.application:create_production_app",
-        "factory": True,
-        "host": "127.0.0.2",
-        "port": 8765,
-        "log_level": "warning",
-        "log_config": uvicorn_log_config("WARNING"),
-        "access_log": False,
-    }
+    configured = invocation["settings"]
+    assert configured.api_host == "127.0.0.2"  # type: ignore[attr-defined]
+    assert configured.api_port == 8765  # type: ignore[attr-defined]
+    assert configured.log_level == "WARNING"  # type: ignore[attr-defined]
+    assert configured.api_graceful_shutdown_timeout_seconds == 30  # type: ignore[attr-defined]
+    assert "metrics_runtime" in invocation
+    assert "tracing_runtime" in invocation
 
 
 def test_worker_process_rejects_blank_credential_as_configuration(

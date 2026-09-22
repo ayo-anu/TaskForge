@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import cast
@@ -30,13 +31,21 @@ from taskforge.api.health import (
 )
 from taskforge.api.history import router as history_router
 from taskforge.api.principals import router as principals_router
+from taskforge.api.request_tracking import (
+    ActiveHTTPRequestTracker,
+    TrackActiveHTTPRequests,
+)
 from taskforge.api.runs import router as runs_router
 from taskforge.api.workers import router as workers_router
 from taskforge.api.workflows import router as workflows_router
+from taskforge.logging import log_event
 from taskforge.metrics import register_http_routes
 from taskforge.runtime_provider import load_installed_task_catalog
 from taskforge.settings import Settings
+from taskforge.shutdown import CooperativeShutdownDeadline
 from taskforge.workflows.task_types import TaskTypeRegistry
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -47,6 +56,7 @@ def create_app(
 ) -> FastAPI:
     """Create the API with injectable readiness behavior for focused tests."""
     resolved_settings = settings or Settings()
+    request_tracker = ActiveHTTPRequestTracker()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -80,16 +90,50 @@ def create_app(
             yield
         finally:
             resolved_readiness.withdraw()
-            if resolved_execution_stream is not None:
-                await resolved_execution_stream.close()
-            await asyncio.gather(
-                resolved_authentication.close(),
-                resolved_readiness.close(),
-                return_exceptions=True,
+            stream_deadline = CooperativeShutdownDeadline(
+                resolved_settings.resource_shutdown_timeout_seconds
             )
+            if resolved_execution_stream is not None:
+                stream_close = asyncio.create_task(resolved_execution_stream.close())
+                try:
+                    await stream_deadline.wait(asyncio.shield(stream_close))
+                except TimeoutError:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "api.shutdown.cancellation_requested",
+                        {"reason.code": "resource_shutdown_timeout"},
+                    )
+                    stream_close.cancel()
+                    # The stream may use the authentication engine. Do not close
+                    # that shared engine while teardown is still physically live.
+                    await asyncio.gather(stream_close, return_exceptions=True)
+            # Uvicorn owns admission. This wait protects only resources shared by
+            # HTTP handlers and intentionally does not delay stream shutdown.
+            await request_tracker.wait_empty()
+            shared_resource_deadline = CooperativeShutdownDeadline(
+                resolved_settings.resource_shutdown_timeout_seconds
+            )
+            try:
+                await shared_resource_deadline.wait(
+                    asyncio.gather(
+                        resolved_authentication.close(),
+                        resolved_readiness.close(),
+                        return_exceptions=True,
+                    )
+                )
+            except TimeoutError:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "api.shutdown.cancellation_requested",
+                    {"reason.code": "resource_shutdown_timeout"},
+                )
 
     app = FastAPI(title="Taskforge API", lifespan=lifespan)
     app.state.settings = resolved_settings
+    app.state.active_http_requests = request_tracker
+    app.add_middleware(TrackActiveHTTPRequests, tracker=request_tracker)
     install_error_handling(
         app, max_request_body_bytes=resolved_settings.api_max_request_body_bytes
     )

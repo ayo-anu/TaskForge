@@ -90,7 +90,7 @@ class TracingRuntime:
     def enabled(self) -> bool:
         return self.provider is not None
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, timeout_seconds: float | None = None) -> None:
         if self.provider is None:
             return
         provider, self.provider = self.provider, None
@@ -104,7 +104,11 @@ class TracingRuntime:
         thread = Thread(target=close, name="taskforge-tracing-shutdown", daemon=True)
         try:
             thread.start()
-            thread.join(self.shutdown_timeout_seconds)
+            thread.join(
+                self.shutdown_timeout_seconds
+                if timeout_seconds is None
+                else min(self.shutdown_timeout_seconds, timeout_seconds)
+            )
         except Exception:
             pass
 

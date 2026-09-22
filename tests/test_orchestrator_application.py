@@ -61,7 +61,8 @@ class Telemetry:
         self.name = name
         self.events = events
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, timeout_seconds: float | None = None) -> None:
+        del timeout_seconds
         self.events.append(f"close:{self.name}")
 
 

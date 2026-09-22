@@ -69,6 +69,8 @@ def test_settings_have_safe_local_defaults() -> None:
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 8000
     assert settings.api_max_request_body_bytes == 10 * 1024 * 1024
+    assert settings.api_graceful_shutdown_timeout_seconds == 30
+    assert settings.resource_shutdown_timeout_seconds == 5.0
     assert settings.readiness_timeout_seconds == 2.0
     assert settings.authentication_timeout_seconds == 2.0
     assert settings.execution_stream_max_connections == 500
@@ -95,6 +97,7 @@ def test_orchestrator_settings_have_bounded_defaults() -> None:
     assert settings.orchestrator_batch_size == 100
     assert settings.orchestrator_poll_interval_seconds == 1.0
     assert settings.orchestrator_publication_timeout_seconds == 5.0
+    assert settings.orchestrator_shutdown_timeout_seconds == 30.0
 
 
 @pytest.mark.parametrize(
@@ -106,6 +109,8 @@ def test_orchestrator_settings_have_bounded_defaults() -> None:
         ("orchestrator_poll_interval_seconds", 61),
         ("orchestrator_publication_timeout_seconds", 0),
         ("orchestrator_publication_timeout_seconds", 31),
+        ("orchestrator_shutdown_timeout_seconds", 5),
+        ("orchestrator_shutdown_timeout_seconds", 301),
     ),
 )
 def test_orchestrator_settings_reject_values_outside_bounds(
@@ -492,6 +497,8 @@ def test_worker_settings_require_credential_and_profile(
     assert settings.worker_heartbeat_interval_seconds == 10.0
     assert settings.worker_prefetch_count == 1
     assert settings.worker_control_operation_timeout_seconds == 2.0
+    assert settings.worker_drain_timeout_seconds == 30.0
+    assert settings.worker_cancellation_grace_seconds == 2.0
 
 
 @pytest.mark.parametrize("credential", (None, ""))

@@ -136,6 +136,8 @@ def test_application_build_targets_commands_and_runtime_security(
         assert service["cap_drop"] == ["ALL"]
         assert service["security_opt"] == ["no-new-privileges:true"]
         assert service["stop_signal"] == "SIGTERM"
+        assert service["stop_grace_period"] == "1m0s"
+        assert "TASKFORGE_STOP_GRACE_PERIOD" not in service["environment"]
         assert service["restart"] == "on-failure:5"
         assert service.get("entrypoint") is None
         assert "volumes" not in service
@@ -358,7 +360,7 @@ def test_persistent_volumes_and_bootstrap_are_dependency_owned(
     assert services["rabbitmq"]["hostname"] == "rabbitmq"
 
 
-def test_compose_introduces_no_migration_or_drain_behavior() -> None:
+def test_compose_keeps_migration_explicit_and_configures_runtime_drain() -> None:
     rendered = "\n".join(
         (
             COMPOSE_FILE.read_text(encoding="utf-8"),
@@ -368,7 +370,9 @@ def test_compose_introduces_no_migration_or_drain_behavior() -> None:
 
     assert "alembic" not in rendered
     assert "\n    entrypoint:" not in rendered
-    assert "drain" not in rendered
+    assert "taskforge_worker_drain_timeout_seconds" in rendered
+    assert "taskforge_worker_cancellation_grace_seconds" in rendered
+    assert "taskforge_stop_grace_period" in rendered
 
 
 def test_migration_service_is_explicit_one_shot_and_owner_scoped(

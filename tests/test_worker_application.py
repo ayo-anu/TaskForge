@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 
+import taskforge.worker.application as application_module
 from taskforge.identity.authentication import (
     AuthenticatedWorker,
     AuthenticationFailure,
@@ -97,7 +98,8 @@ class Telemetry:
         self.name = name
         self.events = events
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, timeout_seconds: float | None = None) -> None:
+        del timeout_seconds
         self.events.append(f"close:{self.name}")
 
 
@@ -106,12 +108,30 @@ class Runtime:
         self.name = name
         self.events = events
         self._failure: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._closed = False
+
+    @property
+    def in_flight(self) -> int:
+        return 0
 
     async def activate(self) -> None:
         self.events.append(f"activate:{self.name}")
 
     async def shutdown(self) -> None:
-        self.events.append(f"close:{self.name}")
+        if not self._closed:
+            self.events.append(f"close:{self.name}")
+            self._closed = True
+
+    async def begin_shutdown(self) -> None:
+        if not self._closed:
+            self.events.append(f"close:{self.name}")
+            self._closed = True
+
+    async def wait_drained(self) -> None:
+        return
+
+    async def cancel_in_flight(self) -> int:
+        return 0
 
     async def wait_failed(self) -> None:
         await self._failure
@@ -127,6 +147,9 @@ class Heartbeat:
 
     def start(self) -> None:
         self.events.append("heartbeat:start")
+
+    async def begin_draining(self) -> None:
+        self.events.append("heartbeat:draining")
 
     async def wait_failed(self) -> None:
         await self._failure
@@ -572,5 +595,187 @@ def test_sigterm_requests_ordinary_stop_without_cancelling_active_work(
             and task.get_name().startswith("taskforge-")
             and not task.done()
         ]
+
+    asyncio.run(scenario())
+
+
+def test_prompt_cancellation_after_drain_timeout_is_not_overrun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        logged: list[tuple[str, dict[str, object]]] = []
+        metrics: list[str] = []
+        entered = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+
+        def capture_log(
+            _logger: object,
+            _level: int,
+            event: str,
+            fields: dict[str, object] | None = None,
+        ) -> None:
+            logged.append((event, fields or {}))
+
+        def capture_metric(
+            name: str,
+            _value: int = 1,
+            attributes: dict[str, str] | None = None,
+        ) -> None:
+            del attributes
+            metrics.append(name)
+
+        monkeypatch.setattr(application_module, "log_event", capture_log)
+        monkeypatch.setattr(application_module, "add_metric", capture_metric)
+
+        class Consumer:
+            handler: Any = None
+
+            async def consume(self, callback: Any) -> str:
+                self.handler = callback
+                return "tag"
+
+            async def cancel(self, consumer_tag: str) -> None:
+                assert consumer_tag == "tag"
+
+        async def handle(control: object) -> None:
+            del control
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                raise
+
+        consumer = Consumer()
+        runtime = WorkerDispatchRuntime(consumer, handle)
+        await runtime.start()
+        delivery = asyncio.create_task(consumer.handler(object()))
+        await entered.wait()
+        application = WorkerApplication(
+            settings().model_copy(
+                update={
+                    "worker_drain_timeout_seconds": 0.01,
+                    "worker_cancellation_grace_seconds": 0.05,
+                }
+            )
+        )
+        application.state = WorkerApplicationState.RUNNING
+        application._heartbeat_started = True
+        application._runtimes = [runtime]
+        application._heartbeat = Heartbeat(events)  # type: ignore[assignment]
+
+        await application.close()
+        assert cancellation_seen.is_set()
+        assert delivery.cancelled()
+        assert "worker.shutdown.cancellation_requested" in [
+            event for event, _ in logged
+        ]
+        assert "worker.shutdown.cancellation_completed" in [
+            event for event, _ in logged
+        ]
+        assert "worker.drain.cancellation_overrun" not in [event for event, _ in logged]
+        assert "taskforge.worker.drain.timeouts" in metrics
+        assert "taskforge.worker.drain.overruns" not in metrics
+        assert (
+            next(
+                fields["outcome"]
+                for event, fields in logged
+                if event == "worker.shutdown.completed"
+            )
+            == "drain_timeout"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_drain_timeout_keeps_heartbeat_alive_until_cancelled_handler_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        logged: list[str] = []
+        entered = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        overrun_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        def capture_log(
+            _logger: object,
+            _level: int,
+            event: str,
+            fields: dict[str, object] | None = None,
+        ) -> None:
+            del fields
+            logged.append(event)
+            if event == "worker.drain.cancellation_overrun":
+                overrun_seen.set()
+
+        monkeypatch.setattr(application_module, "log_event", capture_log)
+
+        class Consumer:
+            handler: Any = None
+
+            async def consume(self, callback: Any) -> str:
+                self.handler = callback
+                return "tag"
+
+            async def cancel(self, consumer_tag: str) -> None:
+                assert consumer_tag == "tag"
+                events.append("consumer:cancel")
+
+        async def handle(control: object) -> None:
+            del control
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                events.append("handler:overrun")
+                await release.wait()
+            events.append("handler:exit")
+
+        class DrainingHeartbeat(Heartbeat):
+            async def begin_draining(self) -> None:
+                events.append("heartbeat:draining")
+
+        consumer = Consumer()
+        runtime = WorkerDispatchRuntime(consumer, handle)
+        await runtime.start()
+        delivery = asyncio.create_task(consumer.handler(object()))
+        await entered.wait()
+
+        application = WorkerApplication(
+            settings().model_copy(
+                update={
+                    "worker_drain_timeout_seconds": 0.01,
+                    "worker_cancellation_grace_seconds": 0.01,
+                }
+            )
+        )
+        application.state = WorkerApplicationState.RUNNING
+        application._heartbeat_started = True
+        application._runtimes = [runtime]
+        application._heartbeat = DrainingHeartbeat(events)  # type: ignore[assignment]
+        application._engine = Engine(events)  # type: ignore[assignment]
+        application._connection = Resource("connection", events)  # type: ignore[assignment]
+        application._topology_channel = Resource("topology", events)  # type: ignore[assignment]
+        application._consumer_channels = [Resource("consumer-channel", events)]  # type: ignore[list-item]
+
+        closing = asyncio.create_task(application.close())
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=1)
+        await asyncio.wait_for(overrun_seen.wait(), timeout=1)
+        assert not closing.done()
+        assert "heartbeat:draining" in events
+        assert not any(event.startswith("close:") for event in events)
+
+        release.set()
+        await delivery
+        await closing
+        assert events.index("handler:exit") < events.index("close:heartbeat")
+        assert events.index("handler:exit") < events.index("close:connection")
+        assert events.index("handler:exit") < events.index("close:engine")
+        assert "worker.drain.overrun_completed" in logged
+        assert application.state is WorkerApplicationState.STOPPED
 
     asyncio.run(scenario())

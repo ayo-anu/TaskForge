@@ -60,6 +60,8 @@ class WorkerHeartbeatSupervisor:
         self._task: asyncio.Task[None] | None = None
         self._closed = False
         self._failure_observed = False
+        self._accepting_work = True
+        self._operation_lock = asyncio.Lock()
 
     @property
     def sequence(self) -> int:
@@ -68,9 +70,11 @@ class WorkerHeartbeatSupervisor:
     async def send_initial(self) -> None:
         if self._sequence != 0 or self._task is not None or self._closed:
             raise RuntimeError("initial heartbeat cannot be sent")
-        uncertain_replay = await self._send_confirmed(1)
+        uncertain_replay = await self._send_confirmed(1, accepting_work=True)
         while uncertain_replay:
-            uncertain_replay = await self._send_confirmed(self._sequence + 1)
+            uncertain_replay = await self._send_confirmed(
+                self._sequence + 1, accepting_work=True
+            )
 
     def start(self) -> None:
         # An uncertain sequence-1 outcome is replayed exactly and followed by a
@@ -109,14 +113,30 @@ class WorkerHeartbeatSupervisor:
                 if not self._failure_observed:
                     raise
 
+    async def begin_draining(self) -> None:
+        """Durably stop claim admission while preserving session liveness."""
+        if self._closed or self._sequence < 1:
+            raise RuntimeError("heartbeat supervisor is not active")
+        self._accepting_work = False
+        await self._send_next()
+
     async def _run(self) -> None:
         while True:
             await asyncio.sleep(self._interval_seconds)
-            uncertain_replay = await self._send_confirmed(self._sequence + 1)
-            while uncertain_replay:
-                uncertain_replay = await self._send_confirmed(self._sequence + 1)
+            await self._send_next()
 
-    async def _send_confirmed(self, sequence: int) -> bool:
+    async def _send_next(self) -> None:
+        async with self._operation_lock:
+            accepting_work = self._accepting_work
+            uncertain_replay = await self._send_confirmed(
+                self._sequence + 1, accepting_work=accepting_work
+            )
+            while uncertain_replay:
+                uncertain_replay = await self._send_confirmed(
+                    self._sequence + 1, accepting_work=accepting_work
+                )
+
+    async def _send_confirmed(self, sequence: int, *, accepting_work: bool) -> bool:
         outcome_was_uncertain = False
         while True:
             try:
@@ -125,7 +145,7 @@ class WorkerHeartbeatSupervisor:
                         self._worker,
                         self._worker_session_id,
                         sequence=sequence,
-                        accepting_work=True,
+                        accepting_work=accepting_work,
                     )
             except asyncio.CancelledError:
                 raise
@@ -156,7 +176,7 @@ class WorkerHeartbeatSupervisor:
             if (
                 projection.worker_session_id != self._worker_session_id
                 or projection.last_sequence != sequence
-                or not projection.accepting_work
+                or projection.accepting_work is not accepting_work
             ):
                 raise WorkerProcessFailure("worker heartbeat receipt is inconsistent")
             self._sequence = sequence

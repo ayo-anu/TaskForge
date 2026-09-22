@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import signal
+from collections.abc import Awaitable
 from contextlib import suppress
 from enum import StrEnum
+from time import perf_counter
 from typing import Any
 
 import aio_pika
@@ -21,8 +24,10 @@ from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.service import TaskClaimService
 from taskforge.identity.authentication import WorkerAuthenticator
 from taskforge.identity.credentials import parse_presented_credential
-from taskforge.logging import configure_logging
+from taskforge.logging import configure_logging, log_event
 from taskforge.metrics import MetricsRuntime, configure_metrics
+from taskforge.metrics import add as add_metric
+from taskforge.metrics import record as record_metric
 from taskforge.persistence.audit import RejectedAuditUnitOfWork
 from taskforge.persistence.authentication import SQLAlchemyWorkerCredentialRepository
 from taskforge.persistence.claims import SQLAlchemyTaskClaimRepository
@@ -48,6 +53,7 @@ from taskforge.runtime_provider import (
     load_installed_worker_profile,
 )
 from taskforge.settings import WorkerSettings
+from taskforge.shutdown import CooperativeShutdownDeadline
 from taskforge.tracing import TracingRuntime, configure_tracing
 from taskforge.worker.claim_renewal import ClaimRenewalSupervisor
 from taskforge.worker.execution import WorkerExecutionConsumer
@@ -58,6 +64,8 @@ from taskforge.worker.runtime_errors import WorkerProcessFailure
 from taskforge.worker.service import WorkerHeartbeatService, WorkerRegistrationService
 from taskforge.worker.start import TaskStartService
 from taskforge.workflows.task_types import TaskTypeRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerApplicationState(StrEnum):
@@ -87,6 +95,7 @@ class WorkerApplication:
         self._heartbeat: WorkerHeartbeatSupervisor | None = None
         self._tracing: TracingRuntime | None = None
         self._metrics: MetricsRuntime | None = None
+        self._heartbeat_started = False
 
     def request_stop(self) -> None:
         """Request ordinary termination without authoring durable drain state."""
@@ -104,7 +113,8 @@ class WorkerApplication:
         try:
             try:
                 await self.start()
-                await self._supervise()
+                if not self._stop_requested.is_set():
+                    await self._supervise()
             except BaseException:
                 with suppress(Exception):
                     await self.close()
@@ -223,7 +233,10 @@ class WorkerApplication:
             await self._start_consumers(profile, execution)
             await self._heartbeat.send_initial()
             self._heartbeat.start()
+            self._heartbeat_started = True
             for runtime in self._runtimes:
+                if self._stop_requested.is_set():
+                    break
                 await runtime.activate()
             self.state = WorkerApplicationState.RUNNING
         except BaseException:
@@ -313,7 +326,13 @@ class WorkerApplication:
         if len(self._consumers) != len(profile.capabilities):
             raise WorkerProcessFailure("worker consumer topology is incomplete")
         for consumer in self._consumers:
-            runtime = WorkerDispatchRuntime(consumer, execution.consume)
+            runtime = WorkerDispatchRuntime(
+                consumer,
+                execution.consume,
+                consumer_cancel_timeout_seconds=(
+                    self.settings.worker_control_operation_timeout_seconds
+                ),
+            )
             self._runtimes.append(runtime)
             await runtime.start(paused=True)
 
@@ -369,26 +388,126 @@ class WorkerApplication:
             await asyncio.gather(*watchers, return_exceptions=True)
 
     async def _close_owned(self) -> None:
+        started = perf_counter()
+        outcome = "completed"
         errors: list[Exception] = []
+        deadline: CooperativeShutdownDeadline | None = None
+        log_event(
+            logger,
+            logging.INFO,
+            "worker.shutdown.started",
+            {"worker.in_flight_count": sum(item.in_flight for item in self._runtimes)},
+        )
         try:
-            # Cancelling subscriptions closes admission; callbacks already admitted
-            # retain heartbeat and renewal authority until they settle or recover.
-            runtime_results = await asyncio.gather(
-                *(runtime.shutdown() for runtime in reversed(self._runtimes)),
-                return_exceptions=True,
+            # Local admission closes before broker cancellation is confirmed. The
+            # heartbeat transition runs concurrently so neither dependency delays
+            # the other safety boundary.
+            admission_operations: list[Awaitable[None]] = [
+                runtime.begin_shutdown() for runtime in reversed(self._runtimes)
+            ]
+            if self._heartbeat is not None and self._heartbeat_started:
+                admission_operations.append(self._heartbeat.begin_draining())
+            admission = asyncio.gather(*admission_operations, return_exceptions=True)
+            drain = asyncio.gather(
+                *(runtime.wait_drained() for runtime in self._runtimes)
             )
-            errors.extend(
-                result for result in runtime_results if isinstance(result, Exception)
+            completed, _ = await asyncio.wait(
+                (admission, drain),
+                timeout=self.settings.worker_drain_timeout_seconds,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            if len(completed) != 2:
+                outcome = "drain_timeout"
+                add_metric("taskforge.worker.drain.timeouts")
+                cancelled = sum(
+                    await asyncio.gather(
+                        *(runtime.cancel_in_flight() for runtime in self._runtimes)
+                    )
+                )
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "worker.shutdown.cancellation_requested",
+                    {
+                        "reason.code": "drain_timeout",
+                        "drain.timeout_seconds": (
+                            self.settings.worker_drain_timeout_seconds
+                        ),
+                        "worker.in_flight_count": cancelled,
+                    },
+                )
+                await asyncio.wait(
+                    (drain,),
+                    timeout=self.settings.worker_cancellation_grace_seconds,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+                active = sum(runtime.in_flight for runtime in self._runtimes)
+                if active:
+                    outcome = "cancellation_overrun"
+                    overrun_started = perf_counter()
+                    add_metric(
+                        "taskforge.worker.drain.overruns",
+                        attributes={"taskforge.outcome": "cancellation_overrun"},
+                    )
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "worker.drain.cancellation_overrun",
+                        {"worker.in_flight_count": active},
+                    )
+                    # Authority-bearing resources intentionally remain live here.
+                    # A non-cooperative callback can keep the process alive until
+                    # the deployment hard stop.
+                    await drain
+                    overrun_duration = perf_counter() - overrun_started
+                    add_metric(
+                        "taskforge.worker.drain.overruns",
+                        attributes={"taskforge.outcome": "completed"},
+                    )
+                    record_metric(
+                        "taskforge.worker.drain.overrun.duration", overrun_duration
+                    )
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "worker.drain.overrun_completed",
+                        {"worker.overrun_duration_seconds": overrun_duration},
+                    )
+                else:
+                    await drain
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "worker.shutdown.cancellation_completed",
+                        {"worker.in_flight_count": 0},
+                    )
+            else:
+                await drain
+
+            # Broker cancellation or the durable false heartbeat may itself be
+            # non-cooperative. Admission is already closed locally; keep its
+            # resources alive until it exits or deployment SIGKILL intervenes.
+            admission_results = await admission
+            admission_errors = [
+                result for result in admission_results if isinstance(result, Exception)
+            ]
+            errors.extend(admission_errors)
+            if not admission_errors:
+                for runtime in self._runtimes:
+                    await runtime.shutdown()
+
+            deadline = CooperativeShutdownDeadline(
+                self.settings.resource_shutdown_timeout_seconds
             )
             if self._heartbeat is not None:
                 try:
-                    await self._heartbeat.close()
+                    await deadline.wait(self._heartbeat.close())
                 except Exception as error:
                     errors.append(error)
             for channel in reversed(self._consumer_channels):
                 if not channel.is_closed:
                     try:
-                        await channel.close()
+                        await deadline.wait(channel.close())
                     except Exception as error:
                         errors.append(error)
             if (
@@ -396,30 +515,54 @@ class WorkerApplication:
                 and not self._topology_channel.is_closed
             ):
                 try:
-                    await self._topology_channel.close()
+                    await deadline.wait(self._topology_channel.close())
                 except Exception as error:
                     errors.append(error)
             if self._connection is not None and not self._connection.is_closed:
                 try:
-                    await self._connection.close()
+                    await deadline.wait(self._connection.close())
                 except Exception as error:
                     errors.append(error)
             if self._engine is not None:
                 try:
-                    await self._engine.dispose()
+                    await deadline.wait(self._engine.dispose())
                 except Exception as error:
                     errors.append(error)
+        finally:
+            final_outcome = "cleanup_failed" if errors else outcome
+            attributes = {
+                "taskforge.process.role": "worker",
+                "taskforge.outcome": final_outcome,
+            }
+            add_metric("taskforge.process.shutdown.operations", attributes=attributes)
+            record_metric(
+                "taskforge.process.shutdown.duration",
+                perf_counter() - started,
+                attributes,
+            )
+            log_event(
+                logger,
+                logging.INFO if not errors else logging.ERROR,
+                "worker.shutdown.completed",
+                {
+                    "outcome": final_outcome,
+                    "duration_ms": (perf_counter() - started) * 1000,
+                },
+            )
+            if deadline is None:
+                deadline = CooperativeShutdownDeadline(
+                    self.settings.resource_shutdown_timeout_seconds
+                )
             if self._metrics is not None:
                 try:
-                    self._metrics.shutdown()
+                    self._metrics.shutdown(timeout_seconds=deadline.remaining_seconds)
                 except Exception as error:
                     errors.append(error)
             if self._tracing is not None:
                 try:
-                    self._tracing.shutdown()
+                    self._tracing.shutdown(timeout_seconds=deadline.remaining_seconds)
                 except Exception as error:
                     errors.append(error)
-        finally:
             self.state = WorkerApplicationState.STOPPED
         if errors:
             raise ExceptionGroup("worker resource cleanup failed", errors)

@@ -168,17 +168,21 @@ class ClaimRenewalGuard:
         if task is None:
             raise RuntimeError("claim renewal guard is not started")
         operation_task = asyncio.ensure_future(operation)
-        done, _ = await asyncio.wait(
-            (operation_task, task), return_when=asyncio.FIRST_COMPLETED
-        )
-        if task in done:
-            self._task = None
-            await _cancel_and_wait(operation_task)
-            await task
-            raise DeliveryAuthorityObsolete
         try:
+            done, _ = await asyncio.wait(
+                (operation_task, task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done:
+                self._task = None
+                await _cancel_and_wait(operation_task)
+                await task
+                raise DeliveryAuthorityObsolete
             result = await operation_task
-        except BaseException:
+        except asyncio.CancelledError:
+            # The protected operation may own a cancellation-resistant handler
+            # task. Keep this renewal guard alive until that entire operation
+            # physically exits, even if this caller receives another cancel.
+            await _cancel_and_wait_physical_exit(operation_task)
             raise
         if task.done():
             self._task = None
@@ -335,3 +339,22 @@ async def _cancel_and_wait(task: asyncio.Future[Any]) -> None:
         await task
     except asyncio.CancelledError:
         pass
+
+
+async def _cancel_and_wait_physical_exit(task: asyncio.Future[Any]) -> None:
+    if not task.done():
+        task.cancel()
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # This caller may be cancelled again; that does not transfer claim
+            # authority while the protected operation still exists.
+            continue
+        except BaseException:
+            break
+    if task.done():
+        try:
+            task.result()
+        except BaseException:
+            pass

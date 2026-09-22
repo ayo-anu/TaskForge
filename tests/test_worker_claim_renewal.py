@@ -253,3 +253,47 @@ def test_delivery_local_obsolescence_does_not_stop_independent_execution() -> No
         await healthy.close()
 
     asyncio.run(scenario())
+
+
+def test_cancelled_protection_retains_renewal_until_handler_physically_exits() -> None:
+    async def scenario() -> None:
+        worker, lease, envelope = fixture()
+        renewer = Renewer([], lease)
+        guard = ClaimRenewalSupervisor(
+            renewer,
+            Observer([TaskCancellationObservationOutcome.ACTIVE]),
+            worker,
+            lease.worker_session_id,
+            lease_seconds=60,
+            operation_timeout_seconds=1,
+            observation_poll_seconds=1,
+        ).guard(envelope, lease, TaskCancellationToken())
+        entered = asyncio.Event()
+        cancellation_observed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def cancellation_resistant_handler() -> None:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+                await release.wait()
+
+        guard.start()
+        protected = asyncio.create_task(guard.protect(cancellation_resistant_handler()))
+        await entered.wait()
+        protected.cancel()
+        await cancellation_observed.wait()
+        assert not protected.done()
+        assert guard._task is not None and not guard._task.done()
+        protected.cancel()
+        await asyncio.sleep(0)
+        assert not protected.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await protected
+        await guard.close()
+        assert renewer.requests
+
+    asyncio.run(scenario())

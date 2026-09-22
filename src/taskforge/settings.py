@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     api_max_request_body_bytes: int = Field(
         default=10 * 1024 * 1024, ge=1, le=64 * 1024 * 1024
     )
+    api_graceful_shutdown_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    resource_shutdown_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
     authentication_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
     rate_limit_timeout_seconds: float = Field(default=0.25, gt=0, le=2)
@@ -298,6 +300,8 @@ class WorkerSettings(BrokerSettings):
     worker_heartbeat_interval_seconds: float = Field(default=10.0, gt=0, le=300)
     worker_prefetch_count: int = Field(default=1, ge=1, le=128)
     worker_control_operation_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    worker_drain_timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
+    worker_cancellation_grace_seconds: float = Field(default=2.0, gt=0, le=30)
 
     @model_validator(mode="after")
     def validate_worker_control_timing(self) -> WorkerSettings:
@@ -324,3 +328,15 @@ class OrchestratorSettings(BrokerSettings):
     orchestrator_batch_size: int = Field(default=100, ge=1, le=100)
     orchestrator_poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
     orchestrator_publication_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    orchestrator_shutdown_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+
+    @model_validator(mode="after")
+    def validate_orchestrator_shutdown_timing(self) -> OrchestratorSettings:
+        if (
+            self.orchestrator_shutdown_timeout_seconds
+            <= self.orchestrator_publication_timeout_seconds
+        ):
+            raise ValueError(
+                "orchestrator shutdown timeout must exceed publication timeout"
+            )
+        return self

@@ -36,16 +36,23 @@ class WorkerDispatchRuntime:
         self,
         consumer: DispatchConsumer,
         handler: DispatchDeliveryHandler,
+        *,
+        consumer_cancel_timeout_seconds: float = 2.0,
     ) -> None:
+        if consumer_cancel_timeout_seconds <= 0:
+            raise ValueError("consumer cancellation timeout must be positive")
         self._consumer = consumer
         self._handler = handler
+        self._consumer_cancel_timeout_seconds = consumer_cancel_timeout_seconds
         self._state = WorkerDispatchRuntimeState.NEW
         self._lock = asyncio.Lock()
         self._drained = asyncio.Condition(self._lock)
         self._start_operation: asyncio.Task[str] | None = None
         self._shutdown_operation: asyncio.Task[None] | None = None
         self._consumer_tag: str | None = None
+        self._consumer_cancelled = False
         self._in_flight = 0
+        self._in_flight_tasks: set[asyncio.Task[None]] = set()
         self._admission_closed = False
         self._activated = asyncio.Event()
         self._stopping = asyncio.Event()
@@ -106,6 +113,14 @@ class WorkerDispatchRuntime:
         raise error
 
     async def shutdown(self) -> None:
+        await self.begin_shutdown()
+        await self.wait_drained()
+        async with self._lock:
+            if self._state is WorkerDispatchRuntimeState.STOPPING:
+                self._state = WorkerDispatchRuntimeState.STOPPED
+
+    async def begin_shutdown(self) -> None:
+        """Close local admission and cancel the broker subscription once."""
         async with self._lock:
             if self._state is WorkerDispatchRuntimeState.STOPPED:
                 return
@@ -120,6 +135,7 @@ class WorkerDispatchRuntime:
             ):
                 self._state = WorkerDispatchRuntimeState.STOPPING
                 self._stopping.set()
+                self._admission_closed = True
             if self._state is not WorkerDispatchRuntimeState.STOPPING:
                 raise WorkerDispatchRuntimeInvariantError
             if self._shutdown_operation is None:
@@ -128,6 +144,19 @@ class WorkerDispatchRuntime:
                 )
             operation = self._shutdown_operation
         await asyncio.shield(operation)
+
+    async def wait_drained(self) -> None:
+        """Wait until every callback admitted before the cutoff has exited."""
+        async with self._drained:
+            await self._drained.wait_for(lambda: self._in_flight == 0)
+
+    async def cancel_in_flight(self) -> int:
+        """Request cooperative cancellation without revoking callback authority."""
+        async with self._lock:
+            tasks = tuple(task for task in self._in_flight_tasks if not task.done())
+        for task in tasks:
+            task.cancel()
+        return len(tasks)
 
     async def _register(self) -> str:
         try:
@@ -167,18 +196,21 @@ class WorkerDispatchRuntime:
                 except Exception:
                     pass
             async with self._lock:
+                # This in-process barrier closes before broker cancellation is
+                # confirmed. Deliveries racing after it remain unacknowledged.
+                self._admission_closed = True
                 consumer_tag = self._consumer_tag
+                consumer_cancelled = self._consumer_cancelled
             cancellation_error: Exception | None = None
-            if consumer_tag is not None:
+            if consumer_tag is not None and not consumer_cancelled:
                 try:
-                    await self._consumer.cancel(consumer_tag)
+                    async with asyncio.timeout(self._consumer_cancel_timeout_seconds):
+                        await self._consumer.cancel(consumer_tag)
                 except Exception as error:
                     cancellation_error = error
-            async with self._drained:
-                self._admission_closed = True
-                await self._drained.wait_for(lambda: self._in_flight == 0)
-                if cancellation_error is None:
-                    self._state = WorkerDispatchRuntimeState.STOPPED
+                else:
+                    async with self._lock:
+                        self._consumer_cancelled = True
             if cancellation_error is not None:
                 raise cancellation_error
         finally:
@@ -189,9 +221,9 @@ class WorkerDispatchRuntime:
     async def _admit(self, control: DispatchDeliveryControl) -> None:
         async with self._lock:
             if self._admission_closed:
-                raise WorkerDispatchRuntimeInvariantError(
-                    "delivery arrived after broker cancellation"
-                )
+                # Manual acknowledgement is intentionally omitted. Channel close
+                # will make this race delivery available for redelivery.
+                return
             if self._state not in (
                 WorkerDispatchRuntimeState.STARTING,
                 WorkerDispatchRuntimeState.RUNNING,
@@ -199,6 +231,10 @@ class WorkerDispatchRuntime:
             ):
                 raise WorkerDispatchRuntimeInvariantError
             self._in_flight += 1
+            current = asyncio.current_task()
+            if current is None:
+                raise WorkerDispatchRuntimeInvariantError
+            self._in_flight_tasks.add(current)
             add_metric("taskforge.worker.running.deliveries", 1)
         try:
             if not self._activated.is_set():
@@ -224,6 +260,9 @@ class WorkerDispatchRuntime:
         finally:
             async with self._drained:
                 self._in_flight -= 1
+                current = asyncio.current_task()
+                if current is not None:
+                    self._in_flight_tasks.discard(current)
                 add_metric("taskforge.worker.running.deliveries", -1)
                 if self._in_flight == 0:
                     self._drained.notify_all()

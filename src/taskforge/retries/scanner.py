@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -65,7 +66,12 @@ class DueRetryScanner:
         self._repository = repository
         self._task_types = task_types
 
-    async def scan_due_retries(self, *, batch_size: int) -> DueRetryScanResult:
+    async def scan_due_retries(
+        self,
+        *,
+        batch_size: int,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> DueRetryScanResult:
         if (
             type(batch_size) is not int
             or not 1 <= batch_size <= MAX_DUE_RETRY_BATCH_SIZE
@@ -73,13 +79,19 @@ class DueRetryScanner:
             raise ValueError("due retry batch size is outside the supported bounds")
 
         with bind_log_context(**{"operation.id": uuid4()}):
-            return await self._scan_due_retries_bound(batch_size=batch_size)
+            return await self._scan_due_retries_bound(
+                batch_size=batch_size, should_stop=should_stop or (lambda: False)
+            )
 
-    async def _scan_due_retries_bound(self, *, batch_size: int) -> DueRetryScanResult:
+    async def _scan_due_retries_bound(
+        self, *, batch_size: int, should_stop: Callable[[], bool]
+    ) -> DueRetryScanResult:
         examined = skipped = 0
         dispatched_attempt_ids: list[UUID] = []
         try:
             for _ in range(batch_size):
+                if should_stop():
+                    break
                 deferred_span = DeferredSpan()
                 prepared_due: PreparedDueRetryDispatch | None = None
                 dispatched_attempt_id: UUID | None = None

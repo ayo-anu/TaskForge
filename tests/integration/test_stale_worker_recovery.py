@@ -50,24 +50,28 @@ pytestmark = [
 
 async def stale_candidate(
     connection: asyncpg.Connection[asyncpg.Record],
+    *,
+    last_seen_at: datetime | None = None,
 ) -> tuple[StaleWorkerSessionCandidate, WorkerFacts]:
     worker = await add_worker(connection)
     row = await connection.fetchrow(
         "UPDATE worker_session_health SET last_sequence = 1, "
-        "last_seen_at = statement_timestamp() - interval '30 seconds', "
+        "last_seen_at = COALESCE($2::timestamptz, statement_timestamp() - interval '30 seconds'), "
         "accepting_work = true, availability_changed_at = "
-        "statement_timestamp() - interval '30 seconds' "
+        "COALESCE($2::timestamptz, statement_timestamp() - interval '30 seconds') "
         "WHERE worker_session_id = $1 RETURNING last_sequence, last_seen_at, "
         "accepting_work, statement_timestamp() AS observed_at",
         worker.session_id,
+        last_seen_at,
     )
     assert row is not None
     await connection.execute(
         "INSERT INTO worker_heartbeats "
-        "(worker_session_id, sequence, received_at, accepting_work) "
-        "VALUES ($1, 1, $2, true)",
+        "(worker_session_id, sequence, received_at, accepting_work, "
+        "worker_identity_id) VALUES ($1, 1, $2, true, $3)",
         worker.session_id,
         row["last_seen_at"],
+        worker.authenticated.worker_identity_id,
     )
     return (
         StaleWorkerSessionCandidate(
@@ -103,7 +107,6 @@ async def boundary_candidate(
     reference_time: datetime,
     offset_microseconds: int,
 ) -> StaleWorkerSessionCandidate:
-    candidate, worker = await stale_candidate(connection)
     last_seen_at = await connection.fetchval(
         "SELECT $1::timestamptz - interval '30 seconds' "
         "+ make_interval(secs => $2::double precision / 1000000)",
@@ -111,24 +114,13 @@ async def boundary_candidate(
         offset_microseconds,
     )
     assert isinstance(last_seen_at, datetime)
+    candidate, worker = await stale_candidate(connection, last_seen_at=last_seen_at)
     await connection.execute(
         "UPDATE worker_sessions SET registered_at = $2::timestamptz "
         "- interval '1 minute' "
         "WHERE id = $1",
         worker.session_id,
         reference_time,
-    )
-    await connection.execute(
-        "UPDATE worker_session_health SET last_seen_at = $2, "
-        "availability_changed_at = $2 WHERE worker_session_id = $1",
-        worker.session_id,
-        last_seen_at,
-    )
-    await connection.execute(
-        "UPDATE worker_heartbeats SET received_at = $2 WHERE "
-        "worker_session_id = $1 AND sequence = 1",
-        worker.session_id,
-        last_seen_at,
     )
     return StaleWorkerSessionCandidate(
         candidate.worker_session_id,

@@ -73,6 +73,7 @@ class ApplicationHeartbeat:
     def __init__(self) -> None:
         self.initial_calls = 0
         self.start_calls = 0
+        self.draining_calls = 0
         self.close_calls = 0
 
     async def send_initial(self) -> None:
@@ -80,6 +81,9 @@ class ApplicationHeartbeat:
 
     def start(self) -> None:
         self.start_calls += 1
+
+    async def begin_draining(self) -> None:
+        self.draining_calls += 1
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -274,6 +278,7 @@ def test_worker_application_loads_real_pipeline_profile_for_registration(
             await application.close()
 
         assert heartbeat.close_calls == 1
+        assert heartbeat.draining_calls == 1
         assert engine.dispose_calls == 1
 
     asyncio.run(scenario())

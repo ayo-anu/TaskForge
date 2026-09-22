@@ -1,8 +1,7 @@
 """Minimal executable entry point for the Taskforge API process."""
 
-import uvicorn
-
-from taskforge.logging import configure_logging, uvicorn_log_config
+from taskforge.api.server import run_api_server
+from taskforge.logging import configure_logging
 from taskforge.metrics import configure_metrics
 from taskforge.settings import Settings
 from taskforge.tracing import configure_tracing
@@ -41,14 +40,8 @@ def main() -> int:
         process_role="api",
     )
     try:
-        uvicorn.run(
-            "taskforge.api.application:create_production_app",
-            factory=True,
-            host=settings.api_host,
-            port=settings.api_port,
-            log_level=settings.log_level.lower(),
-            log_config=uvicorn_log_config(settings.log_level),
-            access_log=False,
+        run_api_server(
+            settings, metrics_runtime=metric_runtime, tracing_runtime=tracing
         )
     finally:
         metric_runtime.shutdown()

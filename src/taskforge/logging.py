@@ -66,6 +66,12 @@ _APPROVED_FIELDS: Final = CANONICAL_IDENTIFIER_FIELDS | frozenset(
         "dependency.name",
         "dependency.state",
         "readiness.status",
+        "shutdown.phase",
+        "shutdown.outcome",
+        "shutdown.duration_seconds",
+        "drain.timeout_seconds",
+        "worker.in_flight_count",
+        "worker.overrun_duration_seconds",
     }
 )
 _SENSITIVE_FRAGMENTS: Final = (

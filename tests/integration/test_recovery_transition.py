@@ -20,10 +20,11 @@ from taskforge.claims.authority import TaskClaimResultAuthorityIssuer
 from taskforge.claims.domain import (
     IssuedTaskClaim,
     TaskClaimRenewalOutcome,
+    TaskClaimRenewalRejected,
+    TaskClaimRenewalRejectionReason,
     TaskClaimRenewalRequest,
     TaskClaimResultAuthority,
 )
-from taskforge.claims.persistence_ports import TaskClaimRenewalRecovered
 from taskforge.claims.service import TaskClaimService
 from taskforge.dispatch.envelope import (
     DispatchEnvelope,
@@ -668,8 +669,9 @@ async def exercise_recovery(database_url: URL) -> None:
             raise
         else:
             await renewal_context.__aexit__(None, None, None)
-        with pytest.raises(TaskClaimRenewalRecovered):
+        with pytest.raises(TaskClaimRenewalRejected) as rejected:
             await renewal_submission
+        assert rejected.value.reason is TaskClaimRenewalRejectionReason.RECOVERED
         await renewal_engine.dispose()
         assert (
             await connection.fetchval(

@@ -801,7 +801,17 @@ async def _execute_handler_logged(
 async def _cancel_task(task: asyncio.Task[object]) -> None:
     if not task.done():
         task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A second cancellation of the delivery must not detach a handler
+            # that can still perform side effects under the live claim.
+            continue
+        except BaseException:
+            break
+    if task.done():
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
