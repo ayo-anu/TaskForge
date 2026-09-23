@@ -26,6 +26,8 @@ from taskforge.dispatch.publisher_ports import (
     BrokerPublicationTimeout,
     OutboxBacklogObservation,
     PublicationAcknowledgement,
+    StartupReplayHighWater,
+    StartupReplayPage,
     StoredDispatch,
     UnpublishedDispatchCursor,
 )
@@ -36,10 +38,44 @@ from taskforge.tracing import inject_trace_context, set_tracer_for_testing, span
 class FakeRepository:
     records: tuple[StoredDispatch, ...]
     acknowledgement: PublicationAcknowledgement = PublicationAcknowledgement.RECORDED
+    startup_records: tuple[StoredDispatch, ...] = ()
     calls: list[tuple[UnpublishedDispatchCursor | None, int]] = field(
         default_factory=list
     )
     acknowledged: list[UUID] = field(default_factory=list)
+
+    async def capture_startup_replay_high_water(
+        self,
+    ) -> StartupReplayHighWater | None:
+        records = self.startup_records or self.records
+        return (
+            StartupReplayHighWater(records[-1].cursor, records[-1].created_at)
+            if records
+            else None
+        )
+
+    async def list_startup_replay_page(
+        self,
+        *,
+        high_water: StartupReplayHighWater,
+        after: UnpublishedDispatchCursor | None,
+        limit: int,
+    ) -> StartupReplayPage:
+        eligible = tuple(
+            record
+            for record in self.startup_records
+            if (record.created_at, record.dispatch_id)
+            <= (high_water.cursor.created_at, high_water.cursor.dispatch_id)
+            and (
+                after is None
+                or (record.created_at, record.dispatch_id)
+                > (after.created_at, after.dispatch_id)
+            )
+        )[:limit]
+        return StartupReplayPage(
+            eligible,
+            eligible[-1].cursor if len(eligible) == limit else None,
+        )
 
     async def list_unpublished_page(
         self, *, after: UnpublishedDispatchCursor | None, limit: int
@@ -341,6 +377,45 @@ def test_concurrent_acknowledgement_outcome_is_counted() -> None:
 
     assert result.acknowledged == 0
     assert result.already_acknowledged == 1
+
+
+def test_startup_replay_publishes_one_page_with_original_identity() -> None:
+    records = tuple(stored_dispatch(index) for index in range(1, 4))
+    repository = FakeRepository(
+        (),
+        PublicationAcknowledgement.ALREADY_RECORDED,
+        startup_records=records,
+    )
+    broker = FakeBroker()
+    publisher = TaskDispatchPublisher(repository, broker)
+
+    high_water = asyncio.run(publisher.capture_startup_replay_high_water())
+    assert high_water == StartupReplayHighWater(
+        records[-1].cursor, records[-1].created_at
+    )
+    first = asyncio.run(
+        publisher.reconcile_startup_replay_page(
+            high_water=high_water,
+            after=None,
+            page_size=2,
+        )
+    )
+    second = asyncio.run(
+        publisher.reconcile_startup_replay_page(
+            high_water=high_water,
+            after=first.next_cursor,
+            page_size=2,
+        )
+    )
+
+    assert first.examined == first.published == 2
+    assert first.next_cursor == records[1].cursor
+    assert second.examined == second.published == 1
+    assert second.next_cursor is None
+    assert [item.dispatch_id for item in broker.publications] == [
+        item.dispatch_id for item in records
+    ]
+    assert repository.acknowledged == [item.dispatch_id for item in records]
 
 
 def test_publication_reconstructs_isolated_identifier_contexts(

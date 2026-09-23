@@ -24,7 +24,10 @@ from taskforge.dispatch.publisher_ports import (
     DispatchAcknowledgementPersistenceFailure,
     DispatchBrokerPublisher,
     DispatchOutboxRepository,
+    OutboxBacklogObservation,
     PublicationAcknowledgement,
+    StartupReplayHighWater,
+    StartupReplayPage,
     StoredDispatch,
     UnpublishedDispatchCursor,
 )
@@ -57,6 +60,22 @@ class FailOnceAcknowledgementRepository:
     delegate: DispatchOutboxRepository
     failed: bool = False
 
+    async def capture_startup_replay_high_water(
+        self,
+    ) -> StartupReplayHighWater | None:
+        return await self.delegate.capture_startup_replay_high_water()
+
+    async def list_startup_replay_page(
+        self,
+        *,
+        high_water: StartupReplayHighWater,
+        after: UnpublishedDispatchCursor | None,
+        limit: int,
+    ) -> StartupReplayPage:
+        return await self.delegate.list_startup_replay_page(
+            high_water=high_water, after=after, limit=limit
+        )
+
     async def list_unpublished_page(
         self, *, after: UnpublishedDispatchCursor | None, limit: int
     ) -> tuple[StoredDispatch, ...]:
@@ -69,6 +88,11 @@ class FailOnceAcknowledgementRepository:
             self.failed = True
             raise DispatchAcknowledgementPersistenceFailure
         return await self.delegate.record_accepted_publication(expected)
+
+    async def observe_unpublished_backlog(
+        self, *, limit: int
+    ) -> OutboxBacklogObservation:
+        return await self.delegate.observe_unpublished_backlog(limit=limit)
 
 
 class TwoPublisherBarrier:

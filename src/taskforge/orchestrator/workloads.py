@@ -8,6 +8,10 @@ from collections.abc import Awaitable, Callable
 from time import perf_counter
 from typing import Any, Protocol
 
+from taskforge.dispatch.publisher_ports import (
+    StartupReplayHighWater,
+    UnpublishedDispatchCursor,
+)
 from taskforge.dispatch.service import TaskDispatchNotEligible
 from taskforge.logging import log_event
 from taskforge.metrics import add as add_metric
@@ -55,6 +59,19 @@ class DueRetryDispatcher(Protocol):
 
 
 class OutboxPublisher(Protocol):
+    async def capture_startup_replay_high_water(
+        self,
+    ) -> StartupReplayHighWater | None: ...
+
+    async def reconcile_startup_replay_page(
+        self,
+        *,
+        high_water: StartupReplayHighWater,
+        after: UnpublishedDispatchCursor | None,
+        page_size: int,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> Any: ...
+
     async def reconcile_unpublished(
         self,
         *,
@@ -274,8 +291,57 @@ class OutboxPublicationWorkload:
         self._batch_size = batch_size
         self._should_stop = should_stop or (lambda: False)
         self._stop_aware = should_stop is not None
+        self._startup_initialized = False
+        self._startup_complete = False
+        self._startup_high_water: StartupReplayHighWater | None = None
+        self._startup_cursor: UnpublishedDispatchCursor | None = None
 
     async def run_once(self) -> WorkloadPassResult:
+        startup_examined = startup_published = 0
+        if not self._startup_complete:
+            if not self._startup_initialized:
+                self._startup_high_water = (
+                    await self._publisher.capture_startup_replay_high_water()
+                )
+                self._startup_initialized = True
+                log_event(logger, logging.INFO, "dispatch.startup_replay.started")
+                if self._startup_high_water is None:
+                    self._complete_startup_replay()
+            if not self._startup_complete:
+                assert self._startup_high_water is not None
+                startup = (
+                    await self._publisher.reconcile_startup_replay_page(
+                        high_water=self._startup_high_water,
+                        after=self._startup_cursor,
+                        page_size=self._batch_size,
+                        should_stop=self._should_stop,
+                    )
+                    if self._stop_aware
+                    else await self._publisher.reconcile_startup_replay_page(
+                        high_water=self._startup_high_water,
+                        after=self._startup_cursor,
+                        page_size=self._batch_size,
+                    )
+                )
+                startup_examined = startup.examined
+                startup_published = startup.published
+                if startup.durable_invalid:
+                    raise OrchestratorWorkloadInvariantError(
+                        "startup dispatch replay contains invalid durable data"
+                    )
+                self._startup_cursor = startup.next_cursor
+                if startup.next_cursor is None:
+                    self._complete_startup_replay()
+
+        if self._should_stop():
+            return WorkloadPassResult(
+                startup_examined,
+                startup_published,
+                not self._startup_complete,
+            )
+
+        # One ordinary unpublished pass always follows one startup page. This
+        # bounds replay work without starving newly committed durable intents.
         result = (
             await self._publisher.reconcile_unpublished(
                 page_size=self._batch_size,
@@ -293,10 +359,16 @@ class OutboxPublicationWorkload:
                 "unpublished dispatch contains invalid durable data"
             )
         return WorkloadPassResult(
-            result.examined,
-            result.acknowledged,
-            result.pass_limit_reached,
+            startup_examined + result.examined,
+            startup_published + result.acknowledged,
+            not self._startup_complete or result.pass_limit_reached,
         )
+
+    def _complete_startup_replay(self) -> None:
+        if self._startup_complete:
+            return
+        self._startup_complete = True
+        log_event(logger, logging.INFO, "dispatch.startup_replay.completed")
 
 
 async def run_workload_loop(

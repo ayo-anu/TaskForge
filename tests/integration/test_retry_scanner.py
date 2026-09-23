@@ -60,6 +60,8 @@ pytestmark = [
     ),
 ]
 
+RUNTIME_PASSWORD = "taskforge-retry-scanner-runtime"
+
 
 @dataclass(frozen=True)
 class AcceptParameters:
@@ -397,6 +399,7 @@ async def exercise_scanner(database_url: URL) -> None:
             ) == ("retry_dispatched", None, 2, None, None)
 
         await exercise_single_candidate_concurrency(setup, scanner, repository)
+        await exercise_runtime_role_single_candidate_concurrency(database_url, setup)
         await exercise_shared_workflow_skip_locked(setup, scanner, repository)
         await exercise_cancellation_wins(database_url, setup, scanner)
         await exercise_state_change_after_discovery(database_url, setup, scanner)
@@ -441,6 +444,103 @@ async def exercise_single_candidate_concurrency(
         == 1
     )
     await assert_attempt_counts(setup, facts)
+
+
+async def exercise_runtime_role_single_candidate_concurrency(
+    database_url: URL,
+    setup: asyncpg.Connection[asyncpg.Record],
+) -> None:
+    await setup.execute(f"ALTER ROLE taskforge_runtime PASSWORD '{RUNTIME_PASSWORD}'")
+    assert await setup.fetchval(
+        "SELECT has_table_privilege('taskforge_runtime', 'task_attempts', 'SELECT')"
+    )
+    assert not await setup.fetchval(
+        "SELECT has_table_privilege('taskforge_runtime', 'task_attempts', 'UPDATE')"
+    )
+    runtime_url = database_url.set(
+        username="taskforge_runtime",
+        password=RUNTIME_PASSWORD,
+        drivername="postgresql+asyncpg",
+    ).render_as_string(hide_password=False)
+    engine_a = create_async_engine(runtime_url, pool_size=1)
+    engine_b = create_async_engine(runtime_url, pool_size=1)
+    repository_a = SQLAlchemyRetryTransitionRepository(build_session_factory(engine_a))
+    repository_b = SQLAlchemyRetryTransitionRepository(build_session_factory(engine_b))
+    locked, release = asyncio.Event(), asyncio.Event()
+    scanner_a = DueRetryScanner(
+        PausingRepository(repository_a, locked, release), registry()
+    )
+    scanner_b = DueRetryScanner(repository_b, registry())
+    now = await setup.fetchval("SELECT statement_timestamp()")
+    attempt_id = UUID(int=152)
+    facts = await add_scheduled_workflow(
+        setup,
+        eligible_at=(now - timedelta(seconds=1),),
+        scheduled_attempt_ids=(attempt_id,),
+    )
+    task = facts.tasks[0]
+    pending_a = asyncio.create_task(scanner_a.scan_due_retries(batch_size=1))
+    await locked.wait()
+    try:
+        loser = await asyncio.wait_for(
+            scanner_b.scan_due_retries(batch_size=1), timeout=2
+        )
+        assert loser.examined == loser.dispatched == loser.skipped == 0
+    finally:
+        release.set()
+    try:
+        winner = await pending_a
+        assert winner.dispatched_attempt_ids == (attempt_id,)
+        settled_loser = await scanner_b.scan_due_retries(batch_size=1)
+        assert (
+            settled_loser.examined
+            == settled_loser.dispatched
+            == settled_loser.skipped
+            == 0
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT status::text FROM task_runs WHERE id=$1",
+                task.task_run_id,
+            )
+            == "dispatched"
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_attempts WHERE task_run_id=$1",
+                task.task_run_id,
+            )
+            == 2
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_dispatch_outbox WHERE task_attempt_id=$1",
+                attempt_id,
+            )
+            == 1
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM task_retry_events "
+                "WHERE task_run_id=$1 AND event_type='retry_dispatched'",
+                task.task_run_id,
+            )
+            == 1
+        )
+        assert (
+            await setup.fetchval(
+                "SELECT count(*) FROM workflow_run_execution_events "
+                "WHERE task_run_id=$1 "
+                "AND event_type='task_run.status_changed' "
+                "AND payload->>'previous_status'='retry_scheduled' "
+                "AND payload->>'status'='dispatched'",
+                task.task_run_id,
+            )
+            == 1
+        )
+    finally:
+        await engine_a.dispose()
+        await engine_b.dispose()
 
 
 async def exercise_shared_workflow_skip_locked(

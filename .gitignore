@@ -7,3 +7,6 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .env
+.taskforge-backups/
+*.taskforge.pgdump
+*.taskforge.pgdump.sha256

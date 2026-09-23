@@ -15,6 +15,7 @@ from taskforge.dispatch.publisher_ports import (
     DispatchAcknowledgementPersistenceFailure,
     DispatchPublicationInvariantConflict,
     PublicationAcknowledgement,
+    StartupReplayHighWater,
     StoredDispatch,
     UnpublishedDispatchCursor,
 )
@@ -25,6 +26,8 @@ from taskforge.persistence.dispatch import (
     _record_publication_acknowledgement_statement,
     _runnable_task_dispatch_snapshot_statement,
     _runnable_to_dispatched_statement,
+    _startup_replay_high_water_statement,
+    _startup_replay_page_statement,
     _unpublished_dispatch_page_statement,
     _workflow_run_dispatch_lock_statement,
 )
@@ -93,6 +96,34 @@ def test_unpublished_scan_is_ordered_bounded_and_unlocked() -> None:
     assert "OFFSET" not in initial
     assert "(task_dispatch_outbox.created_at, task_dispatch_outbox.id) >" in subsequent
     assert "LIMIT 10" in subsequent
+
+
+def test_startup_replay_is_high_water_bounded_and_excludes_obsolete_work() -> None:
+    high_water = StartupReplayHighWater(
+        UnpublishedDispatchCursor(datetime.now(UTC), uuid4()),
+        datetime.now(UTC),
+    )
+    after = UnpublishedDispatchCursor(datetime.now(UTC), uuid4())
+    high_water_sql = sql(_startup_replay_high_water_statement())
+    page = sql(_startup_replay_page_statement(high_water, after, 25))
+
+    assert "ORDER BY task_dispatch_outbox.created_at DESC" in high_water_sql
+    assert "published_at IS NOT NULL" in high_water_sql
+    assert "statement_timestamp() AS captured_at" in high_water_sql
+    assert "LIMIT 1" in high_water_sql
+    assert "published_at IS NOT NULL" in page
+    assert "published_at <=" in page
+    assert "task_runs.status = 'dispatched'" in page
+    assert "workflow_runs.status IN ('pending', 'running')" in page
+    assert "newer_attempt.attempt_number > task_attempts.attempt_number" in page
+    assert "NOT (EXISTS" in page
+    assert "task_attempt_claims" in page
+    assert "task_attempt_results" in page
+    assert "(task_dispatch_outbox.created_at, task_dispatch_outbox.id) <=" in page
+    assert "(task_dispatch_outbox.created_at, task_dispatch_outbox.id) >" in page
+    assert "ORDER BY task_dispatch_outbox.created_at, task_dispatch_outbox.id" in page
+    assert "LIMIT 25" in page
+    assert "FOR UPDATE" not in page
 
 
 def test_acknowledgement_update_guards_complete_snapshot() -> None:

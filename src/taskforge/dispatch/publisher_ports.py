@@ -100,7 +100,35 @@ class PublicationAcknowledgement(Enum):
     ALREADY_RECORDED = "already_recorded"
 
 
+@dataclass(frozen=True)
+class StartupReplayPage:
+    """One bounded page from a process-start outbox replay sweep."""
+
+    records: tuple[StoredDispatch, ...]
+    next_cursor: UnpublishedDispatchCursor | None
+
+
+@dataclass(frozen=True)
+class StartupReplayHighWater:
+    """Finite outbox key and publication-time boundary captured at process start."""
+
+    cursor: UnpublishedDispatchCursor
+    captured_at: datetime
+
+
 class DispatchOutboxRepository(Protocol):
+    async def capture_startup_replay_high_water(
+        self,
+    ) -> StartupReplayHighWater | None: ...
+
+    async def list_startup_replay_page(
+        self,
+        *,
+        high_water: StartupReplayHighWater,
+        after: UnpublishedDispatchCursor | None,
+        limit: int,
+    ) -> StartupReplayPage: ...
+
     async def list_unpublished_page(
         self,
         *,

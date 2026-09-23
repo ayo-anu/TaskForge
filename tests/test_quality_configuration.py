@@ -31,6 +31,7 @@ REQUIRED_MAKE_TARGETS = {
     "privilege-bootstrap",
     "migrations-check",
     "migration-test",
+    "backup-restore-test",
     "claim-test",
     "renewal-test",
     "retry-test",
@@ -133,6 +134,8 @@ def test_makefile_exposes_consistent_developer_commands() -> None:
     assert "ruff format --check src tests migrations" in makefile
     assert "ruff check src tests migrations" in makefile
     assert "TASKFORGE_RUN_BROKER_INTEGRATION=1 is required" in makefile
+    assert "TASKFORGE_RUN_BACKUP_RESTORE_INTEGRATION=1 is required" in makefile
+    assert "tests/integration/test_backup_restore.py" in makefile
     assert "TASKFORGE_RUN_CLAIM_INTEGRATION=1 is required" in makefile
     assert "TASKFORGE_RUN_RECOVERY_INTEGRATION=1 is required" in makefile
     assert "TASKFORGE_RUN_M21_CONTENTION=1 is required" in makefile

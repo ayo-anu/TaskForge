@@ -1,5 +1,150 @@
 # Taskforge
 
+## Deployment startup and PostgreSQL recovery
+
+PostgreSQL is Taskforge's authoritative durable state. The supported backup is
+an online PostgreSQL 18 custom-format logical archive. It includes schema, data,
+object privileges, workflow and task history, outbox records, claims, leases,
+results, retries, worker sessions, and credential verifiers. It does not include
+PostgreSQL roles or plaintext deployment secrets, and it is not a RabbitMQ
+backup or point-in-time-recovery system.
+
+The reference commands below use the `postgres` service's pinned PostgreSQL
+client tools. Set `COMPOSE_PROJECT_NAME` and `COMPOSE_ENV_FILES` explicitly when
+operating a project other than the checkout's default project. Environment files
+contain secrets and must remain mode `0600` outside version control.
+
+### Create and verify a backup
+
+Choose an absolute path on encrypted, access-controlled storage outside this
+repository. The wrapper refuses to overwrite an archive or checksum and creates
+both with mode `0600`.
+
+```console
+export COMPOSE_PROJECT_NAME=taskforge-production
+export COMPOSE_ENV_FILES=/secure/taskforge/production.env
+export TASKFORGE_BACKUP_FILE=/secure/taskforge/backups/taskforge-$(date -u +%Y%m%dT%H%M%SZ).taskforge.pgdump
+scripts/postgres-backup.sh "$TASKFORGE_BACKUP_FILE"
+(cd "$(dirname "$TASKFORGE_BACKUP_FILE")" && sha256sum --check "$(basename "$TASKFORGE_BACKUP_FILE").sha256")
+docker compose exec -T postgres pg_restore --list < "$TASKFORGE_BACKUP_FILE" >/dev/null
+```
+
+The wrapper takes the same database-local, exclusive advisory lock as Taskforge
+migration and privilege bootstrap. It waits up to
+`TASKFORGE_MIGRATION_LOCK_TIMEOUT_SECONDS` (default 300 seconds), holds the lock
+for the complete `pg_dump`, and releases it on success. Failure or interruption
+closes the lock-holder connection, which releases the PostgreSQL session lock.
+Supported backup, bootstrap, and migration operations therefore cannot overlap
+against the same database.
+
+Normal API, worker, and orchestrator transactions may continue while `pg_dump`
+takes its consistent MVCC snapshot. Committed work visible to the snapshot is
+included atomically; later or uncommitted work is absent. The snapshot defines
+the recovery point. Restoring it cannot roll back an external side effect made
+after that point, so task handlers must continue to use their stable idempotency
+context when producing external effects.
+
+The archive contains sensitive durable data, including credential verifiers,
+workflow inputs and outputs, audit history, and execution records. Taskforge does
+not provide archive encryption, retention, off-host replication, or key
+management; those remain deployment responsibilities.
+
+### Restore into a clean PostgreSQL environment
+
+Never start source and restored runtime roles concurrently. Fence or stop the
+source API, orchestrator, and workers before starting any target runtime role.
+The target must use PostgreSQL 18 and the same supported Taskforge owner/runtime
+role names referenced by the archived ACLs.
+
+Create a distinct Compose project and volume, then start only PostgreSQL:
+
+```console
+export COMPOSE_PROJECT_NAME=taskforge-recovery
+export COMPOSE_ENV_FILES=/secure/taskforge/recovery.env
+docker compose up --detach postgres
+```
+
+Provision and reconcile the owner/runtime role contract before restore. This is
+the existing privilege-bootstrap operation, not a restore-specific role path:
+
+```console
+make privilege-bootstrap
+```
+
+On a newly initialized Compose volume the PostgreSQL initialization hook has
+already performed the same bootstrap; running it explicitly is safe and verifies
+the intended target before restore. The retained archive ACLs require these
+roles to exist before `pg_restore` executes.
+
+The restore wrapper accepts the standard PostgreSQL catalogs, built-in `plpgsql`
+extension, pre-provisioned roles, and an empty standard `public` schema. It
+refuses a target containing user schemas, public relations/routines/types,
+nonstandard extensions, large objects, event triggers, logical publications, or
+logical replication subscriptions associated with the target database. It does
+not drop, clean, truncate, or replace anything.
+
+```console
+export TASKFORGE_BACKUP_FILE=/secure/taskforge/backups/taskforge-YYYYmmddTHHMMSSZ.taskforge.pgdump
+export TASKFORGE_RESTORE_CONFIRM_DATABASE=taskforge
+scripts/postgres-restore.sh "$TASKFORGE_BACKUP_FILE"
+```
+
+The restore uses `pg_restore --no-owner --exit-on-error
+--single-transaction`. Ownership suppression is a restore option; the custom
+archive itself retains ownership metadata and ACL entries. A failed or
+interrupted restore rolls back its transaction and must not be treated as a
+healthy target.
+
+After restore, run the existing bootstrap again to verify ownership and
+database/schema privileges, then run the only approved owner migration process:
+
+```console
+make privilege-bootstrap
+docker compose run --rm migrate
+docker compose run --rm migrate
+```
+
+For an archive already at this binary's expected revision, both migration runs
+report verification. For a recognized older ancestor, the first run upgrades
+under the Taskforge migration lock and the second verifies. Unknown, future,
+divergent, unversioned-nonempty, or multiple revisions fail closed. Never edit
+`alembic_version` or ask a runtime process to migrate.
+
+Before migration compatibility is established, worker and orchestrator exit
+nonzero and API readiness remains `503 not_ready`. After verification, start
+the transport and application roles and wait for readiness:
+
+```console
+docker compose up --detach rabbitmq
+docker compose up --detach orchestrator worker api
+curl --fail --silent http://127.0.0.1:${TASKFORGE_API_PUBLISHED_PORT:-8000}/ready
+```
+
+Observe the existing outbox, retry, recovery, claim, result, readiness, and
+shutdown telemetry. On each orchestrator process start, one finite high-water
+sweep republishes the original envelope for latest attempts that are still
+durably `dispatched` even when `published_at` was already recorded. One startup
+page is interleaved with every ordinary unpublished-outbox pass, so a large
+restore backlog cannot starve newly committed work. The sweep never rewrites
+`published_at` and never restarts during ordinary polling.
+
+An orchestrator restart may therefore cause one bounded duplicate delivery per
+eligible unresolved dispatch per starting replica, even if RabbitMQ retained
+the original message. This is expected under Taskforge's at-least-once model;
+claim locking, latest-attempt validation, lease fencing, and result idempotency
+prevent duplicate durable authority.
+
+Restored claims and worker sessions are not rewritten merely because a restore
+occurred. Target PostgreSQL time and the existing lease/staleness thresholds
+remain authoritative. Expired claims, stale sessions, retries, unpublished
+outbox records, committed results awaiting progression, and cancellation state
+converge through the ordinary orchestrator workloads.
+
+If checksum validation, archive listing, clean-target checking, restore,
+bootstrap, migration, or exact compatibility verification fails, do not start
+runtime roles. Inspect the target and explicitly create another clean database
+before retrying; the provided scripts perform no destructive cleanup.
+
 ## Performance and concurrency
 
 See [Performance and concurrency reference](PERFORMANCE.md) for the reproducible

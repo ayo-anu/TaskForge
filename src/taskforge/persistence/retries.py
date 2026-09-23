@@ -544,6 +544,9 @@ class SQLAlchemyDueRetryDispatchTransaction:
             if task.workflow_version_id != candidate.workflow_version_id:
                 raise DueRetryPersistenceInvariantViolation
 
+            # The workflow and task rows above serialize retry dispatch. Attempt
+            # facts are immutable here, so an additional write lock would add no
+            # authority and would incorrectly require UPDATE privilege.
             attempt = (
                 await session.execute(
                     select(
@@ -551,12 +554,10 @@ class SQLAlchemyDueRetryDispatchTransaction:
                         task_attempts.c.task_run_id,
                         task_attempts.c.attempt_number,
                         task_attempts.c.next_eligible_at,
-                    )
-                    .where(
+                    ).where(
                         task_attempts.c.id == candidate.task_attempt_id,
                         task_attempts.c.task_run_id == task.id,
                     )
-                    .with_for_update()
                 )
             ).one_or_none()
             if attempt is None:

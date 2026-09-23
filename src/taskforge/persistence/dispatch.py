@@ -7,7 +7,7 @@ from types import TracebackType
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, insert, select, tuple_, update
+from sqlalchemy import exists, func, insert, select, tuple_, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Select, Update
@@ -26,6 +26,8 @@ from taskforge.dispatch.publisher_ports import (
     DispatchPublicationInvariantConflict,
     OutboxBacklogObservation,
     PublicationAcknowledgement,
+    StartupReplayHighWater,
+    StartupReplayPage,
     StoredDispatch,
     UnpublishedDispatchCursor,
 )
@@ -36,6 +38,8 @@ from taskforge.runs.persistence_ports import (
     WorkflowRunExecutionEventPersistenceUnavailable,
 )
 from taskforge.runs.schema import (
+    task_attempt_claims,
+    task_attempt_results,
     task_attempts,
     task_dispatch_outbox,
     task_runs,
@@ -55,6 +59,54 @@ class SQLAlchemyTaskDispatchRepository:
 class SQLAlchemyDispatchOutboxRepository:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
+
+    async def capture_startup_replay_high_water(
+        self,
+    ) -> StartupReplayHighWater | None:
+        try:
+            async with self._sessions() as session:
+                row = (
+                    await session.execute(_startup_replay_high_water_statement())
+                ).one_or_none()
+        except DBAPIError as error:
+            raise DispatchOutboxPersistenceUnavailable from error
+        if row is None:
+            return None
+        return StartupReplayHighWater(
+            UnpublishedDispatchCursor(row.created_at, row.id),
+            row.captured_at,
+        )
+
+    async def list_startup_replay_page(
+        self,
+        *,
+        high_water: StartupReplayHighWater,
+        after: UnpublishedDispatchCursor | None,
+        limit: int,
+    ) -> StartupReplayPage:
+        try:
+            async with self._sessions() as session:
+                rows = (
+                    await session.execute(
+                        _startup_replay_page_statement(high_water, after, limit)
+                    )
+                ).all()
+        except DBAPIError as error:
+            raise DispatchOutboxPersistenceUnavailable from error
+        records = tuple(
+            StoredDispatch(
+                row.id,
+                row.task_attempt_id,
+                row.route,
+                deepcopy(row.payload),
+                row.created_at,
+            )
+            for row in rows
+        )
+        return StartupReplayPage(
+            records,
+            records[-1].cursor if len(records) == limit else None,
+        )
 
     async def list_unpublished_page(
         self,
@@ -409,6 +461,85 @@ def _unpublished_dispatch_page_statement(
             tuple_(task_dispatch_outbox.c.created_at, task_dispatch_outbox.c.id)
             > (after.created_at, after.dispatch_id)
         )
+    return statement
+
+
+def _startup_replay_high_water_statement() -> Select[Any]:
+    return (
+        select(
+            task_dispatch_outbox.c.created_at,
+            task_dispatch_outbox.c.id,
+            func.statement_timestamp().label("captured_at"),
+        )
+        .where(task_dispatch_outbox.c.published_at.is_not(None))
+        .order_by(
+            task_dispatch_outbox.c.created_at.desc(),
+            task_dispatch_outbox.c.id.desc(),
+        )
+        .limit(1)
+    )
+
+
+def _startup_replay_page_statement(
+    high_water: StartupReplayHighWater,
+    after: UnpublishedDispatchCursor | None,
+    limit: int,
+) -> Select[Any]:
+    key = tuple_(task_dispatch_outbox.c.created_at, task_dispatch_outbox.c.id)
+    newer_attempt = task_attempts.alias("newer_attempt")
+    statement = (
+        select(
+            task_dispatch_outbox.c.id,
+            task_dispatch_outbox.c.task_attempt_id,
+            task_dispatch_outbox.c.route,
+            task_dispatch_outbox.c.payload,
+            task_dispatch_outbox.c.created_at,
+        )
+        .select_from(
+            task_dispatch_outbox.join(
+                task_attempts,
+                task_attempts.c.id == task_dispatch_outbox.c.task_attempt_id,
+            )
+            .join(task_runs, task_runs.c.id == task_attempts.c.task_run_id)
+            .join(
+                workflow_runs,
+                workflow_runs.c.id == task_runs.c.workflow_run_id,
+            )
+        )
+        .where(
+            task_dispatch_outbox.c.published_at.is_not(None),
+            task_dispatch_outbox.c.published_at <= high_water.captured_at,
+            task_runs.c.status == TaskRunStatus.DISPATCHED.value,
+            workflow_runs.c.status.in_(
+                (WorkflowRunStatus.PENDING.value, WorkflowRunStatus.RUNNING.value)
+            ),
+            key
+            <= (
+                high_water.cursor.created_at,
+                high_water.cursor.dispatch_id,
+            ),
+            ~exists(
+                select(newer_attempt.c.id).where(
+                    newer_attempt.c.task_run_id == task_attempts.c.task_run_id,
+                    newer_attempt.c.attempt_number > task_attempts.c.attempt_number,
+                )
+            ),
+            ~exists(
+                select(task_attempt_claims.c.task_attempt_id).where(
+                    task_attempt_claims.c.task_attempt_id == task_attempts.c.id
+                )
+            ),
+            ~exists(
+                select(task_attempt_results.c.task_attempt_id).where(
+                    task_attempt_results.c.task_attempt_id == task_attempts.c.id
+                )
+            ),
+        )
+        .order_by(task_dispatch_outbox.c.created_at, task_dispatch_outbox.c.id)
+        .limit(limit)
+    )
+    if after is not None:
+        statement = statement.where(key > (after.created_at, after.dispatch_id))
     return statement
 
 

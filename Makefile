@@ -1,4 +1,4 @@
-.PHONY: install security format format-check lint typecheck test coverage privilege-bootstrap migrations-check migration-test claim-test renewal-test retry-test recovery-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test m21-workload m21-measurement m21-contention m21-profiling check clean
+.PHONY: install security format format-check lint typecheck test coverage privilege-bootstrap migrations-check migration-test backup-restore-test claim-test renewal-test retry-test recovery-test authentication-test authorization-test protected-route-test credential-bootstrap-test workflow-persistence-test workflow-route-test broker-dispatch-test m21-workload m21-measurement m21-contention m21-profiling check clean
 
 install:
 	uv sync --locked --all-groups --no-install-project
@@ -38,6 +38,10 @@ migration-test:
 	@test "$${TASKFORGE_RUN_MIGRATION_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_MIGRATION_INTEGRATION=1 is required" >&2; exit 2)
 	@test -n "$${TASKFORGE_MIGRATION_TEST_DATABASE_URL:-}" || (echo "TASKFORGE_MIGRATION_TEST_DATABASE_URL is required" >&2; exit 2)
 	uv run pytest tests/integration/test_identity_migrations.py tests/integration/test_workflow_definition_migrations.py tests/integration/test_workflow_run_migrations.py tests/integration/test_task_dispatch_migrations.py tests/integration/test_task_claim_migrations.py tests/integration/test_task_claim_event_migrations.py tests/integration/test_retry_persistence_migrations.py tests/integration/test_retry_event_migrations.py tests/integration/test_recovery_migrations.py tests/integration/test_recovery_event_migrations.py tests/integration/test_dead_letter_migrations.py tests/integration/test_workflow_cancellation_migrations.py tests/integration/test_execution_event_migrations.py tests/integration/test_workflow_replay_migrations.py tests/integration/test_history_privileges.py tests/integration/test_authorized_history_migration.py tests/integration/test_authorized_history_retrieval.py tests/integration/test_worker_authority_privileges.py tests/integration/test_migration_deployment.py
+
+backup-restore-test:
+	@test "$${TASKFORGE_RUN_BACKUP_RESTORE_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_BACKUP_RESTORE_INTEGRATION=1 is required" >&2; exit 2)
+	uv run pytest tests/integration/test_backup_restore.py
 
 claim-test:
 	@test "$${TASKFORGE_RUN_CLAIM_INTEGRATION:-}" = "1" || (echo "TASKFORGE_RUN_CLAIM_INTEGRATION=1 is required" >&2; exit 2)

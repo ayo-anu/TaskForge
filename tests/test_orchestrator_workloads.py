@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 
+from taskforge.dispatch.publisher_ports import (
+    StartupReplayHighWater,
+    UnpublishedDispatchCursor,
+)
 from taskforge.dispatch.service import TaskDispatchNotEligible
 from taskforge.orchestrator.domain import (
     ActiveWorkflowRunCandidate,
@@ -168,8 +173,14 @@ def test_retry_pass_treats_expected_noops_as_candidate_local() -> None:
                 return SimpleNamespace(outcome=SimpleNamespace(value=outcome))
 
         class Due:
-            async def scan_due_retries(self, *, batch_size: int) -> SimpleNamespace:
+            async def scan_due_retries(
+                self,
+                *,
+                batch_size: int,
+                should_stop: Callable[[], bool] | None = None,
+            ) -> SimpleNamespace:
                 assert batch_size == 2
+                assert should_stop is None
                 return SimpleNamespace(examined=2, dispatched=1)
 
         result = await RetryWorkload(
@@ -186,10 +197,30 @@ def test_retry_pass_treats_expected_noops_as_candidate_local() -> None:
 def test_outbox_durable_invalid_is_structural_failure() -> None:
     async def scenario() -> None:
         class Publisher:
+            async def capture_startup_replay_high_water(
+                self,
+            ) -> StartupReplayHighWater | None:
+                return None
+
+            async def reconcile_startup_replay_page(
+                self,
+                *,
+                high_water: StartupReplayHighWater,
+                after: UnpublishedDispatchCursor | None,
+                page_size: int,
+                should_stop: Callable[[], bool] | None = None,
+            ) -> SimpleNamespace:
+                raise AssertionError("empty startup replay must not request a page")
+
             async def reconcile_unpublished(
-                self, *, page_size: int, pass_limit: int
+                self,
+                *,
+                page_size: int,
+                pass_limit: int,
+                should_stop: Callable[[], bool] | None = None,
             ) -> SimpleNamespace:
                 assert (page_size, pass_limit) == (2, 2)
+                assert should_stop is None
                 return SimpleNamespace(
                     examined=1,
                     acknowledged=0,
@@ -202,6 +233,84 @@ def test_outbox_durable_invalid_is_structural_failure() -> None:
                 Publisher(),
                 batch_size=2,
             ).run_once()
+
+    asyncio.run(scenario())
+
+
+def test_outbox_interleaves_finite_startup_replay_with_unpublished_work() -> None:
+    async def scenario() -> None:
+        high_water = StartupReplayHighWater(
+            UnpublishedDispatchCursor(NOW, UUID(int=100)), NOW
+        )
+        cursors = tuple(
+            UnpublishedDispatchCursor(NOW, UUID(int=value)) for value in (10, 20)
+        )
+
+        class Publisher:
+            def __init__(self) -> None:
+                self.captures = 0
+                self.startup_after: list[UnpublishedDispatchCursor | None] = []
+                self.ordinary_calls = 0
+
+            async def capture_startup_replay_high_water(
+                self,
+            ) -> StartupReplayHighWater:
+                self.captures += 1
+                return high_water
+
+            async def reconcile_startup_replay_page(
+                self,
+                *,
+                high_water: StartupReplayHighWater,
+                after: UnpublishedDispatchCursor | None,
+                page_size: int,
+                should_stop: Callable[[], bool] | None = None,
+            ) -> SimpleNamespace:
+                assert high_water == StartupReplayHighWater(
+                    UnpublishedDispatchCursor(NOW, UUID(int=100)), NOW
+                )
+                assert page_size == 2
+                assert should_stop is None
+                self.startup_after.append(after)
+                index = len(self.startup_after) - 1
+                return SimpleNamespace(
+                    examined=2 if index < 2 else 1,
+                    published=2 if index < 2 else 1,
+                    durable_invalid=0,
+                    next_cursor=cursors[index] if index < 2 else None,
+                )
+
+            async def reconcile_unpublished(
+                self,
+                *,
+                page_size: int,
+                pass_limit: int,
+                should_stop: Callable[[], bool] | None = None,
+            ) -> SimpleNamespace:
+                assert (page_size, pass_limit) == (2, 2)
+                assert should_stop is None
+                self.ordinary_calls += 1
+                return SimpleNamespace(
+                    examined=1,
+                    acknowledged=1,
+                    durable_invalid=0,
+                    pass_limit_reached=False,
+                )
+
+        publisher = Publisher()
+        workload = OutboxPublicationWorkload(publisher, batch_size=2)
+
+        first = await workload.run_once()
+        second = await workload.run_once()
+        third = await workload.run_once()
+        fourth = await workload.run_once()
+
+        assert first == second == WorkloadPassResult(3, 3, True)
+        assert third == WorkloadPassResult(2, 2, False)
+        assert fourth == WorkloadPassResult(1, 1, False)
+        assert publisher.captures == 1
+        assert publisher.startup_after == [None, cursors[0], cursors[1]]
+        assert publisher.ordinary_calls == 4
 
     asyncio.run(scenario())
 

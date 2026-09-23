@@ -29,6 +29,7 @@ from taskforge.dispatch.publisher_ports import (
     DispatchOutboxRepository,
     DispatchPublicationInvariantConflict,
     PublicationAcknowledgement,
+    StartupReplayHighWater,
     StoredDispatch,
     UnpublishedDispatchCursor,
 )
@@ -61,6 +62,14 @@ class PublicationPassResult:
     pass_limit_reached: bool
 
 
+@dataclass(frozen=True)
+class StartupReplayPassResult:
+    examined: int
+    published: int
+    durable_invalid: int
+    next_cursor: UnpublishedDispatchCursor | None
+
+
 class TaskDispatchPublisher:
     def __init__(
         self,
@@ -69,6 +78,61 @@ class TaskDispatchPublisher:
     ) -> None:
         self._repository = repository
         self._broker = broker
+
+    async def capture_startup_replay_high_water(
+        self,
+    ) -> StartupReplayHighWater | None:
+        """Capture the finite process-start boundary exactly when requested."""
+        return await self._repository.capture_startup_replay_high_water()
+
+    async def reconcile_startup_replay_page(
+        self,
+        *,
+        high_water: StartupReplayHighWater,
+        after: UnpublishedDispatchCursor | None,
+        page_size: int,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> StartupReplayPassResult:
+        """Publish at most one page from one captured startup boundary."""
+        _validate_bounds(page_size, page_size)
+        page = await self._repository.list_startup_replay_page(
+            high_water=high_water,
+            after=after,
+            limit=page_size,
+        )
+        operation_id = uuid4()
+        with bind_log_context(**{"operation.id": operation_id}):
+            with span("taskforge.dispatch.startup_replay_pass", root=True):
+                counts, last_cursor = await self._publish_records(
+                    page.records,
+                    should_stop=should_stop or (lambda: False),
+                    startup_replay=True,
+                )
+        next_cursor = (
+            page.next_cursor
+            if len(page.records) == counts[0] and page.next_cursor is not None
+            else last_cursor
+            if counts[0] < len(page.records)
+            else None
+        )
+        result = StartupReplayPassResult(
+            examined=counts[0],
+            published=counts[1] + counts[2],
+            durable_invalid=counts[3],
+            next_cursor=next_cursor,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "dispatch.startup_replay.pass_completed",
+            {
+                "examined": result.examined,
+                "published": result.published,
+                "durable_invalid": result.durable_invalid,
+                "reached_end": result.next_cursor is None,
+            },
+        )
+        return result
 
     async def reconcile_unpublished(
         self,
@@ -111,136 +175,17 @@ class TaskDispatchPublisher:
                 reached_end = True
                 break
 
-            for stored in page:
-                if should_stop():
-                    break
-                examined += 1
-                validated = _validated_publication(stored)
-                if validated is None:
-                    durable_invalid += 1
-                    add_metric("taskforge.dispatch.outbox.invalid")
-                    with bind_log_context(
-                        **{
-                            "dispatch.id": stored.dispatch_id,
-                            "task.attempt.id": stored.task_attempt_id,
-                        }
-                    ):
-                        log_event(
-                            logger,
-                            logging.ERROR,
-                            "dispatch.publish.durable_invalid",
-                            {"reason.code": "invalid_durable_envelope"},
-                        )
-                    after = stored.cursor
-                    continue
-
-                publication, identifiers, predecessor_link = validated
-                with bind_log_context(**identifiers):
-                    links = (predecessor_link,) if predecessor_link is not None else ()
-                    publish_started = perf_counter()
-                    with span(
-                        "taskforge.dispatch.publish",
-                        kind=SpanKind.PRODUCER,
-                        attributes={
-                            "messaging.system": "rabbitmq",
-                            "messaging.destination.name": stored.route,
-                            "messaging.message.id": str(stored.dispatch_id),
-                            "taskforge.broker.route": stored.route,
-                        },
-                        links=links,
-                    ) as publish_span:
-                        try:
-                            await self._broker.publish(publication)
-                        except (
-                            BrokerUnavailable,
-                            BrokerPublicationTimeout,
-                            BrokerPublicationRejected,
-                        ) as error:
-                            publish_outcome = {
-                                BrokerUnavailable: "unavailable",
-                                BrokerPublicationTimeout: "timeout",
-                                BrokerPublicationRejected: "rejected",
-                            }[type(error)]
-                            add_metric(
-                                "taskforge.dispatch.publications",
-                                attributes={"taskforge.outcome": publish_outcome},
-                            )
-                            record_metric(
-                                "taskforge.dispatch.publish.duration",
-                                perf_counter() - publish_started,
-                                {"taskforge.outcome": publish_outcome},
-                            )
-                            set_error(publish_span, error, "broker_publication_failure")
-                            log_event(
-                                logger,
-                                logging.ERROR,
-                                "dispatch.publish.failed",
-                                {
-                                    "error.category": "broker_publication_failure",
-                                    "outcome": "failed",
-                                },
-                                error=error,
-                            )
-                            raise
-                    add_metric(
-                        "taskforge.dispatch.publications",
-                        attributes={"taskforge.outcome": "accepted"},
-                    )
-                    record_metric(
-                        "taskforge.dispatch.publish.duration",
-                        perf_counter() - publish_started,
-                        {"taskforge.outcome": "accepted"},
-                    )
-                    record_metric(
-                        "taskforge.dispatch.outbox.duration",
-                        (datetime.now(UTC) - stored.created_at).total_seconds(),
-                    )
-                    with span(
-                        "taskforge.dispatch.record_publication",
-                        attributes={"db.system.name": "postgresql"},
-                    ) as record_span:
-                        try:
-                            outcome = (
-                                await self._repository.record_accepted_publication(
-                                    stored
-                                )
-                            )
-                        except (
-                            DispatchAcknowledgementPersistenceFailure,
-                            DispatchOutboxPersistenceUnavailable,
-                            DispatchPublicationInvariantConflict,
-                        ) as error:
-                            record_outcome = (
-                                "invariant_failure"
-                                if isinstance(
-                                    error, DispatchPublicationInvariantConflict
-                                )
-                                else "persistence_failure"
-                            )
-                            add_metric(
-                                "taskforge.dispatch.publication_records",
-                                attributes={"taskforge.outcome": record_outcome},
-                            )
-                            set_error(record_span, error, "publication_record_failure")
-                            raise
-                        set_attributes(
-                            record_span, {"taskforge.outcome": outcome.value}
-                        )
-                    if outcome is PublicationAcknowledgement.RECORDED:
-                        acknowledged += 1
-                    else:
-                        already_acknowledged += 1
-                    add_metric(
-                        "taskforge.dispatch.publication_records",
-                        attributes={"taskforge.outcome": outcome.value},
-                    )
-                    log_event(
-                        logger,
-                        logging.INFO,
-                        "dispatch.publish.succeeded",
-                        {"outcome": outcome.value, "broker.route": stored.route},
-                    )
-                after = stored.cursor
+            counts, page_cursor = await self._publish_records(
+                page,
+                should_stop=should_stop,
+                startup_replay=False,
+            )
+            examined += counts[0]
+            acknowledged += counts[1]
+            already_acknowledged += counts[2]
+            durable_invalid += counts[3]
+            if page_cursor is not None:
+                after = page_cursor
 
             if should_stop():
                 break
@@ -270,6 +215,147 @@ class TaskDispatchPublisher:
             },
         )
         return result
+
+    async def _publish_records(
+        self,
+        records: tuple[StoredDispatch, ...],
+        *,
+        should_stop: Callable[[], bool],
+        startup_replay: bool,
+    ) -> tuple[tuple[int, int, int, int], UnpublishedDispatchCursor | None]:
+        examined = acknowledged = already_acknowledged = durable_invalid = 0
+        last_cursor: UnpublishedDispatchCursor | None = None
+        for stored in records:
+            if should_stop():
+                break
+            examined += 1
+            validated = _validated_publication(stored)
+            if validated is None:
+                durable_invalid += 1
+                add_metric("taskforge.dispatch.outbox.invalid")
+                with bind_log_context(
+                    **{
+                        "dispatch.id": stored.dispatch_id,
+                        "task.attempt.id": stored.task_attempt_id,
+                    }
+                ):
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "dispatch.publish.durable_invalid",
+                        {"reason.code": "invalid_durable_envelope"},
+                    )
+                last_cursor = stored.cursor
+                continue
+
+            publication, identifiers, predecessor_link = validated
+            with bind_log_context(**identifiers):
+                links = (predecessor_link,) if predecessor_link is not None else ()
+                publish_started = perf_counter()
+                with span(
+                    "taskforge.dispatch.publish",
+                    kind=SpanKind.PRODUCER,
+                    attributes={
+                        "messaging.system": "rabbitmq",
+                        "messaging.destination.name": stored.route,
+                        "messaging.message.id": str(stored.dispatch_id),
+                        "taskforge.broker.route": stored.route,
+                        "taskforge.dispatch.startup_replay": startup_replay,
+                    },
+                    links=links,
+                ) as publish_span:
+                    try:
+                        await self._broker.publish(publication)
+                    except (
+                        BrokerUnavailable,
+                        BrokerPublicationTimeout,
+                        BrokerPublicationRejected,
+                    ) as error:
+                        publish_outcome = {
+                            BrokerUnavailable: "unavailable",
+                            BrokerPublicationTimeout: "timeout",
+                            BrokerPublicationRejected: "rejected",
+                        }[type(error)]
+                        add_metric(
+                            "taskforge.dispatch.publications",
+                            attributes={"taskforge.outcome": publish_outcome},
+                        )
+                        record_metric(
+                            "taskforge.dispatch.publish.duration",
+                            perf_counter() - publish_started,
+                            {"taskforge.outcome": publish_outcome},
+                        )
+                        set_error(publish_span, error, "broker_publication_failure")
+                        log_event(
+                            logger,
+                            logging.ERROR,
+                            "dispatch.publish.failed",
+                            {
+                                "error.category": "broker_publication_failure",
+                                "outcome": "failed",
+                            },
+                            error=error,
+                        )
+                        raise
+                add_metric(
+                    "taskforge.dispatch.publications",
+                    attributes={"taskforge.outcome": "accepted"},
+                )
+                record_metric(
+                    "taskforge.dispatch.publish.duration",
+                    perf_counter() - publish_started,
+                    {"taskforge.outcome": "accepted"},
+                )
+                record_metric(
+                    "taskforge.dispatch.outbox.duration",
+                    (datetime.now(UTC) - stored.created_at).total_seconds(),
+                )
+                with span(
+                    "taskforge.dispatch.record_publication",
+                    attributes={"db.system.name": "postgresql"},
+                ) as record_span:
+                    try:
+                        outcome = await self._repository.record_accepted_publication(
+                            stored
+                        )
+                    except (
+                        DispatchAcknowledgementPersistenceFailure,
+                        DispatchOutboxPersistenceUnavailable,
+                        DispatchPublicationInvariantConflict,
+                    ) as error:
+                        record_outcome = (
+                            "invariant_failure"
+                            if isinstance(error, DispatchPublicationInvariantConflict)
+                            else "persistence_failure"
+                        )
+                        add_metric(
+                            "taskforge.dispatch.publication_records",
+                            attributes={"taskforge.outcome": record_outcome},
+                        )
+                        set_error(record_span, error, "publication_record_failure")
+                        raise
+                    set_attributes(record_span, {"taskforge.outcome": outcome.value})
+                if outcome is PublicationAcknowledgement.RECORDED:
+                    acknowledged += 1
+                else:
+                    already_acknowledged += 1
+                add_metric(
+                    "taskforge.dispatch.publication_records",
+                    attributes={"taskforge.outcome": outcome.value},
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "dispatch.publish.succeeded",
+                    {"outcome": outcome.value, "broker.route": stored.route},
+                )
+            last_cursor = stored.cursor
+        return (
+            examined,
+            acknowledged,
+            already_acknowledged,
+            durable_invalid,
+        ), last_cursor
 
     async def _observe_backlog(self) -> None:
         try:
